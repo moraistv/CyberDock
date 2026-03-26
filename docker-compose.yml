@@ -1,0 +1,35 @@
+version: '3.8'
+
+services:
+  backend:
+    build: .
+    ports:
+      - "${PORT:-3001}:3001"
+    environment:
+      - NODE_ENV=production
+      - PORT=3001
+      - PGUSER=${PGUSER}
+      - PGHOST=${PGHOST}
+      - PGDATABASE=${PGDATABASE}
+      - PGPASSWORD=${PGPASSWORD}
+      - PGPORT=${PGPORT:-5432}
+      - JWT_SECRET=${JWT_SECRET}
+      - FIREBASE_PROJECT_ID=${FIREBASE_PROJECT_ID}
+      - FIREBASE_CLIENT_EMAIL=${FIREBASE_CLIENT_EMAIL}
+      - FIREBASE_PRIVATE_KEY=${FIREBASE_PRIVATE_KEY}
+      - FIREBASE_DB_URL=${FIREBASE_DB_URL}
+    restart: always
+
+  # Optional: PostgreSQL if not using a separate Coolify DB resource
+  # db:
+  #   image: postgres:15
+  #   environment:
+  #     - POSTGRES_USER=${PGUSER}
+  #     - POSTGRES_PASSWORD=${PGPASSWORD}
+  #     - POSTGRES_DB=${PGDATABASE}
+  #   volumes:
+  #     - pgdata:/var/lib/postgresql/data
+  #   restart: always
+
+volumes:
+  pgdata:
