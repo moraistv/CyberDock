@@ -16,6 +16,7 @@ router.get('/all', authenticateToken, requireMaster, async (req, res) => {
             SELECT
                 u.uid,
                 u.email,
+                u.name,
                 u.role,
                 u.created_at,
                 (SELECT nickname FROM public.ml_accounts WHERE uid = u.uid ORDER BY created_at ASC LIMIT 1) as "mlNickname"
@@ -59,6 +60,36 @@ router.put('/:uid/role', authenticateToken, requireMaster, async (req, res) => {
     } catch (error) {
         console.error(`Erro ao atualizar permissão para o usuário ${uid}:`, error);
         res.status(500).json({ error: 'Erro interno ao atualizar permissão.' });
+    }
+});
+
+/**
+ * @route   PUT /api/users/:uid/name
+ * @desc    Atualiza o nome de um usuário.
+ * @access  Private (Master)
+ */
+router.put('/:uid/name', authenticateToken, requireMaster, async (req, res) => {
+    const { uid } = req.params;
+    const { name } = req.body;
+
+    if (!name || !name.trim()) {
+        return res.status(400).json({ error: 'O nome não pode ser vazio.' });
+    }
+
+    try {
+        const { rows } = await db.query(
+            'UPDATE public.users SET name = $1, updated_at = NOW() WHERE uid = $2 RETURNING uid, name',
+            [name.trim(), uid]
+        );
+
+        if (rows.length === 0) {
+            return res.status(404).json({ error: 'Usuário não encontrado.' });
+        }
+
+        res.json({ message: 'Nome atualizado com sucesso.', user: rows[0] });
+    } catch (error) {
+        console.error(`Erro ao atualizar nome para o usuário ${uid}:`, error);
+        res.status(500).json({ error: 'Erro interno ao atualizar nome.' });
     }
 });
 
