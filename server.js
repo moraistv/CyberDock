@@ -7,7 +7,6 @@ const cors = require('cors');
 
 const mainRouter = require('./router');
 const { initializeDatabase } = require('./utils/init-db');
-const { startNgrok } = require('./ngrok');
 
 const app = express();
 
@@ -30,13 +29,4 @@ app.get('/health', (_req, res) => res.status(200).json({ ok: true }));
 app.listen(PORT, async () => {
   await initializeDatabase();
   console.log(`🚀 Servidor backend rodando na porta ${PORT}`);
-
-  if (process.env.NODE_ENV !== 'production') {
-    const ngrokUrl = await startNgrok();
-    if (ngrokUrl) {
-      console.log(`✅ Ngrok ativo: ${ngrokUrl}`);
-    } else {
-      console.log('⚠️ Ngrok não foi iniciado. Verifique o authtoken ou a conexão.');
-    }
-  }
 });
