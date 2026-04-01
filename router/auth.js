@@ -50,13 +50,17 @@ router.post('/login', async (req, res) => {
     }
 
     try {
-        const userQuery = 'SELECT uid, email, role, password_hash FROM public.users WHERE email = $1';
+        const userQuery = 'SELECT uid, email, role, password_hash, active FROM public.users WHERE email = $1';
         
         const { rows } = await db.query(userQuery, [email]);
         const user = rows[0];
 
         if (!user || !user.password_hash) {
             return res.status(401).json({ error: 'Email ou senha inválidos.' });
+        }
+
+        if (user.active === false) {
+            return res.status(403).json({ error: 'Sua conta foi desativada. Entre em contato com o suporte.' });
         }
 
         const isMatch = await bcrypt.compare(password, user.password_hash);

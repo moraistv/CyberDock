@@ -24,6 +24,7 @@ const schema = {
             email VARCHAR(255) UNIQUE NOT NULL,
             name VARCHAR(255),
             role VARCHAR(50) NOT NULL DEFAULT 'cliente',
+            active BOOLEAN DEFAULT TRUE,
             created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
             updated_at TIMESTAMP WITH TIME ZONE,
             password_hash VARCHAR(255)
@@ -189,6 +190,12 @@ async function syncDatabaseSchema() {
                     if (updatedAtColRes.rowCount === 0) {
                         console.log(`   -> Adicionando coluna 'updated_at' à tabela: public.users`);
                         await client.query('ALTER TABLE public.users ADD COLUMN updated_at TIMESTAMP WITH TIME ZONE;');
+                    }
+                    // Verifica e adiciona a coluna 'active' se não existir
+                    const activeColRes = await client.query(`SELECT 1 FROM information_schema.columns WHERE table_schema = 'public' AND table_name = 'users' AND column_name = 'active'`);
+                    if (activeColRes.rowCount === 0) {
+                        console.log(`   -> Adicionando coluna 'active' à tabela: public.users`);
+                        await client.query('ALTER TABLE public.users ADD COLUMN active BOOLEAN DEFAULT TRUE;');
                     }
                 }
                  if (tableName === 'services') {

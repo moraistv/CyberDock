@@ -18,6 +18,7 @@ router.get('/all', authenticateToken, requireMaster, async (req, res) => {
                 u.email,
                 u.name,
                 u.role,
+                u.active,
                 u.created_at,
                 (SELECT nickname FROM public.ml_accounts WHERE uid = u.uid ORDER BY created_at ASC LIMIT 1) as "mlNickname"
             FROM
@@ -90,6 +91,36 @@ router.put('/:uid/name', authenticateToken, requireMaster, async (req, res) => {
     } catch (error) {
         console.error(`Erro ao atualizar nome para o usuário ${uid}:`, error);
         res.status(500).json({ error: 'Erro interno ao atualizar nome.' });
+    }
+});
+
+/**
+ * @route   PUT /api/users/:uid/active
+ * @desc    Ativa ou inativa um usuário.
+ * @access  Private (Master)
+ */
+router.put('/:uid/active', authenticateToken, requireMaster, async (req, res) => {
+    const { uid } = req.params;
+    const { active } = req.body;
+
+    if (typeof active !== 'boolean') {
+        return res.status(400).json({ error: 'O campo active deve ser um booleano.' });
+    }
+
+    try {
+        const { rows } = await db.query(
+            'UPDATE public.users SET active = $1, updated_at = NOW() WHERE uid = $2 RETURNING uid, active',
+            [active, uid]
+        );
+
+        if (rows.length === 0) {
+            return res.status(404).json({ error: 'Usuário não encontrado.' });
+        }
+
+        res.json({ message: `Inativação/Ativação atualizada com sucesso.`, user: rows[0] });
+    } catch (error) {
+        console.error(`Erro ao atualizar status active para o usuário ${uid}:`, error);
+        res.status(500).json({ error: 'Erro interno ao atualizar status de ativação do usuário.' });
     }
 });
 
