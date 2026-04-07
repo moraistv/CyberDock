@@ -474,6 +474,24 @@ router.get('/sync-status/:clientId', (req, res) => {
   });
 });
 
+router.get('/all', authenticateToken, requireMaster, async (req, res) => {
+  try {
+    const query = `
+      SELECT id, sku, uid, seller_id, channel, account_nickname, sale_date,
+        product_title, quantity, shipping_mode, shipping_limit_date,
+        packages, shipping_status, raw_api_data, updated_at, processed_at
+      FROM public.sales 
+      ORDER BY sale_date DESC
+      LIMIT 10000;
+    `;
+    const { rows } = await db.query(query);
+    res.json(rows);
+  } catch (error) {
+    console.error("Erro interno ao buscar todas as vendas:", error);
+    res.status(500).json({ error: 'Erro interno ao buscar vendas globais.' });
+  }
+});
+
 router.get('/user/:uid', authenticateToken, requireMaster, async (req, res) => {
   const { uid } = req.params;
   if (!uid) return res.status(400).json({ error: 'O UID do usuário é obrigatório.' });

@@ -246,6 +246,29 @@ router.post('/refresh-token', async (req, res) => {
   }
 });
 
+/* ----------------------- Obter contas TODAS (Master) ----------------------- */
+router.get('/all-accounts', authenticateToken, async (req, res) => {
+  // Importante: verificar role master
+  try {
+    const { rows: userRows } = await db.query('SELECT role FROM public.users WHERE uid = $1', [req.user.uid]);
+    if (userRows.length === 0 || userRows[0].role !== 'master') {
+      return res.status(403).json({ error: 'Acesso negado.' });
+    }
+    
+    const { rows } = await db.query(`
+      SELECT m.uid, m.user_id, m.nickname, m.status, m.expires_in, m.connected_at
+      FROM public.ml_accounts m
+      JOIN public.users u ON m.uid = u.uid
+      WHERE m.status = 'active'
+      ORDER BY m.updated_at DESC
+    `);
+    
+    res.json(rows);
+  } catch (error) {
+    res.status(500).json({ error: 'Erro ao buscar contas globais.' });
+  }
+});
+
 /* ----------------------- Obter contas por UID ----------------------- */
 router.get('/contas/:uid', async (req, res) => {
   const { uid } = req.params;
