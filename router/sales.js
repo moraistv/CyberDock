@@ -477,11 +477,13 @@ router.get('/sync-status/:clientId', (req, res) => {
 router.get('/all', authenticateToken, requireMaster, async (req, res) => {
   try {
     const query = `
-      SELECT id, sku, uid, seller_id, channel, account_nickname, sale_date,
-        product_title, quantity, shipping_mode, shipping_limit_date,
-        packages, shipping_status, raw_api_data, updated_at, processed_at
-      FROM public.sales 
-      ORDER BY sale_date DESC
+      SELECT s.id, s.sku, s.uid, s.seller_id, s.channel, s.account_nickname, s.sale_date,
+        s.product_title, s.quantity, s.shipping_mode, s.shipping_limit_date,
+        s.packages, s.shipping_status, s.raw_api_data, s.updated_at, s.processed_at,
+        u.name as user_nickname
+      FROM public.sales s
+      LEFT JOIN public.users u ON s.uid = u.uid
+      ORDER BY s.sale_date DESC
       LIMIT 10000;
     `;
     const { rows } = await db.query(query);
