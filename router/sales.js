@@ -476,18 +476,88 @@ router.get('/sync-status/:clientId', (req, res) => {
 
 router.get('/all', authenticateToken, requireMaster, async (req, res) => {
   try {
-    const query = `
+    const page = Math.max(1, parseInt(req.query.page) || 1);
+    const limit = Math.min(100, Math.max(1, parseInt(req.query.limit) || 50));
+    const offset = (page - 1) * limit;
+    const search = (req.query.search || '').trim();
+    const shippingStatus = (req.query.shippingStatus || '').trim();
+    const saleStatus = (req.query.saleStatus || '').trim();
+    const saleDateStart = (req.query.saleDateStart || '').trim();
+    const saleDateEnd = (req.query.saleDateEnd || '').trim();
+
+    const conditions = [];
+    const params = [];
+    let paramIdx = 1;
+
+    if (search) {
+      conditions.push(`(
+        s.product_title ILIKE $${paramIdx}
+        OR s.sku ILIKE $${paramIdx}
+        OR s.account_nickname ILIKE $${paramIdx}
+        OR u.name ILIKE $${paramIdx}
+        OR CAST(s.id AS TEXT) ILIKE $${paramIdx}
+      )`);
+      params.push(`%${search}%`);
+      paramIdx++;
+    }
+    if (shippingStatus) {
+      conditions.push(`s.shipping_status = $${paramIdx}`);
+      params.push(shippingStatus);
+      paramIdx++;
+    }
+    if (saleStatus) {
+      conditions.push(`s.raw_api_data->>'status' = $${paramIdx}`);
+      params.push(saleStatus);
+      paramIdx++;
+    }
+    if (saleDateStart) {
+      conditions.push(`s.sale_date >= $${paramIdx}`);
+      params.push(saleDateStart);
+      paramIdx++;
+    }
+    if (saleDateEnd) {
+      conditions.push(`s.sale_date <= $${paramIdx}`);
+      params.push(saleDateEnd + 'T23:59:59.999Z');
+      paramIdx++;
+    }
+
+    const whereClause = conditions.length > 0 ? 'WHERE ' + conditions.join(' AND ') : '';
+
+    // Count total
+    const countQuery = `SELECT COUNT(*) as total FROM public.sales s LEFT JOIN public.users u ON s.uid = u.uid ${whereClause}`;
+    const countResult = await db.query(countQuery, params);
+    const total = parseInt(countResult.rows[0].total);
+
+    // Fetch page — extract thumbnail and permalink from raw_api_data via SQL
+    const dataQuery = `
       SELECT s.id, s.sku, s.uid, s.seller_id, s.channel, s.account_nickname, s.sale_date,
         s.product_title, s.quantity, s.shipping_mode, s.shipping_limit_date,
-        s.packages, s.shipping_status, s.raw_api_data, s.updated_at, s.processed_at,
-        u.name as user_nickname
+        s.packages, s.shipping_status, s.updated_at, s.processed_at,
+        u.name as user_nickname,
+        s.raw_api_data->>'status' as sale_status,
+        s.raw_api_data->'shipping'->>'id' as shipping_id,
+        s.raw_api_data->'sla_data'->>'expected_date' as sla_expected_date,
+        (s.raw_api_data->'order_items'->0->'item'->>'thumbnail') as product_thumbnail,
+        (s.raw_api_data->'order_items'->0->'item'->>'permalink') as product_permalink,
+        s.raw_api_data->'buyer'->>'first_name' as buyer_first_name,
+        s.raw_api_data->'buyer'->>'last_name' as buyer_last_name,
+        s.raw_api_data->'buyer'->>'nickname' as buyer_nickname
       FROM public.sales s
       LEFT JOIN public.users u ON s.uid = u.uid
+      ${whereClause}
       ORDER BY s.sale_date DESC
-      LIMIT 10000;
+      LIMIT $${paramIdx} OFFSET $${paramIdx + 1};
     `;
-    const { rows } = await db.query(query);
-    res.json(rows);
+
+    const dataResult = await db.query(dataQuery, [...params, limit, offset]);
+
+    res.json({
+      data: dataResult.rows,
+      total,
+      page,
+      limit,
+      totalPages: Math.ceil(total / limit) || 1
+    });
   } catch (error) {
     console.error("Erro interno ao buscar todas as vendas:", error);
     res.status(500).json({ error: 'Erro interno ao buscar vendas globais.' });
