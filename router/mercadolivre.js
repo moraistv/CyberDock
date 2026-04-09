@@ -269,8 +269,6 @@ router.get('/all-accounts', authenticateToken, async (req, res) => {
   }
 });
 
-/* ----------------------- Obter contas por UID ----------------------- */
-router.get('/contas/:uid', async (req, res) => {
   const { uid } = req.params;
   try {
     const { rows } = await db.query(
@@ -306,6 +304,40 @@ router.get('/access-token/:mlUserId', authenticateToken, async (req, res) => {
   } catch (error) {
     console.error('Erro ao obter token de acesso:', error);
     res.status(500).json({ error: 'Erro interno do servidor.' });
+  }
+});
+
+/* -------------------- Proxy Thumbnail (Bypass 403) ------------------ */
+router.get('/item-thumbnail/:itemId', authenticateToken, async (req, res) => {
+  const { itemId } = req.params;
+  if (!itemId) return res.status(400).json({ error: 'ID do item é obrigatório.' });
+
+  try {
+    // Busca o primeiro token ativo do sistema para agir como proxy público
+    const { rows } = await db.query(
+      "SELECT access_token FROM public.ml_accounts WHERE status = 'active' LIMIT 1"
+    );
+    
+    if (rows.length === 0) {
+      return res.status(404).json({ error: 'Sem contas ML ativas para o proxy.' });
+    }
+    
+    const accessToken = rows[0].access_token;
+    
+    const mlResponse = await fetch(`https://api.mercadolibre.com/items/${itemId}`, {
+      headers: { 'Authorization': `Bearer ${accessToken}` }
+    });
+
+    if (!mlResponse.ok) {
+      return res.status(mlResponse.status).json({ error: 'ML API erro' });
+    }
+
+    const data = await mlResponse.json();
+    const thumb = data.thumbnail || (data.pictures && data.pictures[0]?.url) || null;
+    
+    res.json({ thumbnail: thumb });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
   }
 });
 
