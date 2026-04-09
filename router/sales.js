@@ -488,6 +488,7 @@ router.get('/all', authenticateToken, requireMaster, async (req, res) => {
     const buyer = (req.query.buyer || '').trim();
     const shippingLimitStart = (req.query.shippingLimitStart || '').trim();
     const shippingLimitEnd = (req.query.shippingLimitEnd || '').trim();
+    const shippingMode = (req.query.shippingMode || '').trim();
 
     const conditions = [];
     const params = [];
@@ -536,6 +537,17 @@ router.get('/all', authenticateToken, requireMaster, async (req, res) => {
         OR s.raw_api_data->'buyer'->>'nickname' ILIKE $${paramIdx}
       )`);
       params.push(`%${buyer}%`);
+      paramIdx++;
+    }
+    if (shippingMode) {
+      conditions.push(`s.shipping_mode = $${paramIdx}`);
+      params.push(shippingMode);
+      paramIdx++;
+    }
+    const userNickname = (req.query.userNickname || '').trim();
+    if (userNickname) {
+      conditions.push(`u.name ILIKE $${paramIdx}`);
+      params.push(`%${userNickname}%`);
       paramIdx++;
     }
     if (shippingLimitStart) {
