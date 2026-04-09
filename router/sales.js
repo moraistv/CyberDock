@@ -484,6 +484,10 @@ router.get('/all', authenticateToken, requireMaster, async (req, res) => {
     const saleStatus = (req.query.saleStatus || '').trim();
     const saleDateStart = (req.query.saleDateStart || '').trim();
     const saleDateEnd = (req.query.saleDateEnd || '').trim();
+    const account = (req.query.account || '').trim();
+    const buyer = (req.query.buyer || '').trim();
+    const shippingLimitStart = (req.query.shippingLimitStart || '').trim();
+    const shippingLimitEnd = (req.query.shippingLimitEnd || '').trim();
 
     const conditions = [];
     const params = [];
@@ -518,6 +522,30 @@ router.get('/all', authenticateToken, requireMaster, async (req, res) => {
     if (saleDateEnd) {
       conditions.push(`s.sale_date <= $${paramIdx}`);
       params.push(saleDateEnd + 'T23:59:59.999Z');
+      paramIdx++;
+    }
+    if (account) {
+      conditions.push(`s.account_nickname ILIKE $${paramIdx}`);
+      params.push(`%${account}%`);
+      paramIdx++;
+    }
+    if (buyer) {
+      conditions.push(`(
+        s.raw_api_data->'buyer'->>'first_name' ILIKE $${paramIdx}
+        OR s.raw_api_data->'buyer'->>'last_name' ILIKE $${paramIdx}
+        OR s.raw_api_data->'buyer'->>'nickname' ILIKE $${paramIdx}
+      )`);
+      params.push(`%${buyer}%`);
+      paramIdx++;
+    }
+    if (shippingLimitStart) {
+      conditions.push(`COALESCE(s.raw_api_data->'sla_data'->>'expected_date', s.shipping_limit_date::text) >= $${paramIdx}`);
+      params.push(shippingLimitStart);
+      paramIdx++;
+    }
+    if (shippingLimitEnd) {
+      conditions.push(`COALESCE(s.raw_api_data->'sla_data'->>'expected_date', s.shipping_limit_date::text) <= $${paramIdx}`);
+      params.push(shippingLimitEnd + 'T23:59:59.999Z');
       paramIdx++;
     }
 
