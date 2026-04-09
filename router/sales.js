@@ -539,6 +539,7 @@ router.get('/all', authenticateToken, requireMaster, async (req, res) => {
         s.raw_api_data->'sla_data'->>'expected_date' as sla_expected_date,
         (s.raw_api_data->'order_items'->0->'item'->>'thumbnail') as product_thumbnail,
         (s.raw_api_data->'order_items'->0->'item'->>'permalink') as product_permalink,
+        (s.raw_api_data->'order_items'->0->'item'->>'id') as ml_item_id,
         s.raw_api_data->'buyer'->>'first_name' as buyer_first_name,
         s.raw_api_data->'buyer'->>'last_name' as buyer_last_name,
         s.raw_api_data->'buyer'->>'nickname' as buyer_nickname
