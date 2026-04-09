@@ -309,37 +309,39 @@ router.get('/access-token/:mlUserId', authenticateToken, async (req, res) => {
   }
 });
 
-/* -------------------- Proxy Thumbnail (Bypass 403) ------------------ */
-router.get('/item-thumbnail/:itemId', authenticateToken, async (req, res) => {
-  const { itemId } = req.params;
-  if (!itemId) return res.status(400).json({ error: 'ID do item é obrigatório.' });
+/* -------------------- Image Proxy (Bypass 403) ---------------------- */
+// Serve a imagem diretamente como proxy de bytes — o frontend usa como src da <img>
+router.get('/img-proxy', authenticateToken, async (req, res) => {
+  const imageUrl = req.query.url;
+  if (!imageUrl) return res.status(400).send('URL da imagem é obrigatória.');
 
   try {
-    // Busca o primeiro token ativo do sistema para agir como proxy público
-    const { rows } = await db.query(
-      "SELECT access_token FROM public.ml_accounts WHERE status = 'active' LIMIT 1"
-    );
+    // Converte http para https
+    const safeUrl = String(imageUrl).replace(/^http:\/\//i, 'https://');
     
-    if (rows.length === 0) {
-      return res.status(404).json({ error: 'Sem contas ML ativas para o proxy.' });
-    }
-    
-    const accessToken = rows[0].access_token;
-    
-    const mlResponse = await fetch(`https://api.mercadolibre.com/items/${itemId}`, {
-      headers: { 'Authorization': `Bearer ${accessToken}` }
+    const imgResponse = await fetch(safeUrl, {
+      headers: {
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+        'Accept': 'image/webp,image/apng,image/*,*/*;q=0.8',
+        'Referer': 'https://www.mercadolivre.com.br/',
+      },
+      timeout: 8000,
     });
 
-    if (!mlResponse.ok) {
-      return res.status(mlResponse.status).json({ error: 'ML API erro' });
+    if (!imgResponse.ok) {
+      return res.status(imgResponse.status).send('Imagem não encontrada');
     }
 
-    const data = await mlResponse.json();
-    const thumb = data.thumbnail || (data.pictures && data.pictures[0]?.url) || null;
-    
-    res.json({ thumbnail: thumb });
+    // Repassa os headers de conteúdo da imagem
+    const contentType = imgResponse.headers.get('content-type') || 'image/jpeg';
+    res.setHeader('Content-Type', contentType);
+    res.setHeader('Cache-Control', 'public, max-age=86400'); // cache 24h
+    res.setHeader('Access-Control-Allow-Origin', '*');
+
+    // Streama os bytes da imagem diretamente para o cliente
+    imgResponse.body.pipe(res);
   } catch (error) {
-    res.status(500).json({ error: error.message });
+    res.status(500).send('Erro ao buscar imagem');
   }
 });
 
