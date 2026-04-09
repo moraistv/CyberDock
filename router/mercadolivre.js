@@ -265,8 +265,10 @@ router.get('/all-accounts', authenticateToken, async (req, res) => {
     
     res.json(rows);
   } catch (error) {
-    res.status(500).json({ error: 'Erro ao buscar contas globais.' });
+   res.status(500).json({ error: 'Erro ao buscar contas globais.' });
   }
+});
+
 /* -------------------- Lista de Contas p/ Usuário ----------------- */
 router.get('/contas/:uid', authenticateToken, async (req, res) => {
   const { uid } = req.params;
