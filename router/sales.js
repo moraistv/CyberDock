@@ -559,15 +559,17 @@ router.get('/all', authenticateToken, requireMaster, async (req, res) => {
     // Fetch page — extract thumbnail and permalink from raw_api_data via SQL
     const dataQuery = `
       SELECT s.id, s.sku, s.uid, s.seller_id, s.channel, s.account_nickname, s.sale_date,
-        s.product_title, s.quantity, s.shipping_mode, s.shipping_limit_date,
+        s.product_title, s.quantity, s.shipping_mode, 
+        COALESCE(s.shipping_limit_date, (s.raw_api_data->'sla_data'->>'expected_date')::timestamp, (s.raw_api_data->'shipping'->'shipping_option'->'estimated_delivery_time'->>'shipping_limit_date')::timestamp) as shipping_limit_date,
         s.packages, s.shipping_status, s.updated_at, s.processed_at,
+        s.raw_api_data as raw_api_data,
         u.name as user_nickname,
         s.raw_api_data->>'status' as sale_status,
         s.raw_api_data->'shipping'->>'id' as shipping_id,
         s.raw_api_data->'sla_data'->>'expected_date' as sla_expected_date,
-        (s.raw_api_data->'order_items'->0->'item'->>'thumbnail') as product_thumbnail,
-        (s.raw_api_data->'order_items'->0->'item'->>'permalink') as product_permalink,
-        (s.raw_api_data->'order_items'->0->'item'->>'id') as ml_item_id,
+        (s.raw_api_data::jsonb->'order_items'->0->'item'->>'thumbnail') as product_thumbnail,
+        (s.raw_api_data::jsonb->'order_items'->0->'item'->>'permalink') as product_permalink,
+        (s.raw_api_data::jsonb->'order_items'->0->'item'->>'id') as ml_item_id,
         s.raw_api_data->'buyer'->>'first_name' as buyer_first_name,
         s.raw_api_data->'buyer'->>'last_name' as buyer_last_name,
         s.raw_api_data->'buyer'->>'nickname' as buyer_nickname
