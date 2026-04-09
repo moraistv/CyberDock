@@ -594,6 +594,72 @@ router.get('/all', authenticateToken, requireMaster, async (req, res) => {
 
     const dataResult = await db.query(dataQuery, [...params, limit, offset]);
 
+    // ========== ENRICHMENT: Batch fetch thumbnails from ML Items API ==========
+    // A API de Orders do ML NÃO retorna thumbnails. Precisamos buscar via Items API.
+    try {
+      const rows = dataResult.rows;
+      // Coleta IDs únicos de items que não têm thumbnail
+      const itemIdsSet = new Set();
+      for (const row of rows) {
+        if (!row.product_thumbnail && row.ml_item_id) {
+          itemIdsSet.add(String(row.ml_item_id).toUpperCase());
+        }
+      }
+
+      if (itemIdsSet.size > 0) {
+        // Busca um token ativo do sistema
+        const tokenResult = await db.query(
+          "SELECT access_token FROM public.ml_accounts WHERE status = 'active' LIMIT 1"
+        );
+
+        if (tokenResult.rows.length > 0) {
+          const accessToken = tokenResult.rows[0].access_token;
+          const allIds = Array.from(itemIdsSet);
+          const thumbMap = {};
+
+          // ML permite até 20 IDs por request em /items?ids=
+          const BATCH_SIZE = 20;
+          for (let i = 0; i < allIds.length; i += BATCH_SIZE) {
+            const batch = allIds.slice(i, i + BATCH_SIZE);
+            try {
+              const mlRes = await fetch(
+                `https://api.mercadolibre.com/items?ids=${batch.join(',')}&attributes=id,thumbnail,secure_thumbnail`,
+                { headers: { 'Authorization': `Bearer ${accessToken}` } }
+              );
+              if (mlRes.ok) {
+                const mlData = await mlRes.json();
+                for (const entry of mlData) {
+                  if (entry.code === 200 && entry.body) {
+                    const thumb = entry.body.secure_thumbnail || entry.body.thumbnail;
+                    if (thumb) {
+                      thumbMap[String(entry.body.id).toUpperCase()] = thumb;
+                    }
+                  }
+                }
+              }
+            } catch (batchErr) {
+              // Silencia erros de batch individual — melhor retornar sem thumb do que crashar
+              console.warn('Erro ao buscar batch de thumbnails:', batchErr.message);
+            }
+          }
+
+          // Injeta thumbnails nos resultados
+          for (const row of rows) {
+            if (!row.product_thumbnail && row.ml_item_id) {
+              const key = String(row.ml_item_id).toUpperCase();
+              if (thumbMap[key]) {
+                row.product_thumbnail = thumbMap[key];
+              }
+            }
+          }
+        }
+      }
+    } catch (enrichErr) {
+      // Se falhar o enriquecimento, retorna sem thumbnails — melhor do que quebrar
+      console.warn('Erro no enriquecimento de thumbnails:', enrichErr.message);
+    }
+    // ========== END ENRICHMENT ==========
+
     res.json({
       data: dataResult.rows,
       total,

@@ -310,13 +310,22 @@ router.get('/access-token/:mlUserId', authenticateToken, async (req, res) => {
 });
 
 /* -------------------- Image Proxy (Bypass 403) ---------------------- */
-// Serve a imagem diretamente como proxy de bytes — o frontend usa como src da <img>
-router.get('/img-proxy', authenticateToken, async (req, res) => {
+// Público (sem auth) porque <img src=> não envia JWT. Protegido por whitelist de domínio.
+router.get('/img-proxy', async (req, res) => {
   const imageUrl = req.query.url;
   if (!imageUrl) return res.status(400).send('URL da imagem é obrigatória.');
 
+  // Segurança: só permite URLs do mlstatic (domínio de imagens do ML)
   try {
-    // Converte http para https
+    const parsed = new URL(imageUrl);
+    if (!parsed.hostname.endsWith('mlstatic.com')) {
+      return res.status(403).send('Domínio não permitido.');
+    }
+  } catch {
+    return res.status(400).send('URL inválida.');
+  }
+
+  try {
     const safeUrl = String(imageUrl).replace(/^http:\/\//i, 'https://');
     
     const imgResponse = await fetch(safeUrl, {
@@ -325,20 +334,17 @@ router.get('/img-proxy', authenticateToken, async (req, res) => {
         'Accept': 'image/webp,image/apng,image/*,*/*;q=0.8',
         'Referer': 'https://www.mercadolivre.com.br/',
       },
-      timeout: 8000,
     });
 
     if (!imgResponse.ok) {
       return res.status(imgResponse.status).send('Imagem não encontrada');
     }
 
-    // Repassa os headers de conteúdo da imagem
     const contentType = imgResponse.headers.get('content-type') || 'image/jpeg';
     res.setHeader('Content-Type', contentType);
-    res.setHeader('Cache-Control', 'public, max-age=86400'); // cache 24h
+    res.setHeader('Cache-Control', 'public, max-age=604800'); // cache 7 dias
     res.setHeader('Access-Control-Allow-Origin', '*');
 
-    // Streama os bytes da imagem diretamente para o cliente
     imgResponse.body.pipe(res);
   } catch (error) {
     res.status(500).send('Erro ao buscar imagem');
