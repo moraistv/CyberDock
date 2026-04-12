@@ -1171,10 +1171,11 @@ router.post('/sync-account', authenticateToken, async (req, res) => {
     } else {
       let lastSyncRes;
       if (req.user.role === 'master') {
-        // Para masters, busca a última venda da conta específica, independente do seller_id
+        // Para masters, busca a última venda da conta específica (seller_id)
+        // IMPORTANTE: filtrar por seller_id para suportar multi-contas (ex: MIMALE com 2 contas)
         lastSyncRes = await db.query(
-          `SELECT MAX(sale_date) AS last_sale FROM public.sales WHERE uid = $1`,
-          [targetUid]
+          `SELECT MAX(sale_date) AS last_sale FROM public.sales WHERE uid = $1 AND seller_id = $2`,
+          [targetUid, userId]
         );
       } else {
         // Para usuários normais, mantém a restrição de seller_id
@@ -1222,11 +1223,8 @@ router.post('/sync-account', authenticateToken, async (req, res) => {
           })
         });
         if (!refreshResponse.ok) {
-          if (req.user.role === 'master') {
-            await db.query("UPDATE public.ml_accounts SET status = 'reconnect_needed' WHERE uid = $1", [targetUid]);
-          } else {
-            await db.query("UPDATE public.ml_accounts SET status = 'reconnect_needed' WHERE user_id = $1 AND uid = $2", [userId, targetUid]);
-          }
+          // Marca apenas a conta específica (user_id) como necessitando reconexão
+          await db.query("UPDATE public.ml_accounts SET status = 'reconnect_needed' WHERE user_id = $1 AND uid = $2", [userId, targetUid]);
           throw new Error('Falha ao renovar token. É necessário reconectar a conta.');
         }
         const newTokenData = await refreshResponse.json();
