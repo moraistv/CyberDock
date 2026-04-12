@@ -540,9 +540,16 @@ router.get('/all', authenticateToken, requireMaster, async (req, res) => {
       paramIdx++;
     }
     if (shippingMode) {
-      conditions.push(`s.shipping_mode = $${paramIdx}`);
-      params.push(shippingMode);
-      paramIdx++;
+      const modes = shippingMode.split(',').map(m => m.trim()).filter(Boolean);
+      if (modes.length === 1) {
+        conditions.push(`s.shipping_mode = $${paramIdx}`);
+        params.push(modes[0]);
+        paramIdx++;
+      } else if (modes.length > 1) {
+        conditions.push(`s.shipping_mode = ANY($${paramIdx})`);
+        params.push(modes);
+        paramIdx++;
+      }
     }
     const userNickname = (req.query.userNickname || '').trim();
     if (userNickname) {
