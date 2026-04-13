@@ -590,7 +590,8 @@ router.get('/all', authenticateToken, requireMaster, async (req, res) => {
         (s.raw_api_data->'order_items'->0->'item'->>'id') as ml_item_id,
         s.raw_api_data->'buyer'->>'first_name' as buyer_first_name,
         s.raw_api_data->'buyer'->>'last_name' as buyer_last_name,
-        s.raw_api_data->'buyer'->>'nickname' as buyer_nickname
+        s.raw_api_data->'buyer'->>'nickname' as buyer_nickname,
+        EXISTS (SELECT 1 FROM public.skus sk WHERE sk.user_id = s.uid AND UPPER(TRIM(sk.sku)) = UPPER(TRIM(s.sku)) AND sk.ativo = true) as is_sku_mapped
       FROM public.sales s
       LEFT JOIN public.users u ON s.uid = u.uid
       ${whereClause}
