@@ -615,51 +615,92 @@ router.get('/all', authenticateToken, requireMaster, async (req, res) => {
       }
 
       if (itemIdsSet.size > 0) {
-        // Busca um token ativo do sistema
+        const allIds = Array.from(itemIdsSet);
+        const thumbMap = {};
+        const BATCH_SIZE = 20;
+
+        // Busca TODOS os tokens ativos, priorizando o mais recente
         const tokenResult = await db.query(
-          "SELECT access_token FROM public.ml_accounts WHERE status = 'active' LIMIT 1"
+          "SELECT access_token FROM public.ml_accounts WHERE status = 'active' ORDER BY updated_at DESC NULLS LAST"
         );
+        const tokens = tokenResult.rows.map(r => r.access_token);
 
-        if (tokenResult.rows.length > 0) {
-          const accessToken = tokenResult.rows[0].access_token;
-          const allIds = Array.from(itemIdsSet);
-          const thumbMap = {};
+        // Função para tentar buscar thumbnails com um header específico
+        const fetchThumbBatch = async (batch, headers) => {
+          const url = `https://api.mercadolibre.com/items?ids=${batch.join(',')}&attributes=id,thumbnail,secure_thumbnail`;
+          const res = await fetch(url, { headers });
+          if (!res.ok) return false;
+          const data = await res.json();
+          let found = 0;
+          for (const entry of data) {
+            if (entry.code === 200 && entry.body) {
+              const thumb = entry.body.secure_thumbnail || entry.body.thumbnail;
+              if (thumb) {
+                thumbMap[String(entry.body.id).toUpperCase()] = thumb;
+                found++;
+              }
+            }
+          }
+          return found > 0;
+        };
 
-          // ML permite até 20 IDs por request em /items?ids=
-          const BATCH_SIZE = 20;
-          for (let i = 0; i < allIds.length; i += BATCH_SIZE) {
-            const batch = allIds.slice(i, i + BATCH_SIZE);
+        for (let i = 0; i < allIds.length; i += BATCH_SIZE) {
+          const batch = allIds.slice(i, i + BATCH_SIZE);
+          let success = false;
+
+          // Tenta com cada token ativo (mais recente primeiro)
+          for (const token of tokens) {
             try {
-              const mlRes = await fetch(
-                `https://api.mercadolibre.com/items?ids=${batch.join(',')}&attributes=id,thumbnail,secure_thumbnail`,
-                { headers: { 'Authorization': `Bearer ${accessToken}` } }
-              );
-              if (mlRes.ok) {
-                const mlData = await mlRes.json();
-                for (const entry of mlData) {
-                  if (entry.code === 200 && entry.body) {
-                    const thumb = entry.body.secure_thumbnail || entry.body.thumbnail;
-                    if (thumb) {
-                      thumbMap[String(entry.body.id).toUpperCase()] = thumb;
-                    }
-                  }
-                }
-              }
-            } catch (batchErr) {
-              // Silencia erros de batch individual — melhor retornar sem thumb do que crashar
-              console.warn('Erro ao buscar batch de thumbnails:', batchErr.message);
+              success = await fetchThumbBatch(batch, { 'Authorization': `Bearer ${token}` });
+              if (success) break; // Funcionou, pula para o próximo batch
+            } catch (e) {
+              // Token falhou, tenta o próximo
             }
           }
 
-          // Injeta thumbnails nos resultados
-          for (const row of rows) {
-            if (!row.product_thumbnail && row.ml_item_id) {
-              const key = String(row.ml_item_id).toUpperCase();
-              if (thumbMap[key]) {
-                row.product_thumbnail = thumbMap[key];
-              }
+          // Fallback: tenta SEM autenticação (ML Items API é pública para thumbnails)
+          if (!success) {
+            try {
+              await fetchThumbBatch(batch, {});
+            } catch (e) {
+              // Silencia — melhor retornar sem thumb do que crashar
             }
           }
+        }
+
+        // Injeta thumbnails nos resultados
+        const idsToCache = []; // Para persistir no banco
+        for (const row of rows) {
+          if (!row.product_thumbnail && row.ml_item_id) {
+            const key = String(row.ml_item_id).toUpperCase();
+            if (thumbMap[key]) {
+              row.product_thumbnail = thumbMap[key];
+              idsToCache.push({ id: row.id, sku: row.sku, thumb: thumbMap[key] });
+            }
+          }
+        }
+
+        // Persiste thumbnails no raw_api_data para evitar re-fetch no futuro (fire & forget)
+        if (idsToCache.length > 0) {
+          setImmediate(async () => {
+            try {
+              for (const item of idsToCache) {
+                await db.query(
+                  `UPDATE public.sales
+                     SET raw_api_data = jsonb_set(
+                       COALESCE(raw_api_data, '{}')::jsonb,
+                       '{order_items,0,item,thumbnail}',
+                       $1::jsonb
+                     )
+                   WHERE id = $2 AND sku = $3`,
+                  [JSON.stringify(item.thumb), item.id, item.sku]
+                );
+              }
+            } catch (cacheErr) {
+              // Silencia — caching é best-effort, não deve afetar a resposta
+              console.warn('Erro ao cachear thumbnails:', cacheErr.message);
+            }
+          });
         }
       }
     } catch (enrichErr) {
