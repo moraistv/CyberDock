@@ -608,10 +608,20 @@ router.get('/all', authenticateToken, requireMaster, async (req, res) => {
       const rows = dataResult.rows;
       // Coleta IDs únicos de items que não têm thumbnail
       const itemIdsSet = new Set();
+      const noThumbNoId = []; // Itens sem thumbnail E sem ml_item_id
       for (const row of rows) {
         if (!row.product_thumbnail && row.ml_item_id) {
           itemIdsSet.add(String(row.ml_item_id).toUpperCase());
+        } else if (!row.product_thumbnail && !row.ml_item_id) {
+          noThumbNoId.push({ id: row.id, sku: row.sku, account: row.account_nickname });
         }
+      }
+
+      // LOG: Itens que NÃO têm ml_item_id (nunca vão ter thumbnail)
+      if (noThumbNoId.length > 0) {
+        console.warn(`[THUMB] ⚠️ ${noThumbNoId.length} vendas SEM ml_item_id (sem thumbnail possível):`);
+        noThumbNoId.slice(0, 5).forEach(x => console.warn(`  → Sale #${x.id} | SKU: ${x.sku} | Conta: ${x.account}`));
+        if (noThumbNoId.length > 5) console.warn(`  ... e mais ${noThumbNoId.length - 5} itens`);
       }
 
       if (itemIdsSet.size > 0) {
@@ -619,27 +629,42 @@ router.get('/all', authenticateToken, requireMaster, async (req, res) => {
         const thumbMap = {};
         const BATCH_SIZE = 20;
 
+        console.log(`[THUMB] Buscando thumbnails para ${allIds.length} itens únicos...`);
+
         // Busca TODOS os tokens ativos, priorizando o mais recente
         const tokenResult = await db.query(
-          "SELECT access_token FROM public.ml_accounts WHERE status = 'active' ORDER BY updated_at DESC NULLS LAST"
+          "SELECT access_token, nickname FROM public.ml_accounts WHERE status = 'active' ORDER BY updated_at DESC NULLS LAST"
         );
-        const tokens = tokenResult.rows.map(r => r.access_token);
+        const tokens = tokenResult.rows;
+        console.log(`[THUMB] ${tokens.length} tokens ativos disponíveis: ${tokens.map(t => t.nickname).join(', ')}`);
 
         // Função para tentar buscar thumbnails com um header específico
         const fetchThumbBatch = async (batch, headers) => {
           const url = `https://api.mercadolibre.com/items?ids=${batch.join(',')}&attributes=id,thumbnail,secure_thumbnail`;
           const res = await fetch(url, { headers });
-          if (!res.ok) return false;
+          if (!res.ok) {
+            console.warn(`[THUMB] API retornou status ${res.status} para batch de ${batch.length} itens`);
+            return false;
+          }
           const data = await res.json();
           let found = 0;
+          const failed = [];
           for (const entry of data) {
             if (entry.code === 200 && entry.body) {
               const thumb = entry.body.secure_thumbnail || entry.body.thumbnail;
               if (thumb) {
                 thumbMap[String(entry.body.id).toUpperCase()] = thumb;
                 found++;
+              } else {
+                failed.push({ id: entry.body.id, reason: 'sem thumbnail no body' });
               }
+            } else {
+              failed.push({ id: entry.body?.id || '?', code: entry.code, reason: entry.body?.message || 'erro' });
             }
+          }
+          if (failed.length > 0) {
+            console.warn(`[THUMB] ${failed.length} itens falharam no batch:`);
+            failed.forEach(f => console.warn(`  → ${f.id}: code=${f.code || '200'} reason=${f.reason}`));
           }
           return found > 0;
         };
@@ -649,36 +674,46 @@ router.get('/all', authenticateToken, requireMaster, async (req, res) => {
           let success = false;
 
           // Tenta com cada token ativo (mais recente primeiro)
-          for (const token of tokens) {
+          for (const tokenRow of tokens) {
             try {
-              success = await fetchThumbBatch(batch, { 'Authorization': `Bearer ${token}` });
-              if (success) break; // Funcionou, pula para o próximo batch
+              success = await fetchThumbBatch(batch, { 'Authorization': `Bearer ${tokenRow.access_token}` });
+              if (success) {
+                console.log(`[THUMB] ✅ Batch ${i / BATCH_SIZE + 1} OK com token de ${tokenRow.nickname}`);
+                break;
+              }
             } catch (e) {
-              // Token falhou, tenta o próximo
+              console.warn(`[THUMB] Token ${tokenRow.nickname} falhou: ${e.message}`);
             }
           }
 
           // Fallback: tenta SEM autenticação (ML Items API é pública para thumbnails)
           if (!success) {
             try {
-              await fetchThumbBatch(batch, {});
+              const fallbackOk = await fetchThumbBatch(batch, {});
+              console.log(`[THUMB] Fallback sem auth: ${fallbackOk ? '✅ OK' : '❌ sem resultados'}`);
             } catch (e) {
-              // Silencia — melhor retornar sem thumb do que crashar
+              console.warn(`[THUMB] Fallback sem auth falhou: ${e.message}`);
             }
           }
         }
 
         // Injeta thumbnails nos resultados
-        const idsToCache = []; // Para persistir no banco
+        const idsToCache = [];
+        let injected = 0;
+        let missed = 0;
         for (const row of rows) {
           if (!row.product_thumbnail && row.ml_item_id) {
             const key = String(row.ml_item_id).toUpperCase();
             if (thumbMap[key]) {
               row.product_thumbnail = thumbMap[key];
               idsToCache.push({ id: row.id, sku: row.sku, thumb: thumbMap[key] });
+              injected++;
+            } else {
+              missed++;
             }
           }
         }
+        console.log(`[THUMB] Resultado: ${injected} injetadas, ${missed} sem thumb encontrado, ${noThumbNoId.length} sem ml_item_id`);
 
         // Persiste thumbnails no raw_api_data para evitar re-fetch no futuro (fire & forget)
         if (idsToCache.length > 0) {
@@ -696,15 +731,14 @@ router.get('/all', authenticateToken, requireMaster, async (req, res) => {
                   [JSON.stringify(item.thumb), item.id, item.sku]
                 );
               }
+              console.log(`[THUMB] ✅ Cacheadas ${idsToCache.length} thumbnails no banco`);
             } catch (cacheErr) {
-              // Silencia — caching é best-effort, não deve afetar a resposta
               console.warn('Erro ao cachear thumbnails:', cacheErr.message);
             }
           });
         }
       }
     } catch (enrichErr) {
-      // Se falhar o enriquecimento, retorna sem thumbnails — melhor do que quebrar
       console.warn('Erro no enriquecimento de thumbnails:', enrichErr.message);
     }
     // ========== END ENRICHMENT ==========
