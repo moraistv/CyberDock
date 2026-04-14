@@ -474,6 +474,20 @@ router.get('/sync-status/:clientId', (req, res) => {
   });
 });
 
+router.get('/filter-options', authenticateToken, requireMaster, async (req, res) => {
+  try {
+    const accResult = await db.query("SELECT DISTINCT nickname FROM public.ml_accounts WHERE nickname IS NOT NULL AND status = 'active' ORDER BY nickname");
+    const userResult = await db.query("SELECT DISTINCT name FROM public.users WHERE name IS NOT NULL AND status = 'active' ORDER BY name");
+    res.json({
+      accounts: accResult.rows.map(r => r.nickname),
+      users: userResult.rows.map(r => r.name)
+    });
+  } catch (err) {
+    console.error('Erro ao buscar filter options:', err);
+    res.status(500).json({ error: 'Falha ao buscar opções de filtro' });
+  }
+});
+
 router.get('/all', authenticateToken, requireMaster, async (req, res) => {
   try {
     const page = Math.max(1, parseInt(req.query.page) || 1);
