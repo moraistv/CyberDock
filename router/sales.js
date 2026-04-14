@@ -603,96 +603,96 @@ router.get('/all', authenticateToken, requireMaster, async (req, res) => {
     const dataResult = await db.query(dataQuery, [...params, limit, offset]);
 
     // ========== ENRICHMENT: Batch fetch thumbnails from ML Items API ==========
-    // A API de Orders do ML NÃO retorna thumbnails. Precisamos buscar via Items API.
+    // Itens de catálogo retornam 403 se o token não pertence ao vendedor.
+    // Solução: agrupar por conta e usar o token correspondente.
     try {
       const rows = dataResult.rows;
-      // Coleta IDs únicos de items que não têm thumbnail
-      const itemIdsSet = new Set();
-      const noThumbNoId = []; // Itens sem thumbnail E sem ml_item_id
+      const thumbMap = {};
+
+      // Agrupa itens sem thumbnail por account_nickname (cada conta tem seu token)
+      const byAccount = {};  // { nickname: [ml_item_id, ...] }
       for (const row of rows) {
         if (!row.product_thumbnail && row.ml_item_id) {
-          itemIdsSet.add(String(row.ml_item_id).toUpperCase());
-        } else if (!row.product_thumbnail && !row.ml_item_id) {
-          noThumbNoId.push({ id: row.id, sku: row.sku, account: row.account_nickname });
+          const acct = row.account_nickname || '__unknown__';
+          if (!byAccount[acct]) byAccount[acct] = new Set();
+          byAccount[acct].add(String(row.ml_item_id).toUpperCase());
         }
       }
 
-      // LOG: Itens que NÃO têm ml_item_id (nunca vão ter thumbnail)
-      if (noThumbNoId.length > 0) {
-        console.warn(`[THUMB] ⚠️ ${noThumbNoId.length} vendas SEM ml_item_id (sem thumbnail possível):`);
-        noThumbNoId.slice(0, 5).forEach(x => console.warn(`  → Sale #${x.id} | SKU: ${x.sku} | Conta: ${x.account}`));
-        if (noThumbNoId.length > 5) console.warn(`  ... e mais ${noThumbNoId.length - 5} itens`);
-      }
+      const accountNames = Object.keys(byAccount);
+      if (accountNames.length > 0) {
+        // Busca TODOS os tokens ativos mapeados por nickname
+        const tokenResult = await db.query(
+          "SELECT access_token, nickname, user_id FROM public.ml_accounts WHERE status = 'active' ORDER BY updated_at DESC NULLS LAST"
+        );
+        const tokenByNickname = {};
+        const allTokens = [];
+        for (const t of tokenResult.rows) {
+          if (t.nickname && !tokenByNickname[t.nickname]) {
+            tokenByNickname[t.nickname] = t.access_token;
+          }
+          allTokens.push(t);
+        }
 
-      if (itemIdsSet.size > 0) {
-        const allIds = Array.from(itemIdsSet);
-        const thumbMap = {};
         const BATCH_SIZE = 20;
 
-        console.log(`[THUMB] Buscando thumbnails para ${allIds.length} itens únicos...`);
-
-        // Busca TODOS os tokens ativos, priorizando o mais recente
-        const tokenResult = await db.query(
-          "SELECT access_token, nickname FROM public.ml_accounts WHERE status = 'active' ORDER BY updated_at DESC NULLS LAST"
-        );
-        const tokens = tokenResult.rows;
-        console.log(`[THUMB] ${tokens.length} tokens ativos disponíveis: ${tokens.map(t => t.nickname).join(', ')}`);
-
-        // Função para tentar buscar thumbnails com um header específico
+        // Função que busca thumbnails para um batch de IDs com headers
         const fetchThumbBatch = async (batch, headers) => {
           const url = `https://api.mercadolibre.com/items?ids=${batch.join(',')}&attributes=id,thumbnail,secure_thumbnail`;
           const res = await fetch(url, { headers });
-          if (!res.ok) {
-            console.warn(`[THUMB] API retornou status ${res.status} para batch de ${batch.length} itens`);
-            return false;
-          }
+          if (!res.ok) return 0;
           const data = await res.json();
           let found = 0;
-          const failed = [];
           for (const entry of data) {
             if (entry.code === 200 && entry.body) {
               const thumb = entry.body.secure_thumbnail || entry.body.thumbnail;
               if (thumb) {
                 thumbMap[String(entry.body.id).toUpperCase()] = thumb;
                 found++;
-              } else {
-                failed.push({ id: entry.body.id, reason: 'sem thumbnail no body' });
               }
-            } else {
-              failed.push({ id: entry.body?.id || '?', code: entry.code, reason: entry.body?.message || 'erro' });
             }
           }
-          if (failed.length > 0) {
-            console.warn(`[THUMB] ${failed.length} itens falharam no batch:`);
-            failed.forEach(f => console.warn(`  → ${f.id}: code=${f.code || '200'} reason=${f.reason}`));
-          }
-          return found > 0;
+          return found;
         };
 
-        for (let i = 0; i < allIds.length; i += BATCH_SIZE) {
-          const batch = allIds.slice(i, i + BATCH_SIZE);
-          let success = false;
+        // Para cada conta, busca thumbnails com o token DELA
+        for (const acctName of accountNames) {
+          const itemIds = Array.from(byAccount[acctName]);
+          const ownToken = tokenByNickname[acctName];
 
-          // Tenta com cada token ativo (mais recente primeiro)
-          for (const tokenRow of tokens) {
-            try {
-              success = await fetchThumbBatch(batch, { 'Authorization': `Bearer ${tokenRow.access_token}` });
-              if (success) {
-                console.log(`[THUMB] ✅ Batch ${i / BATCH_SIZE + 1} OK com token de ${tokenRow.nickname}`);
-                break;
-              }
-            } catch (e) {
-              console.warn(`[THUMB] Token ${tokenRow.nickname} falhou: ${e.message}`);
+          for (let i = 0; i < itemIds.length; i += BATCH_SIZE) {
+            const batch = itemIds.slice(i, i + BATCH_SIZE);
+            // Filtra apenas IDs que ainda não temos thumb
+            const pending = batch.filter(id => !thumbMap[id]);
+            if (pending.length === 0) continue;
+
+            let found = 0;
+
+            // 1) Tenta com o token do DONO da venda (resolve o 403)
+            if (ownToken) {
+              try {
+                found = await fetchThumbBatch(pending, { 'Authorization': `Bearer ${ownToken}` });
+              } catch (e) { /* silencia */ }
             }
-          }
 
-          // Fallback: tenta SEM autenticação (ML Items API é pública para thumbnails)
-          if (!success) {
-            try {
-              const fallbackOk = await fetchThumbBatch(batch, {});
-              console.log(`[THUMB] Fallback sem auth: ${fallbackOk ? '✅ OK' : '❌ sem resultados'}`);
-            } catch (e) {
-              console.warn(`[THUMB] Fallback sem auth falhou: ${e.message}`);
+            // 2) Se não encontrou tudo, tenta com outros tokens
+            if (found < pending.length) {
+              const stillMissing = pending.filter(id => !thumbMap[id]);
+              if (stillMissing.length > 0) {
+                for (const t of allTokens) {
+                  if (t.nickname === acctName) continue; // já tentou
+                  try {
+                    const f = await fetchThumbBatch(stillMissing, { 'Authorization': `Bearer ${t.access_token}` });
+                    if (f > 0) break;
+                  } catch (e) { /* silencia */ }
+                }
+              }
+            }
+
+            // 3) Fallback sem auth
+            const finalMissing = pending.filter(id => !thumbMap[id]);
+            if (finalMissing.length > 0) {
+              try { await fetchThumbBatch(finalMissing, {}); } catch (e) { /* silencia */ }
             }
           }
         }
@@ -700,7 +700,6 @@ router.get('/all', authenticateToken, requireMaster, async (req, res) => {
         // Injeta thumbnails nos resultados
         const idsToCache = [];
         let injected = 0;
-        let missed = 0;
         for (const row of rows) {
           if (!row.product_thumbnail && row.ml_item_id) {
             const key = String(row.ml_item_id).toUpperCase();
@@ -708,14 +707,15 @@ router.get('/all', authenticateToken, requireMaster, async (req, res) => {
               row.product_thumbnail = thumbMap[key];
               idsToCache.push({ id: row.id, sku: row.sku, thumb: thumbMap[key] });
               injected++;
-            } else {
-              missed++;
             }
           }
         }
-        console.log(`[THUMB] Resultado: ${injected} injetadas, ${missed} sem thumb encontrado, ${noThumbNoId.length} sem ml_item_id`);
 
-        // Persiste thumbnails no raw_api_data para evitar re-fetch no futuro (fire & forget)
+        if (injected > 0 || Object.keys(thumbMap).length > 0) {
+          console.log(`[THUMB] ✅ ${injected} thumbnails injetadas de ${Object.keys(thumbMap).length} encontradas`);
+        }
+
+        // Persiste thumbnails no raw_api_data (fire & forget)
         if (idsToCache.length > 0) {
           setImmediate(async () => {
             try {
@@ -731,15 +731,15 @@ router.get('/all', authenticateToken, requireMaster, async (req, res) => {
                   [JSON.stringify(item.thumb), item.id, item.sku]
                 );
               }
-              console.log(`[THUMB] ✅ Cacheadas ${idsToCache.length} thumbnails no banco`);
+              console.log(`[THUMB] ✅ ${idsToCache.length} thumbnails cacheadas no banco`);
             } catch (cacheErr) {
-              console.warn('Erro ao cachear thumbnails:', cacheErr.message);
+              console.warn('[THUMB] Erro ao cachear:', cacheErr.message);
             }
           });
         }
       }
     } catch (enrichErr) {
-      console.warn('Erro no enriquecimento de thumbnails:', enrichErr.message);
+      console.warn('[THUMB] Erro no enriquecimento:', enrichErr.message);
     }
     // ========== END ENRICHMENT ==========
 
