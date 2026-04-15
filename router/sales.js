@@ -582,6 +582,9 @@ router.get('/all', authenticateToken, requireMaster, async (req, res) => {
       paramIdx++;
     }
 
+    // Default system filter: do not show sales of inactive users in the master table
+    conditions.push(`COALESCE(u.active, true) = true`);
+
     const whereClause = conditions.length > 0 ? 'WHERE ' + conditions.join(' AND ') : '';
 
     // Count total
