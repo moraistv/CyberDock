@@ -582,6 +582,8 @@ router.get('/download-label', authenticateToken, async (req, res) => {
     }
 
     // 2) Tenta métodos (single vs batch)
+    let lastErrorDetails = null;
+
     const tryEndpoints = async () => {
       // Se for 1 id, prioriza endpoint individual
       if (ids.length === 1) {
@@ -589,11 +591,13 @@ router.get('/download-label', authenticateToken, async (req, res) => {
         const url1 = `https://api.mercadolibre.com/shipments/${id}/labels?response_type=${type}`;
         const resp1 = await fetchMLWithAutoRefresh(url1, { seller_id, uid, role, accept: acceptHeader }, tokens);
         if (resp1.ok && resp1.headers.get('content-type')?.includes(isPDF ? 'pdf' : 'zpl')) return resp1;
+        if (!resp1.ok) lastErrorDetails = await resp1.json().catch(() => null);
 
         // fallback: endpoint geral com 1 id
         const url2 = `https://api.mercadolibre.com/shipment_labels?shipment_ids=${id}&response_type=${type}`;
         const resp2 = await fetchMLWithAutoRefresh(url2, { seller_id, uid, role, accept: acceptHeader }, tokens);
         if (resp2.ok && resp2.headers.get('content-type')?.includes(isPDF ? 'pdf' : 'zpl')) return resp2;
+        if (!resp2.ok && !lastErrorDetails) lastErrorDetails = await resp2.json().catch(() => null);
 
         // fallback com access_token na query (alguns ambientes legados)
         const url3 = `https://api.mercadolibre.com/shipment_labels?shipment_ids=${id}&response_type=${type}&access_token=${
@@ -614,6 +618,7 @@ router.get('/download-label', authenticateToken, async (req, res) => {
         tokens
       );
       if (respBatch.ok && respBatch.headers.get('content-type')?.includes(isPDF ? 'pdf' : 'zpl')) return respBatch;
+      if (!respBatch.ok) lastErrorDetails = await respBatch.json().catch(() => null);
 
       // fallback: tenta baixar um a um e juntar? (não suportaremos mesclar PDF aqui; retornaremos erro detalhado)
       return null;
@@ -621,18 +626,13 @@ router.get('/download-label', authenticateToken, async (req, res) => {
 
     const mlResponse = await tryEndpoints();
     if (!mlResponse) {
-      // Tenta ler JSON de erro do ML para repassar
-      let mlErr = null;
-      try {
-        mlErr = await mlResponse.json();
-      } catch {}
       return res.status(400).json({
-        error: 'Etiqueta não disponível',
+        error: lastErrorDetails?.message || 'Etiqueta não disponível',
         message:
           'Não foi possível obter a etiqueta no momento. Verifique se os envios estão aptos ou tente novamente em instantes.',
         details: {
           shipmentIdsTried: ids,
-          mlError: mlErr || 'Sem detalhes',
+          mlError: lastErrorDetails || 'Sem detalhes',
         },
       });
     }
