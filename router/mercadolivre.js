@@ -561,6 +561,16 @@ router.get('/download-label', authenticateToken, async (req, res) => {
 
     // 1) Verifica status de cada shipment e bloqueia apenas os claramente impossíveis
     const nonPrintableStatuses = new Set(['shipped', 'delivered', 'cancelled', 'canceled']);
+    
+    // Tradutor humano de erros
+    const getHumanError = (status) => {
+      const s = (status || '').toLowerCase();
+      if (s === 'shipped') return 'já foi despachado';
+      if (s === 'delivered') return 'já foi entregue';
+      if (s === 'cancelled' || s === 'canceled') return 'foi cancelado';
+      return 'não está liberado';
+    };
+
     const statusChecks = await Promise.all(
       ids.map(async (id) => {
         const url = `https://api.mercadolibre.com/shipments/${id}`;
@@ -573,11 +583,10 @@ router.get('/download-label', authenticateToken, async (req, res) => {
 
     const notPrintable = statusChecks.filter((s) => !s.printable);
     if (notPrintable.length > 0) {
+      const details = notPrintable.map((x) => `Envio ${x.id} (${getHumanError(x.status)})`).join(', ');
       return res.status(400).json({
-        error: 'Etiqueta não disponível',
-        message: `Um ou mais envios não possuem etiqueta disponível: ${notPrintable
-          .map((x) => `${x.id} (status: ${x.status || 'desconhecido'})`)
-          .join(', ')}`,
+        error: 'Etiqueta Indisponível',
+        message: `Não é possível imprimir: ${details}.`,
         details: { shipmentIdsTried: ids, blockedByStatus: notPrintable },
       });
     }
@@ -609,16 +618,33 @@ router.get('/download-label', authenticateToken, async (req, res) => {
       try {
         const pdfDoc = await PDFDocument.load(pdfBuffer);
         const pages = pdfDoc.getPages();
+        if (pages.length === 0) return pdfBuffer;
+
         const text = `SKU: ${sku || 'N/A'} | Cliente: ${userName || 'N/A'}`;
-        for (const page of pages) {
-          const { height } = page.getSize();
-          page.drawText(text, {
-            x: 20,
-            y: height - 15,
-            size: 10,
-            color: rgb(0, 0, 0)
-          });
-        }
+        // Apenas a primeira página! (Evita sujar a PLP e a Declaração de Conteúdo)
+        const page = pages[0];
+        const { height } = page.getSize();
+        
+        // Verifica se é A4 (> 600) ou Térmica (< 600)
+        const isA4 = height > 600;
+        
+        // Coordenadas calculadas para ficar ACIMA do último código de barras
+        // A4: o último código costuma ficar perto do Y=350-400 (se o topo da folha é o 842).
+        // Térmica: o último código fica perto da base da etiqueta, Y=50-80.
+        const xPos = isA4 ? 40 : 20;
+        const yPos = isA4 ? (height / 2) + 15 : 120; // +15 a partir da metade (separa a etiqueta da PLP/Danfe) na A4.
+        
+        // Em um A4 do ML, a metade inferior tem a PLP ou está em branco.
+        // A etiqueta ocupa a metade superior. O último cód. de barras fica no final da metade superior.
+        // Portanto, a linha do meio (height/2) é 421. Desenhamos um pouco acima, no y = 435.
+
+        page.drawText(text, {
+          x: xPos,
+          y: yPos,
+          size: 10,
+          color: rgb(0, 0, 0)
+        });
+
         const bytes = await pdfDoc.save();
         return Buffer.from(bytes);
       } catch (err) {
