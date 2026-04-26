@@ -632,16 +632,12 @@ router.get('/download-label', authenticateToken, async (req, res) => {
         // A4: o último código costuma ficar perto do Y=350-400 (se o topo da folha é o 842).
         // Térmica: o último código fica perto da base da etiqueta, Y=50-80.
         const xPos = isA4 ? 40 : 20;
-        const yPos = isA4 ? (height / 2) + 15 : 120; // +15 a partir da metade (separa a etiqueta da PLP/Danfe) na A4.
+        const yPos = isA4 ? (height / 2) + 85 : 120; // +85 a partir da metade (sobe para ficar acima do código de barras inferior)
         
-        // Em um A4 do ML, a metade inferior tem a PLP ou está em branco.
-        // A etiqueta ocupa a metade superior. O último cód. de barras fica no final da metade superior.
-        // Portanto, a linha do meio (height/2) é 421. Desenhamos um pouco acima, no y = 435.
-
         page.drawText(text, {
           x: xPos,
           y: yPos,
-          size: 10,
+          size: 8,
           color: rgb(0, 0, 0)
         });
 
