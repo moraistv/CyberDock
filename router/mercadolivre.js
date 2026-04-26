@@ -625,14 +625,12 @@ router.get('/download-label', authenticateToken, async (req, res) => {
         const page = pages[0];
         const { height } = page.getSize();
         
-        // Verifica se é A4 (> 600) ou Térmica (< 600)
-        const isA4 = height > 600;
-        
-        // Coordenadas calculadas para ficar ACIMA do último código de barras
-        // A4: o último código costuma ficar perto do Y=350-400 (se o topo da folha é o 842).
-        // Térmica: o último código fica perto da base da etiqueta, Y=50-80.
-        const xPos = isA4 ? 40 : 20;
-        const yPos = isA4 ? (height / 2) + 85 : 120; // +85 a partir da metade (sobe para ficar acima do código de barras inferior)
+        // Em todas as etiquetas do ML (A4 ou Térmica), o conteúdo principal é ancorado no topo.
+        // A etiqueta ocupa cerca de 380-400 pontos de altura a partir do topo.
+        // O código de barras inferior e a linha "Remetente" ficam perto de 300-340 pontos abaixo do topo.
+        // Medindo a partir do topo (height), descemos 315 pontos para ficar em cima da linha.
+        const xPos = 25;
+        const yPos = height - 315; 
         
         page.drawText(text, {
           x: xPos,
