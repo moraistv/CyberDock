@@ -626,11 +626,10 @@ router.get('/download-label', authenticateToken, async (req, res) => {
         const { height } = page.getSize();
         
         // Em todas as etiquetas do ML (A4 ou Térmica), o conteúdo principal é ancorado no topo.
-        // A etiqueta ocupa cerca de 380-400 pontos de altura a partir do topo.
-        // O código de barras inferior e a linha "Remetente" ficam perto de 300-340 pontos abaixo do topo.
-        // Medindo a partir do topo (height), descemos 315 pontos para ficar em cima da linha.
+        // A linha acima de "Remetente" está por volta de 315 pontos abaixo do topo.
+        // Medindo a partir do topo (height), descemos 295 pontos para ficar no espaço em branco acima dessa linha.
         const xPos = 25;
-        const yPos = height - 315; 
+        const yPos = height - 295;  
         
         page.drawText(text, {
           x: xPos,
