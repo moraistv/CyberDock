@@ -5,6 +5,7 @@ const fetch = require('node-fetch'); // v2.x (web streams no v3 mudam o pipe)
 const crypto = require('crypto');
 const db = require('../utils/postgres');
 const { authenticateToken } = require('../utils/authMiddleware');
+const { PDFDocument, rgb } = require('pdf-lib');
 
 const router = express.Router();
 
@@ -581,82 +582,143 @@ router.get('/download-label', authenticateToken, async (req, res) => {
       });
     }
 
-    // 2) Tenta métodos (single vs batch)
+    // 2) Buscar SKU e Cliente no DB para enriquecer a etiqueta
+    let salesInfo = [];
+    try {
+      const dbRes = await db.query(`
+        SELECT 
+          s.raw_api_data->'shipping'->>'id' as shipping_id, 
+          s.sku, 
+          u.name as user_name 
+        FROM public.sales s 
+        JOIN public.users u ON s.uid = u.uid 
+        WHERE s.raw_api_data->'shipping'->>'id' = ANY($1)
+      `, [ids]);
+      salesInfo = dbRes.rows;
+    } catch (err) {
+      console.error('Erro ao buscar dados de vendas para etiqueta:', err);
+    }
+    
+    const infoMap = {};
+    salesInfo.forEach(r => {
+      infoMap[String(r.shipping_id)] = { sku: r.sku, user_name: r.user_name };
+    });
+
+    const enrichPdf = async (pdfBuffer, sku, userName) => {
+      if (!sku && !userName) return pdfBuffer;
+      try {
+        const pdfDoc = await PDFDocument.load(pdfBuffer);
+        const pages = pdfDoc.getPages();
+        const text = `SKU: ${sku || 'N/A'} | Cliente: ${userName || 'N/A'}`;
+        for (const page of pages) {
+          const { height } = page.getSize();
+          page.drawText(text, {
+            x: 20,
+            y: height - 15,
+            size: 10,
+            color: rgb(0, 0, 0)
+          });
+        }
+        const bytes = await pdfDoc.save();
+        return Buffer.from(bytes);
+      } catch (err) {
+        console.error('Erro ao enriquecer PDF:', err);
+        return pdfBuffer;
+      }
+    };
+
+    const enrichZpl = (zplString, sku, userName) => {
+      if (!sku && !userName) return zplString;
+      const text = `SKU: ${sku || 'N/A'} | Cliente: ${userName || 'N/A'}`;
+      // Adiciona um bloco ZPL no fim da string para imprimir o texto
+      // A maioria das etiquetas termina com ^XZ. Injetar logo antes ou enviar como nova etiqueta curta.
+      // É mais seguro concatenar uma mini etiqueta logo após a principal para não estragar a formatação nativa.
+      const extraTag = `^XA^FO50,50^A0N,30,30^FD${text}^FS^XZ\n`;
+      return zplString + '\n' + extraTag;
+    };
+
     let lastErrorDetails = null;
 
-    const tryEndpoints = async () => {
-      // Se for 1 id, prioriza endpoint individual
-      if (ids.length === 1) {
-        const id = ids[0];
-        const url1 = `https://api.mercadolibre.com/shipments/${id}/labels?response_type=${type}`;
-        const resp1 = await fetchMLWithAutoRefresh(url1, { seller_id, uid, role, accept: acceptHeader }, tokens);
-        if (resp1.ok && resp1.headers.get('content-type')?.includes(isPDF ? 'pdf' : 'zpl')) return resp1;
-        if (!resp1.ok) lastErrorDetails = await resp1.json().catch(() => null);
+    // Função para baixar uma única etiqueta
+    const downloadSingle = async (id) => {
+      const url1 = `https://api.mercadolibre.com/shipments/${id}/labels?response_type=${type}`;
+      const resp1 = await fetchMLWithAutoRefresh(url1, { seller_id, uid, role, accept: acceptHeader }, tokens);
+      if (resp1.ok && resp1.headers.get('content-type')?.includes(isPDF ? 'pdf' : 'zpl')) return resp1;
+      if (!resp1.ok) lastErrorDetails = await resp1.json().catch(() => null);
 
-        // fallback: endpoint geral com 1 id
-        const url2 = `https://api.mercadolibre.com/shipment_labels?shipment_ids=${id}&response_type=${type}`;
-        const resp2 = await fetchMLWithAutoRefresh(url2, { seller_id, uid, role, accept: acceptHeader }, tokens);
-        if (resp2.ok && resp2.headers.get('content-type')?.includes(isPDF ? 'pdf' : 'zpl')) return resp2;
-        if (!resp2.ok && !lastErrorDetails) lastErrorDetails = await resp2.json().catch(() => null);
+      const url2 = `https://api.mercadolibre.com/shipment_labels?shipment_ids=${id}&response_type=${type}`;
+      const resp2 = await fetchMLWithAutoRefresh(url2, { seller_id, uid, role, accept: acceptHeader }, tokens);
+      if (resp2.ok && resp2.headers.get('content-type')?.includes(isPDF ? 'pdf' : 'zpl')) return resp2;
+      if (!resp2.ok && !lastErrorDetails) lastErrorDetails = await resp2.json().catch(() => null);
 
-        // fallback com access_token na query (alguns ambientes legados)
-        const url3 = `https://api.mercadolibre.com/shipment_labels?shipment_ids=${id}&response_type=${type}&access_token=${
-          (await getAccountTokens({ seller_id, uid, role })).accessToken
-        }`;
-        const resp3 = await fetch(url3, { headers: { Accept: acceptHeader } }); // sem bearer
-        if (resp3.ok && resp3.headers.get('content-type')?.includes(isPDF ? 'pdf' : 'zpl')) return resp3;
-
-        return null;
-      }
-
-      // Com vários ids, prioriza endpoint em lote
-      const joined = ids.join(',');
-      const urlBatch = `https://api.mercadolibre.com/shipment_labels?shipment_ids=${joined}&response_type=${type}`;
-      const respBatch = await fetchMLWithAutoRefresh(
-        urlBatch,
-        { seller_id, uid, role, accept: acceptHeader },
-        tokens
-      );
-      if (respBatch.ok && respBatch.headers.get('content-type')?.includes(isPDF ? 'pdf' : 'zpl')) return respBatch;
-      if (!respBatch.ok) lastErrorDetails = await respBatch.json().catch(() => null);
-
-      // fallback: tenta baixar um a um e juntar? (não suportaremos mesclar PDF aqui; retornaremos erro detalhado)
+      const url3 = `https://api.mercadolibre.com/shipment_labels?shipment_ids=${id}&response_type=${type}&access_token=${tokens.accessToken}`;
+      const resp3 = await fetch(url3, { headers: { Accept: acceptHeader } });
+      if (resp3.ok && resp3.headers.get('content-type')?.includes(isPDF ? 'pdf' : 'zpl')) return resp3;
+      
       return null;
     };
 
-    const mlResponse = await tryEndpoints();
-    if (!mlResponse) {
+    // Baixa, enriquece e junta todas
+    const buffers = [];
+    let hasError = false;
+
+    for (const id of ids) {
+      const resp = await downloadSingle(id);
+      if (!resp) {
+        hasError = true;
+        break;
+      }
+      
+      const ab = await resp.arrayBuffer();
+      let buf = Buffer.from(ab);
+      const info = infoMap[id] || {};
+
+      if (isPDF) {
+        buf = await enrichPdf(buf, info.sku, info.user_name);
+      } else {
+        const zplStr = enrichZpl(buf.toString('utf-8'), info.sku, info.user_name);
+        buf = Buffer.from(zplStr, 'utf-8');
+      }
+      buffers.push(buf);
+    }
+
+    if (hasError || buffers.length === 0) {
       return res.status(400).json({
         error: lastErrorDetails?.message || 'Etiqueta não disponível',
-        message:
-          'Não foi possível obter a etiqueta no momento. Verifique se os envios estão aptos ou tente novamente em instantes.',
-        details: {
-          shipmentIdsTried: ids,
-          mlError: lastErrorDetails || 'Sem detalhes',
-        },
+        message: 'Não foi possível obter a etiqueta no momento. Verifique se os envios estão aptos ou tente novamente em instantes.',
+        details: { shipmentIdsTried: ids, mlError: lastErrorDetails || 'Sem detalhes' },
       });
     }
 
-    // 3) Stream seguro do conteúdo (sem depender de .body.pipe em envs com web streams)
-    const ct = mlResponse.headers.get('content-type') || (isPDF ? 'application/pdf' : 'application/zpl');
+    // Mesclar os resultados
+    let finalBuffer;
+    if (isPDF) {
+      if (buffers.length === 1) {
+        finalBuffer = buffers[0];
+      } else {
+        const mergedPdf = await PDFDocument.create();
+        for (const buf of buffers) {
+          try {
+            const doc = await PDFDocument.load(buf);
+            const copiedPages = await mergedPdf.copyPages(doc, doc.getPageIndices());
+            copiedPages.forEach((page) => mergedPdf.addPage(page));
+          } catch (err) {
+            console.error('Erro ao mesclar PDF:', err);
+          }
+        }
+        finalBuffer = Buffer.from(await mergedPdf.save());
+      }
+    } else {
+      finalBuffer = Buffer.concat(buffers);
+    }
+
+    const ct = isPDF ? 'application/pdf' : 'application/zpl';
     const cd = `attachment; filename="etiqueta-${ids.length === 1 ? ids[0] : 'lote'}.${isPDF ? 'pdf' : 'zpl'}"`;
 
-    // Detecta se veio JSON (erro do ML) e repassa como 400
-    if (ct.includes('application/json')) {
-      const payload = await mlResponse.json().catch(() => ({}));
-      return res.status(400).json({
-        error: 'Etiqueta não disponível',
-        message: payload.message || 'Resposta da API do Mercado Livre não retornou arquivo de etiqueta.',
-        details: { shipmentIdsTried: ids, mlPayload: payload },
-      });
-    }
-
-    const ab = await mlResponse.arrayBuffer();
-    const buf = Buffer.from(ab);
     res.setHeader('Content-Type', ct);
     res.setHeader('Content-Disposition', cd);
-    res.setHeader('Content-Length', String(buf.length));
-    return res.status(200).end(buf);
+    res.setHeader('Content-Length', String(finalBuffer.length));
+    return res.status(200).end(finalBuffer);
   } catch (error) {
     console.error('Erro no servidor ao baixar etiqueta:', error);
     res.status(error.status || 500).json({
