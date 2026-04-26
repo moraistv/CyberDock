@@ -628,13 +628,13 @@ router.get('/download-label', authenticateToken, async (req, res) => {
         // Em todas as etiquetas do ML (A4 ou Térmica), o conteúdo principal é ancorado no topo.
         // A linha acima de "Remetente" está por volta de 315 pontos abaixo do topo.
         // Medindo a partir do topo (height), descemos 295 pontos para ficar no espaço em branco acima dessa linha.
-        const xPos = 25;
+        const xPos = 105; // Movido mais para a direita para alinhar dentro da borda da etiqueta
         const yPos = height - 295;  
         
         page.drawText(text, {
           x: xPos,
           y: yPos,
-          size: 8,
+          size: 7, // Reduzido em cerca de 10%
           color: rgb(0, 0, 0)
         });
 
