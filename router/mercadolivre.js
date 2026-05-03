@@ -575,11 +575,17 @@ router.get('/download-label', authenticateToken, async (req, res) => {
       ids.map(async (id) => {
         const url = `https://api.mercadolibre.com/shipments/${id}`;
         const r = await fetchMLWithAutoRefresh(url, { seller_id, uid, role }, tokens);
-        if (!r.ok) return { id, status: null, printable: true }; // se não der pra checar, seguimos tentando baixar
+        if (!r.ok) return { id, status: null, logistic_type: null, printable: true };
         const d = await r.json();
-        return { id, status: d.status, printable: !nonPrintableStatuses.has((d.status || '').toLowerCase()) };
+        return { id, status: d.status, logistic_type: d.logistic_type || null, printable: !nonPrintableStatuses.has((d.status || '').toLowerCase()) };
       })
     );
+
+    // Mapa de logistic_type por shipment ID para ajustar posição na etiqueta
+    const logisticMap = {};
+    statusChecks.forEach(sc => {
+      logisticMap[String(sc.id)] = sc.logistic_type;
+    });
 
     const notPrintable = statusChecks.filter((s) => !s.printable);
     if (notPrintable.length > 0) {
@@ -613,7 +619,7 @@ router.get('/download-label', authenticateToken, async (req, res) => {
       infoMap[String(r.shipping_id)] = { sku: r.sku, user_name: r.user_name };
     });
 
-    const enrichPdf = async (pdfBuffer, sku, userName) => {
+    const enrichPdf = async (pdfBuffer, sku, userName, logisticType) => {
       if (!sku && !userName) return pdfBuffer;
       try {
         const pdfDoc = await PDFDocument.load(pdfBuffer);
@@ -621,20 +627,29 @@ router.get('/download-label', authenticateToken, async (req, res) => {
         if (pages.length === 0) return pdfBuffer;
 
         const text = `SKU: ${sku || 'N/A'} | Cliente: ${userName || 'N/A'}`;
-        // Apenas a primeira página! (Evita sujar a PLP e a Declaração de Conteúdo)
         const page = pages[0];
         const { height } = page.getSize();
         
-        // Em todas as etiquetas do ML (A4 ou Térmica), o conteúdo principal é ancorado no topo.
-        // A linha acima de "Remetente" está por volta de 315 pontos abaixo do topo.
-        // Medindo a partir do topo (height), descemos 295 pontos para ficar no espaço em branco acima dessa linha.
-        const xPos = 70; // Ajustado para centralizar melhor o texto na etiqueta
-        const yPos = height - 295;  
+        // Posição ajustada por modalidade de envio
+        const lt = (logisticType || '').toLowerCase();
+        let xPos, yPos, fontSize;
+
+        if (lt === 'self_service') {
+          // FLEX: texto abaixo do bloco Destinatário (mais embaixo na página)
+          xPos = 70;
+          yPos = height - 480;
+          fontSize = 7;
+        } else {
+          // AGÊNCIA / DROP-OFF / COLETA / FULL e demais: posição padrão (abaixo de SEX dd/mm NF)
+          xPos = 70;
+          yPos = height - 295;
+          fontSize = 7;
+        }
         
         page.drawText(text, {
           x: xPos,
           y: yPos,
-          size: 7, // Reduzido em cerca de 10%
+          size: fontSize,
           color: rgb(0, 0, 0)
         });
 
@@ -693,7 +708,8 @@ router.get('/download-label', authenticateToken, async (req, res) => {
       const info = infoMap[id] || {};
 
       if (isPDF) {
-        buf = await enrichPdf(buf, info.sku, info.user_name);
+        const logisticType = logisticMap[id] || null;
+        buf = await enrichPdf(buf, info.sku, info.user_name, logisticType);
       } else {
         const zplStr = enrichZpl(buf.toString('utf-8'), info.sku, info.user_name);
         buf = Buffer.from(zplStr, 'utf-8');
