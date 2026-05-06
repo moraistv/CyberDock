@@ -641,7 +641,7 @@ router.get('/download-label', authenticateToken, async (req, res) => {
           fontSize = 7;
         } else {
           // AGÊNCIA / DROP-OFF / COLETA / FULL e demais: posição padrão (abaixo de SEX dd/mm NF)
-          xPos = 70;
+          xPos = 95;
           yPos = height - 295;
           fontSize = 7;
         }
