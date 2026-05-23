@@ -1199,7 +1199,7 @@ router.post('/process', authenticateToken, requireMaster, async (req, res) => {
 });
 
 router.post('/sync-account', authenticateToken, async (req, res) => {
-  const { userId, accountNickname: nickname, clientId, force, backfill, clientUid } = req.body;
+  const { userId, accountNickname: nickname, clientId, force, backfill, clientUid, daysToSync } = req.body;
   let targetUid = clientUid || req.user.uid;
 
   if (!userId || !clientId) return res.status(400).json({ error: 'ID usuário e clientId obrigatórios.' });
@@ -1265,7 +1265,12 @@ router.post('/sync-account', authenticateToken, async (req, res) => {
     const maxLookbackDate = new Date();
     maxLookbackDate.setDate(maxLookbackDate.getDate() - 180);
 
-    if (force) {
+    if (daysToSync) {
+      lastSyncDate = new Date();
+      lastSyncDate.setDate(lastSyncDate.getDate() - parseInt(daysToSync, 10));
+      if (lastSyncDate < maxLookbackDate) lastSyncDate = maxLookbackDate;
+      sendEvent(clientId, { progress: 15, message: `[${nickname}] Sincronização dos últimos ${daysToSync} dias iniciada...`, type: 'info' });
+    } else if (force) {
       lastSyncDate = maxLookbackDate;
       sendEvent(clientId, { progress: 15, message: `[${nickname}] Sincronização forçada iniciada...`, type: 'info' });
     } else {
