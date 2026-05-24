@@ -1510,7 +1510,7 @@ router.post('/sync-account', authenticateToken, async (req, res) => {
       const limit = Math.min(PAGE_LIMIT, MAX_ORDERS - orderSummaries.length);
       const ordersUrl =
         `https://api.mercadolibre.com/orders/search` +
-        `?seller=${userId}&offset=${offset}&limit=${limit}&sort=date_last_updated_desc` +
+        `?seller=${userId}&offset=${offset}&limit=${limit}&sort=date_desc` +
         `&order.date_last_updated.from=${encodeURIComponent(lastSyncDate.toISOString())}`;
 
       let ordersResponse = await fetch(ordersUrl, { headers: { Authorization: `Bearer ${access_token}` } });
