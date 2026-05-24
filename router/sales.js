@@ -927,7 +927,7 @@ router.get('/my-sales', authenticateToken, async (req, res) => {
       const accountNames = Object.keys(byAccount);
       if (accountNames.length > 0) {
         const tokenResult = await db.query(
-          "SELECT access_token, nickname FROM public.ml_accounts WHERE user_id = $1 AND status = 'active'", [uid]
+          "SELECT access_token, nickname FROM public.ml_accounts WHERE status = 'active' ORDER BY updated_at DESC NULLS LAST"
         );
         const tokenByNickname = {};
         const allTokens = [];
