@@ -941,7 +941,7 @@ router.get('/my-sales', authenticateToken, async (req, res) => {
         const BATCH_SIZE = 20;
 
         const fetchThumbBatch = async (batch, headers) => {
-          const url = \`https://api.mercadolibre.com/items?ids=\${batch.join(',')}&attributes=id,thumbnail,secure_thumbnail\`;
+          const url = `https://api.mercadolibre.com/items?ids=${batch.join(',')}&attributes=id,thumbnail,secure_thumbnail`;
           const res = await fetch(url, { headers });
           if (!res.ok) return 0;
           const data = await res.json();
@@ -969,7 +969,7 @@ router.get('/my-sales', authenticateToken, async (req, res) => {
 
             let found = 0;
             if (ownToken) {
-              try { found = await fetchThumbBatch(pending, { 'Authorization': \`Bearer \${ownToken}\` }); } catch (e) { }
+              try { found = await fetchThumbBatch(pending, { 'Authorization': `Bearer ${ownToken}` }); } catch (e) { }
             }
 
             if (found < pending.length) {
@@ -978,7 +978,7 @@ router.get('/my-sales', authenticateToken, async (req, res) => {
                 for (const t of allTokens) {
                   if (t.nickname === acctName) continue;
                   try {
-                    const f = await fetchThumbBatch(stillMissing, { 'Authorization': \`Bearer \${t.access_token}\` });
+                    const f = await fetchThumbBatch(stillMissing, { 'Authorization': `Bearer ${t.access_token}` });
                     if (f > 0) break;
                   } catch (e) { }
                 }
@@ -1010,13 +1010,13 @@ router.get('/my-sales', authenticateToken, async (req, res) => {
             try {
               for (const item of idsToCache) {
                 await db.query(
-                  \`UPDATE public.sales
+                  `UPDATE public.sales
                      SET raw_api_data = jsonb_set(
                        COALESCE(raw_api_data, '{}')::jsonb,
                        '{order_items,0,item,thumbnail}',
                        $1::jsonb
                      )
-                   WHERE id = $2 AND sku = $3 AND uid = $4\`,
+                   WHERE id = $2 AND sku = $3 AND uid = $4`,
                   [JSON.stringify(item.thumb), item.id, item.sku, uid]
                 );
               }
