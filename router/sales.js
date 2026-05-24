@@ -542,9 +542,9 @@ router.get('/all', authenticateToken, requireMaster, async (req, res) => {
       paramIdx++;
     }
     if (account) {
-      conditions.push(`s.account_nickname ILIKE $${paramIdx}`);
-      params.push(`%${account}%`);
-      paramIdx++;
+      conditions.push(`(s.seller_id::text = $${paramIdx} OR s.account_nickname ILIKE $${paramIdx + 1})`);
+      params.push(account, `%${account}%`);
+      paramIdx += 2;
     }
     if (buyer) {
       conditions.push(`(
@@ -825,9 +825,9 @@ router.get('/my-sales', authenticateToken, async (req, res) => {
       paramIdx++;
     }
     if (account) {
-      conditions.push(`(s.seller_id::text = $${paramIdx} OR s.account_nickname ILIKE $${paramIdx})`);
-      params.push(`%${account}%`);
-      paramIdx++;
+      conditions.push(`(s.seller_id::text = $${paramIdx} OR s.account_nickname ILIKE $${paramIdx + 1})`);
+      params.push(account, `%${account}%`);
+      paramIdx += 2;
     }
     if (buyer) {
       conditions.push(`(
