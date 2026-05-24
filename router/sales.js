@@ -793,15 +793,249 @@ router.get('/user/:uid', authenticateToken, requireMaster, async (req, res) => {
 router.get('/my-sales', authenticateToken, async (req, res) => {
   const { uid } = req.user;
   try {
-    const query = `
-      SELECT id, sku, uid, seller_id, channel, account_nickname, sale_date,
-        product_title, quantity, shipping_mode, shipping_limit_date,
-        packages, shipping_status, raw_api_data, updated_at, processed_at
-      FROM public.sales WHERE uid = $1 ORDER BY sale_date DESC;
+    const page = Math.max(1, parseInt(req.query.page) || 1);
+    const limit = Math.min(100, Math.max(1, parseInt(req.query.limit) || 50));
+    const offset = (page - 1) * limit;
+    
+    const search = (req.query.search || '').trim();
+    const shippingStatus = (req.query.shippingStatus || '').trim();
+    const saleStatus = (req.query.saleStatus || '').trim();
+    const saleDateStart = (req.query.saleDateStart || '').trim();
+    const saleDateEnd = (req.query.saleDateEnd || '').trim();
+    const account = (req.query.account || '').trim(); // Expected to be seller_id or account_nickname
+    const buyer = (req.query.buyer || '').trim();
+    const shippingLimitStart = (req.query.shippingLimitStart || '').trim();
+    const shippingLimitEnd = (req.query.shippingLimitEnd || '').trim();
+    const shippingMode = (req.query.shippingMode || '').trim();
+
+    const conditions = ['s.uid = $1'];
+    const params = [uid];
+    let paramIdx = 2;
+
+    if (search) {
+      conditions.push(`(
+        s.product_title ILIKE $${paramIdx}
+        OR s.sku ILIKE $${paramIdx}
+        OR s.account_nickname ILIKE $${paramIdx}
+        OR CAST(s.id AS TEXT) ILIKE $${paramIdx}
+      )`);
+      params.push(`%${search}%`);
+      paramIdx++;
+    }
+    if (shippingStatus) {
+      conditions.push(`s.shipping_status = $${paramIdx}`);
+      params.push(shippingStatus);
+      paramIdx++;
+    }
+    if (saleStatus) {
+      conditions.push(`s.raw_api_data->>'status' = $${paramIdx}`);
+      params.push(saleStatus);
+      paramIdx++;
+    }
+    if (saleDateStart) {
+      conditions.push(`s.sale_date >= $${paramIdx}`);
+      params.push(saleDateStart);
+      paramIdx++;
+    }
+    if (saleDateEnd) {
+      conditions.push(`s.sale_date <= $${paramIdx}`);
+      params.push(saleDateEnd + 'T23:59:59.999Z');
+      paramIdx++;
+    }
+    if (account) {
+      conditions.push(`(s.seller_id::text = $${paramIdx} OR s.account_nickname ILIKE $${paramIdx})`);
+      params.push(`%${account}%`);
+      paramIdx++;
+    }
+    if (buyer) {
+      conditions.push(`(
+        s.raw_api_data->'buyer'->>'first_name' ILIKE $${paramIdx}
+        OR s.raw_api_data->'buyer'->>'last_name' ILIKE $${paramIdx}
+        OR s.raw_api_data->'buyer'->>'nickname' ILIKE $${paramIdx}
+      )`);
+      params.push(`%${buyer}%`);
+      paramIdx++;
+    }
+    if (shippingMode) {
+      const modes = shippingMode.split(',').map(m => m.trim()).filter(Boolean);
+      if (modes.length === 1) {
+        conditions.push(`s.shipping_mode = $${paramIdx}`);
+        params.push(modes[0]);
+        paramIdx++;
+      } else if (modes.length > 1) {
+        conditions.push(`s.shipping_mode = ANY($${paramIdx})`);
+        params.push(modes);
+        paramIdx++;
+      }
+    }
+    if (shippingLimitStart) {
+      conditions.push(`COALESCE(s.raw_api_data->'sla_data'->>'expected_date', s.shipping_limit_date::text) >= $${paramIdx}`);
+      params.push(shippingLimitStart);
+      paramIdx++;
+    }
+    if (shippingLimitEnd) {
+      conditions.push(`COALESCE(s.raw_api_data->'sla_data'->>'expected_date', s.shipping_limit_date::text) <= $${paramIdx}`);
+      params.push(shippingLimitEnd + 'T23:59:59.999Z');
+      paramIdx++;
+    }
+
+    const whereClause = 'WHERE ' + conditions.join(' AND ');
+
+    // Count total
+    const countQuery = `SELECT COUNT(*) as total FROM public.sales s ${whereClause}`;
+    const countResult = await db.query(countQuery, params);
+    const total = parseInt(countResult.rows[0].total);
+
+    // Fetch page
+    const dataQuery = `
+      SELECT s.id, s.sku, s.uid, s.seller_id, s.channel, s.account_nickname, s.sale_date,
+        s.product_title, s.quantity, s.shipping_mode, s.shipping_limit_date,
+        s.packages, s.shipping_status, s.updated_at, s.processed_at,
+        s.raw_api_data as raw_api_data,
+        s.raw_api_data->>'status' as sale_status,
+        s.raw_api_data->'shipping'->>'id' as shipping_id,
+        s.raw_api_data->'sla_data'->>'expected_date' as sla_expected_date,
+        (s.raw_api_data->'order_items'->0->'item'->>'thumbnail') as product_thumbnail,
+        (s.raw_api_data->'order_items'->0->'item'->>'permalink') as product_permalink,
+        (s.raw_api_data->'order_items'->0->'item'->>'id') as ml_item_id,
+        s.raw_api_data->'buyer'->>'first_name' as buyer_first_name,
+        s.raw_api_data->'buyer'->>'last_name' as buyer_last_name,
+        s.raw_api_data->'buyer'->>'nickname' as buyer_nickname,
+        EXISTS (SELECT 1 FROM public.skus sk WHERE sk.user_id = $1 AND UPPER(TRIM(sk.sku)) = UPPER(TRIM(s.sku)) AND sk.ativo = true) as is_sku_mapped
+      FROM public.sales s
+      ${whereClause}
+      ORDER BY s.sale_date DESC
+      LIMIT $${paramIdx} OFFSET $${paramIdx + 1};
     `;
-    const { rows } = await db.query(query, [uid]);
-    res.json(rows);
+
+    const dataResult = await db.query(dataQuery, [...params, limit, offset]);
+
+    // ========== ENRICHMENT: Batch fetch thumbnails from ML Items API ==========
+    try {
+      const rows = dataResult.rows;
+      const thumbMap = {};
+
+      const byAccount = {};
+      for (const row of rows) {
+        if (!row.product_thumbnail && row.ml_item_id) {
+          const acct = row.account_nickname || '__unknown__';
+          if (!byAccount[acct]) byAccount[acct] = new Set();
+          byAccount[acct].add(String(row.ml_item_id).toUpperCase());
+        }
+      }
+
+      const accountNames = Object.keys(byAccount);
+      if (accountNames.length > 0) {
+        const tokenResult = await db.query(
+          "SELECT access_token, nickname FROM public.ml_accounts WHERE user_id = $1 AND status = 'active'", [uid]
+        );
+        const tokenByNickname = {};
+        const allTokens = [];
+        for (const t of tokenResult.rows) {
+          if (t.nickname && !tokenByNickname[t.nickname]) {
+            tokenByNickname[t.nickname] = t.access_token;
+          }
+          allTokens.push(t);
+        }
+
+        const BATCH_SIZE = 20;
+
+        const fetchThumbBatch = async (batch, headers) => {
+          const url = \`https://api.mercadolibre.com/items?ids=\${batch.join(',')}&attributes=id,thumbnail,secure_thumbnail\`;
+          const res = await fetch(url, { headers });
+          if (!res.ok) return 0;
+          const data = await res.json();
+          let found = 0;
+          for (const entry of data) {
+            if (entry.code === 200 && entry.body) {
+              const thumb = entry.body.secure_thumbnail || entry.body.thumbnail;
+              if (thumb) {
+                thumbMap[String(entry.body.id).toUpperCase()] = thumb;
+                found++;
+              }
+            }
+          }
+          return found;
+        };
+
+        for (const acctName of accountNames) {
+          const itemIds = Array.from(byAccount[acctName]);
+          const ownToken = tokenByNickname[acctName];
+
+          for (let i = 0; i < itemIds.length; i += BATCH_SIZE) {
+            const batch = itemIds.slice(i, i + BATCH_SIZE);
+            const pending = batch.filter(id => !thumbMap[id]);
+            if (pending.length === 0) continue;
+
+            let found = 0;
+            if (ownToken) {
+              try { found = await fetchThumbBatch(pending, { 'Authorization': \`Bearer \${ownToken}\` }); } catch (e) { }
+            }
+
+            if (found < pending.length) {
+              const stillMissing = pending.filter(id => !thumbMap[id]);
+              if (stillMissing.length > 0) {
+                for (const t of allTokens) {
+                  if (t.nickname === acctName) continue;
+                  try {
+                    const f = await fetchThumbBatch(stillMissing, { 'Authorization': \`Bearer \${t.access_token}\` });
+                    if (f > 0) break;
+                  } catch (e) { }
+                }
+              }
+            }
+
+            const finalMissing = pending.filter(id => !thumbMap[id]);
+            if (finalMissing.length > 0) {
+              try { await fetchThumbBatch(finalMissing, {}); } catch (e) { }
+            }
+          }
+        }
+
+        const idsToCache = [];
+        let injected = 0;
+        for (const row of rows) {
+          if (!row.product_thumbnail && row.ml_item_id) {
+            const key = String(row.ml_item_id).toUpperCase();
+            if (thumbMap[key]) {
+              row.product_thumbnail = thumbMap[key];
+              idsToCache.push({ id: row.id, sku: row.sku, thumb: thumbMap[key] });
+              injected++;
+            }
+          }
+        }
+
+        if (idsToCache.length > 0) {
+          setImmediate(async () => {
+            try {
+              for (const item of idsToCache) {
+                await db.query(
+                  \`UPDATE public.sales
+                     SET raw_api_data = jsonb_set(
+                       COALESCE(raw_api_data, '{}')::jsonb,
+                       '{order_items,0,item,thumbnail}',
+                       $1::jsonb
+                     )
+                   WHERE id = $2 AND sku = $3 AND uid = $4\`,
+                  [JSON.stringify(item.thumb), item.id, item.sku, uid]
+                );
+              }
+            } catch (cacheErr) {}
+          });
+        }
+      }
+    } catch (enrichErr) {}
+    // ========== END ENRICHMENT ==========
+
+    res.json({
+      data: dataResult.rows,
+      total,
+      page,
+      limit,
+      totalPages: Math.ceil(total / limit) || 1
+    });
   } catch (error) {
+    console.error("Erro interno ao buscar minhas vendas:", error);
     res.status(500).json({ error: 'Erro interno ao buscar vendas.' });
   }
 });
