@@ -685,33 +685,9 @@ router.get('/all', authenticateToken, requireMaster, async (req, res) => {
             const pending = batch.filter(id => !thumbMap[id]);
             if (pending.length === 0) continue;
 
-            let found = 0;
-
-            // 1) Tenta com o token do DONO da venda (resolve o 403)
-            if (ownToken) {
-              try {
-                found = await fetchThumbBatch(pending, { 'Authorization': `Bearer ${ownToken}` });
-              } catch (e) { /* silencia */ }
-            }
-
-            // 2) Se não encontrou tudo, tenta com outros tokens
-            if (found < pending.length) {
-              const stillMissing = pending.filter(id => !thumbMap[id]);
-              if (stillMissing.length > 0) {
-                for (const t of allTokens) {
-                  if (t.nickname === acctName) continue; // já tentou
-                  try {
-                    const f = await fetchThumbBatch(stillMissing, { 'Authorization': `Bearer ${t.access_token}` });
-                    if (f > 0) break;
-                  } catch (e) { /* silencia */ }
-                }
-              }
-            }
-
-            // 3) Fallback sem auth
-            const finalMissing = pending.filter(id => !thumbMap[id]);
-            if (finalMissing.length > 0) {
-              try { await fetchThumbBatch(finalMissing, {}); } catch (e) { /* silencia */ }
+            let tokenToUse = ownToken || (allTokens.length > 0 ? allTokens[0].access_token : null);
+            if (tokenToUse) {
+              try { await fetchThumbBatch(pending, { 'Authorization': `Bearer ${tokenToUse}` }); } catch (e) { /* silencia */ }
             }
 
             if (i + BATCH_SIZE < itemIds.length) {
@@ -973,27 +949,9 @@ router.get('/my-sales', authenticateToken, async (req, res) => {
             const pending = batch.filter(id => !thumbMap[id]);
             if (pending.length === 0) continue;
 
-            let found = 0;
-            if (ownToken) {
-              try { found = await fetchThumbBatch(pending, { 'Authorization': `Bearer ${ownToken}` }); } catch (e) { }
-            }
-
-            if (found < pending.length) {
-              const stillMissing = pending.filter(id => !thumbMap[id]);
-              if (stillMissing.length > 0) {
-                for (const t of allTokens) {
-                  if (t.nickname === acctName) continue;
-                  try {
-                    const f = await fetchThumbBatch(stillMissing, { 'Authorization': `Bearer ${t.access_token}` });
-                    if (f > 0) break;
-                  } catch (e) { }
-                }
-              }
-            }
-
-            const finalMissing = pending.filter(id => !thumbMap[id]);
-            if (finalMissing.length > 0) {
-              try { await fetchThumbBatch(finalMissing, {}); } catch (e) { }
+            let tokenToUse = ownToken || (allTokens.length > 0 ? allTokens[0].access_token : null);
+            if (tokenToUse) {
+              try { await fetchThumbBatch(pending, { 'Authorization': `Bearer ${tokenToUse}` }); } catch (e) { }
             }
 
             if (i + BATCH_SIZE < itemIds.length) {
