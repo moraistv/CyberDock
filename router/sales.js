@@ -8,6 +8,8 @@ const router = express.Router();
 
 const clients = {};
 
+const sleep = (ms) => new Promise(resolve => setTimeout(resolve, ms));
+
 const MAX_ORDERS = 5000;
 const PAGE_LIMIT = 50;
 const SLA_CONCURRENCY = 10;
@@ -711,6 +713,10 @@ router.get('/all', authenticateToken, requireMaster, async (req, res) => {
             if (finalMissing.length > 0) {
               try { await fetchThumbBatch(finalMissing, {}); } catch (e) { /* silencia */ }
             }
+
+            if (i + BATCH_SIZE < itemIds.length) {
+              await sleep(200);
+            }
           }
         }
 
@@ -988,6 +994,10 @@ router.get('/my-sales', authenticateToken, async (req, res) => {
             const finalMissing = pending.filter(id => !thumbMap[id]);
             if (finalMissing.length > 0) {
               try { await fetchThumbBatch(finalMissing, {}); } catch (e) { }
+            }
+
+            if (i + BATCH_SIZE < itemIds.length) {
+              await sleep(200);
             }
           }
         }
@@ -1513,13 +1523,13 @@ router.post('/sync-account', authenticateToken, async (req, res) => {
         // Para masters, busca a última venda da conta específica (seller_id)
         // IMPORTANTE: filtrar por seller_id para suportar multi-contas (ex: MIMALE com 2 contas)
         lastSyncRes = await db.query(
-          `SELECT MAX(sale_date) AS last_sale FROM public.sales WHERE uid = $1 AND seller_id = $2`,
+          `SELECT MAX(updated_at) AS last_sale FROM public.sales WHERE uid = $1 AND seller_id = $2`,
           [targetUid, userId]
         );
       } else {
         // Para usuários normais, mantém a restrição de seller_id
         lastSyncRes = await db.query(
-          `SELECT MAX(sale_date) AS last_sale FROM public.sales WHERE uid = $1 AND seller_id = $2`,
+          `SELECT MAX(updated_at) AS last_sale FROM public.sales WHERE uid = $1 AND seller_id = $2`,
           [targetUid, userId]
         );
       }
@@ -1542,8 +1552,8 @@ router.post('/sync-account', authenticateToken, async (req, res) => {
       const limit = Math.min(PAGE_LIMIT, MAX_ORDERS - orderSummaries.length);
       const ordersUrl =
         `https://api.mercadolibre.com/orders/search` +
-        `?seller=${userId}&offset=${offset}&limit=${limit}&sort=date_desc` +
-        `&order.date_created.from=${encodeURIComponent(lastSyncDate.toISOString())}`;
+        `?seller=${userId}&offset=${offset}&limit=${limit}&sort=date_last_updated_desc` +
+        `&order.date_last_updated.from=${encodeURIComponent(lastSyncDate.toISOString())}`;
 
       let ordersResponse = await fetch(ordersUrl, { headers: { Authorization: `Bearer ${access_token}` } });
 
@@ -1945,7 +1955,7 @@ router.get('/last-sync/:mlAccountId', authenticateToken, async (req, res) => {
 
     // Busca a última venda sincronizada para esta conta
     const lastSyncRes = await db.query(
-      `SELECT MAX(sale_date) AS last_sale FROM public.sales WHERE uid = $1 AND seller_id = $2`,
+      `SELECT MAX(updated_at) AS last_sale FROM public.sales WHERE uid = $1 AND seller_id = $2`,
       [targetUid, mlAccountId]
     );
  
