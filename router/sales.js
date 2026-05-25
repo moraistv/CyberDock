@@ -768,7 +768,7 @@ router.get('/user/:uid', authenticateToken, requireMaster, async (req, res) => {
       SELECT id, sku, uid, seller_id, channel, account_nickname, sale_date,
         product_title, quantity, shipping_mode, shipping_limit_date,
         packages, shipping_status, raw_api_data, updated_at, processed_at
-      FROM public.sales WHERE uid = $1 ORDER BY sale_date DESC;
+      FROM public.sales WHERE uid = $1 ORDER BY sale_date DESC LIMIT 250;
     `;
     const { rows } = await db.query(query, [uid]);
     res.json(rows);
@@ -1807,7 +1807,7 @@ router.post('/enrich-existing-sales', authenticateToken, async (req, res) => {
     });
     
     let enrichedCount = 0;
-    const SLA_CONCURRENCY = 5;
+    const SLA_CONCURRENCY = 15;
     
     // Função para enriquecer uma venda com dados de etiqueta
     const enrichSale = async (sale, index) => {
