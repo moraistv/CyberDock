@@ -1702,6 +1702,8 @@ router.post('/enrich-existing-sales', authenticateToken, async (req, res) => {
   
   let targetUid = clientUid || uid;
   
+  res.status(202).json({ message: 'Enriquecimento iniciado.' });
+  
   try {
     console.log(`[ENRICH] Iniciando enriquecimento para userId: ${userId}, nickname: ${nickname}, clientUid: ${clientUid}, role: ${role}`);
     
@@ -1750,7 +1752,12 @@ router.post('/enrich-existing-sales', authenticateToken, async (req, res) => {
     
     if (!access_token) {
       console.log(`[ENRICH] Conta não encontrada para userId: ${userId}, targetUid: ${targetUid}, role: ${role}`);
-      return res.status(404).json({ error: 'Conta não encontrada ou sem permissão.' });
+      sendEvent(clientId, { progress: 100, message: 'Conta não encontrada ou sem permissão.', type: 'error' });
+      if (clients[clientId]) {
+        clients[clientId].res.end();
+        delete clients[clientId];
+      }
+      return;
     }
     
     console.log(`[ENRICH] Token encontrado para userId: ${userId}, targetUid: ${targetUid}`);
@@ -1785,11 +1792,12 @@ router.post('/enrich-existing-sales', authenticateToken, async (req, res) => {
     const salesToEnrich = salesResult.rows;
     
     if (salesToEnrich.length === 0) {
-      return res.json({ 
-        message: 'Nenhuma venda encontrada para enriquecer.',
-        enriched: 0,
-        total: 0
-      });
+      sendEvent(clientId, { progress: 100, message: 'Nenhuma venda encontrada para enriquecer.', type: 'success' });
+      if (clients[clientId]) {
+        clients[clientId].res.end();
+        delete clients[clientId];
+      }
+      return;
     }
     
     sendEvent(clientId, { 
@@ -1881,10 +1889,11 @@ router.post('/enrich-existing-sales', authenticateToken, async (req, res) => {
       enrichedCount: enrichedCount
     });
     
-    res.json({ 
-      message: 'Enriquecimento concluído com sucesso.',
-      enriched: enrichedCount,
-      total: salesToEnrich.length
+    sendEvent(clientId, { 
+      progress: 100, 
+      message: 'Enriquecimento concluído com sucesso.', 
+      type: 'success',
+      enrichedCount: enrichedCount
     });
     
   } catch (error) {
@@ -1894,7 +1903,6 @@ router.post('/enrich-existing-sales', authenticateToken, async (req, res) => {
       message: `Erro em [${nickname}]: ${error.message}`, 
       type: 'error' 
     });
-    res.status(500).json({ error: error.message });
   } finally {
     if (clients[clientId]) {
       clients[clientId].res.end();
