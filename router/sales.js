@@ -690,6 +690,11 @@ router.get('/all', authenticateToken, requireMaster, async (req, res) => {
               try { await fetchThumbBatch(pending, { 'Authorization': `Bearer ${tokenToUse}` }); } catch (e) { /* silencia */ }
             }
 
+            const stillMissing = pending.filter(id => !thumbMap[id]);
+            for (const missing of stillMissing) {
+              thumbMap[missing] = 'not_found';
+            }
+
             if (i + BATCH_SIZE < itemIds.length) {
               await sleep(200);
             }
@@ -703,9 +708,9 @@ router.get('/all', authenticateToken, requireMaster, async (req, res) => {
           if (!row.product_thumbnail && row.ml_item_id) {
             const key = String(row.ml_item_id).toUpperCase();
             if (thumbMap[key]) {
-              row.product_thumbnail = thumbMap[key];
+              row.product_thumbnail = thumbMap[key] === 'not_found' ? null : thumbMap[key];
               idsToCache.push({ id: row.id, sku: row.sku, thumb: thumbMap[key] });
-              injected++;
+              if (thumbMap[key] !== 'not_found') injected++;
             }
           }
         }
@@ -954,6 +959,11 @@ router.get('/my-sales', authenticateToken, async (req, res) => {
               try { await fetchThumbBatch(pending, { 'Authorization': `Bearer ${tokenToUse}` }); } catch (e) { }
             }
 
+            const stillMissing = pending.filter(id => !thumbMap[id]);
+            for (const missing of stillMissing) {
+              thumbMap[missing] = 'not_found';
+            }
+
             if (i + BATCH_SIZE < itemIds.length) {
               await sleep(200);
             }
@@ -966,9 +976,9 @@ router.get('/my-sales', authenticateToken, async (req, res) => {
           if (!row.product_thumbnail && row.ml_item_id) {
             const key = String(row.ml_item_id).toUpperCase();
             if (thumbMap[key]) {
-              row.product_thumbnail = thumbMap[key];
-              idsToCache.push({ id: row.id, sku: row.sku, thumb: thumbMap[key] });
-              injected++;
+              row.product_thumbnail = thumbMap[key] === 'not_found' ? null : thumbMap[key];
+              idsToCache.push({ id: row.id, sku: row.sku, uid: row.uid, thumb: thumbMap[key] });
+              if (thumbMap[key] !== 'not_found') injected++;
             }
           }
         }

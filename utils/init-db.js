@@ -271,6 +271,13 @@ async function syncDatabaseSchema() {
                 }
             }
         }
+        
+        console.log('   -> Verificando índices de performance em public.sales...');
+        await client.query('CREATE INDEX IF NOT EXISTS idx_sales_seller_id ON public.sales(seller_id);');
+        await client.query('CREATE INDEX IF NOT EXISTS idx_sales_sale_date ON public.sales(sale_date DESC);');
+        await client.query(`CREATE INDEX IF NOT EXISTS idx_sales_status ON public.sales((raw_api_data->>'status'));`);
+        await client.query('CREATE INDEX IF NOT EXISTS idx_sales_seller_date ON public.sales(seller_id, sale_date DESC);');
+
         await client.query('COMMIT');
         console.log('✅ Esquema do banco de dados está atualizado.');
     } catch (error) {
