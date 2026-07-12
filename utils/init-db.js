@@ -174,7 +174,7 @@ async function syncDatabaseSchema() {
         const existingTables = res.rows.map(row => row.tablename);
         
         const tablesInOrder = [
-            'users', 'package_types', 'services', 'ml_accounts', 'system_settings',
+            'users', 'package_types', 'services', 'ml_accounts', 'ml_sync_cursors', 'system_settings',
             'user_statuses', 'user_contracts', 'skus', 'sku_kit_components', 'kit_parents', 'sales', 'stock_movements',
             'invoices', 'invoice_items'
         ];
