@@ -1641,34 +1641,49 @@ router.post('/sync-account', authenticateToken, async (req, res) => {
     sendEvent(clientId, { progress: 35, message: `[${nickname}] Verificando o que mudou desde a última sincronização...`, type: 'info' });
 
     const orderIdList = [...new Set(orderSummaries.map(o => o.id).filter(Boolean).map(id => parseInt(id, 10)).filter(n => !isNaN(n)))];
-    const savedState = new Map(); // id(string) -> Date|null (date_last_updated salvo)
+    const savedState = new Map(); // id(string) -> { updated: Date|null, final: bool }
     if (orderIdList.length > 0) {
-      // Usa a COLUNA date_last_updated (confiável e indexada). Filtra por uid + id
-      // (id do pedido já é único no ML).
+      // Além do date_last_updated (cursor), marcamos se o pedido está FINALIZADO
+      // (entregue/não entregue/cancelado). Pedido final não muda mais nada que
+      // interesse — mesmo que o ML "bumpe" o date_last_updated por evento interno.
       const stateRes = await db.query(
-        `SELECT id, MAX(date_last_updated) AS stored_updated
+        `SELECT id,
+                MAX(date_last_updated) AS stored_updated,
+                bool_or(
+                  (raw_api_data->'shipping'->>'status') IN ('delivered','not_delivered','cancelled')
+                  OR (raw_api_data->>'status') = 'cancelled'
+                ) AS is_final
            FROM public.sales
           WHERE uid = $1 AND id = ANY($2::bigint[])
           GROUP BY id`,
         [targetUid, orderIdList]
       );
       for (const r of stateRes.rows) {
-        savedState.set(String(r.id), r.stored_updated ? new Date(r.stored_updated) : null);
+        savedState.set(String(r.id), {
+          updated: r.stored_updated ? new Date(r.stored_updated) : null,
+          final: r.is_final === true
+        });
       }
     }
 
     const toProcess = [];
     let skippedCount = 0;
+    let finalizedSkipped = 0;
     for (const summary of orderSummaries) {
-      const storedUpdated = savedState.get(String(summary.id));
-      const remoteUpdated = summary.date_last_updated ? new Date(summary.date_last_updated) : null;
-      // Pula ANTES de baixar: se já existe e o date_last_updated não avançou,
-      // o pedido não mudou no ML — não gasta detalhe/shipment/SLA com ele.
-      const unchanged = storedUpdated && remoteUpdated && storedUpdated.getTime() >= remoteUpdated.getTime();
-      if (unchanged) { skippedCount++; continue; }
+      const st = savedState.get(String(summary.id));
+      if (st) {
+        // Pedido já finalizado (entregue/cancelado): nunca reprocessa. Ignora os
+        // "bumps" internos de date_last_updated do ML — é o que estava trazendo
+        // milhares de "atualizadas" fantasmas de vendas antigas.
+        if (st.final) { skippedCount++; finalizedSkipped++; continue; }
+        // Ativo: pula se o date_last_updated não avançou (nada mudou).
+        const remoteUpdated = summary.date_last_updated ? new Date(summary.date_last_updated) : null;
+        const unchanged = st.updated && remoteUpdated && st.updated.getTime() >= remoteUpdated.getTime();
+        if (unchanged) { skippedCount++; continue; }
+      }
       toProcess.push(summary);
     }
-    console.log(`[SYNC] ${nickname} encontrados=${orderSummaries.length} paraProcessar=${toProcess.length} pulados=${skippedCount} (estadoSalvo=${savedState.size})`);
+    console.log(`[SYNC] ${nickname} encontrados=${orderSummaries.length} paraProcessar=${toProcess.length} pulados=${skippedCount} (finalizados=${finalizedSkipped}, estadoSalvo=${savedState.size})`);
 
     if (toProcess.length === 0) {
       sendEvent(clientId, {
