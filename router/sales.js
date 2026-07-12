@@ -161,6 +161,7 @@ function buildInsertBatchRows(orders, targetUid, nickname) {
         shipping_mode: finalShippingMode,
         shipping_limit_date: finalShippingLimitDate,
         packages: packages,
+        date_last_updated: order?.date_last_updated || null,
         raw_api_data: order
       });
     }
@@ -172,7 +173,7 @@ function buildMultiInsertQuery_DoUpdate(rows) {
   const cols = [
     'id', 'sku', 'uid', 'seller_id', 'channel', 'account_nickname',
     'sale_date', 'product_title', 'quantity', 'shipping_mode',
-    'shipping_limit_date', 'packages', 'raw_api_data', 'updated_at'
+    'shipping_limit_date', 'packages', 'date_last_updated', 'raw_api_data', 'updated_at'
   ];
   const values = [];
   const params = [];
@@ -219,15 +220,17 @@ function buildMultiInsertQuery_DoUpdate(rows) {
     params.push(
       id, r.sku, r.uid, sellerId, 'ML', r.account_nickname,
       r.sale_date, r.product_title, quantity, r.shipping_mode,
-      r.shipping_limit_date, packages, r.raw_api_data,
+      r.shipping_limit_date, packages, r.date_last_updated || null, r.raw_api_data,
       new Date()
     );
     const placeholders = cols.map(() => `$${p++}`).join(', ');
     values.push(`(${placeholders})`);
   }
 
-  // RETURNING (xmax = 0) permite distinguir INSERT de UPDATE no mesmo upsert:
-  // em linhas recém-inseridas xmax = 0; em linhas atualizadas xmax != 0.
+  // RETURNING (xmax = 0) distingue INSERT de UPDATE (inserido: xmax=0).
+  // O DO UPDATE só ocorre quando ALGO relevante mudou (IS DISTINCT FROM):
+  // assim "atualizada" significa mudança real, e vendas tocadas mas iguais
+  // não são regravadas nem contadas (nem geram escrita à toa no banco).
   const query = `
     INSERT INTO public.sales (${cols.join(', ')})
     VALUES ${values.join(', ')}
@@ -235,9 +238,16 @@ function buildMultiInsertQuery_DoUpdate(rows) {
       shipping_mode = EXCLUDED.shipping_mode,
       shipping_limit_date = EXCLUDED.shipping_limit_date,
       packages = EXCLUDED.packages,
+      date_last_updated = EXCLUDED.date_last_updated,
       raw_api_data = EXCLUDED.raw_api_data,
       updated_at = EXCLUDED.updated_at
     WHERE public.sales.processed_at IS NULL
+      AND (
+        public.sales.date_last_updated IS DISTINCT FROM EXCLUDED.date_last_updated
+        OR public.sales.shipping_mode IS DISTINCT FROM EXCLUDED.shipping_mode
+        OR public.sales.shipping_limit_date IS DISTINCT FROM EXCLUDED.shipping_limit_date
+        OR public.sales.packages IS DISTINCT FROM EXCLUDED.packages
+      )
     RETURNING (xmax = 0) AS inserted;
   `;
 
@@ -1499,35 +1509,36 @@ router.post('/sync-account', authenticateToken, async (req, res) => {
     const maxLookbackDate = new Date();
     maxLookbackDate.setDate(maxLookbackDate.getDate() - 180);
 
-    // Cursor incremental por conta: o MAIOR date_last_updated que já salvamos.
-    // É o marco confiável de "até onde já sincronizei". Buscar a partir dele
-    // (com pequena margem) faz o clique repetido, sem mudanças, voltar ZERO
-    // pedidos — em vez de reler os últimos N dias inteiros toda vez.
+    // Cursor incremental por conta: o MAIOR date_last_updated já salvo (coluna
+    // dedicada, confiável e indexada).
     const cursorRes = await db.query(
-      `SELECT MAX((raw_api_data->>'date_last_updated')::timestamptz) AS cursor
+      `SELECT MAX(date_last_updated) AS cursor
          FROM public.sales
         WHERE uid = $1 AND seller_id = $2`,
       [targetUid, userId]
     );
     const syncCursor = cursorRes.rows[0]?.cursor ? new Date(cursorRes.rows[0].cursor) : null;
 
-    if (force || !syncCursor) {
-      // Primeira sincronização da conta (sem cursor) ou forçada: janela ampla.
-      if (daysToSync && !force) {
-        lastSyncDate = new Date();
-        lastSyncDate.setDate(lastSyncDate.getDate() - parseInt(daysToSync, 10));
-        if (lastSyncDate < maxLookbackDate) lastSyncDate = maxLookbackDate;
-        sendEvent(clientId, { progress: 15, message: `[${nickname}] Primeira sincronização (últimos ${daysToSync} dias)...`, type: 'info' });
-      } else {
-        lastSyncDate = maxLookbackDate;
-        sendEvent(clientId, { progress: 15, message: `[${nickname}] Sincronização completa iniciada...`, type: 'info' });
-      }
-    } else {
-      // Incremental: busca só o que mudou desde o último date_last_updated
-      // conhecido, com margem de 2 minutos por segurança de relógio/atraso.
+    // Janela de busca (por date_last_updated):
+    // - dropdown (daysToSync) tem precedência: o usuário escolhe até onde olhar;
+    // - senão, forçada = 180 dias;
+    // - senão, incremental pelo cursor (só o que mudou desde a última vez).
+    // Em todos os casos o "skip antes de baixar" garante velocidade.
+    if (daysToSync) {
+      lastSyncDate = new Date();
+      lastSyncDate.setDate(lastSyncDate.getDate() - parseInt(daysToSync, 10));
+      if (lastSyncDate < maxLookbackDate) lastSyncDate = maxLookbackDate;
+      sendEvent(clientId, { progress: 15, message: `[${nickname}] Verificando alterações dos últimos ${daysToSync} dias...`, type: 'info' });
+    } else if (force) {
+      lastSyncDate = maxLookbackDate;
+      sendEvent(clientId, { progress: 15, message: `[${nickname}] Sincronização completa iniciada...`, type: 'info' });
+    } else if (syncCursor) {
       lastSyncDate = new Date(syncCursor.getTime() - 2 * 60 * 1000);
       if (lastSyncDate < maxLookbackDate) lastSyncDate = maxLookbackDate;
       sendEvent(clientId, { progress: 15, message: `[${nickname}] Buscando novidades desde a última sincronização...`, type: 'info' });
+    } else {
+      lastSyncDate = maxLookbackDate;
+      sendEvent(clientId, { progress: 15, message: `[${nickname}] Sincronização completa iniciada...`, type: 'info' });
     }
     console.log(`[SYNC] ${nickname} uid=${targetUid} seller=${userId} cursor=${syncCursor ? syncCursor.toISOString() : 'none'} from=${lastSyncDate.toISOString()} force=${!!force} days=${daysToSync || '-'}`);
 
@@ -1630,41 +1641,30 @@ router.post('/sync-account', authenticateToken, async (req, res) => {
     sendEvent(clientId, { progress: 35, message: `[${nickname}] Verificando o que mudou desde a última sincronização...`, type: 'info' });
 
     const orderIdList = [...new Set(orderSummaries.map(o => o.id).filter(Boolean).map(id => parseInt(id, 10)).filter(n => !isNaN(n)))];
-    const savedState = new Map(); // id(string) -> { updated: Date|null, enriched: bool }
+    const savedState = new Map(); // id(string) -> Date|null (date_last_updated salvo)
     if (orderIdList.length > 0) {
-      // Filtra só por uid + id (o id do pedido já é único no ML). Não usamos
-      // seller_id aqui para não correr o risco de o seller_id salvo divergir do
-      // userId e a consulta voltar vazia (o que faria o skip nunca acontecer).
+      // Usa a COLUNA date_last_updated (confiável e indexada). Filtra por uid + id
+      // (id do pedido já é único no ML).
       const stateRes = await db.query(
-        `SELECT id,
-                MAX(raw_api_data->>'date_last_updated') AS stored_updated,
-                bool_and(
-                  (raw_api_data->'shipping'->>'id') IS NULL
-                  OR (raw_api_data ? 'sla_data')
-                  OR (raw_api_data->'shipping'->>'status') IS NOT NULL
-                ) AS enriched
+        `SELECT id, MAX(date_last_updated) AS stored_updated
            FROM public.sales
           WHERE uid = $1 AND id = ANY($2::bigint[])
           GROUP BY id`,
         [targetUid, orderIdList]
       );
       for (const r of stateRes.rows) {
-        savedState.set(String(r.id), {
-          updated: r.stored_updated ? new Date(r.stored_updated) : null,
-          enriched: r.enriched === true
-        });
+        savedState.set(String(r.id), r.stored_updated ? new Date(r.stored_updated) : null);
       }
     }
 
     const toProcess = [];
     let skippedCount = 0;
     for (const summary of orderSummaries) {
-      const st = savedState.get(String(summary.id));
+      const storedUpdated = savedState.get(String(summary.id));
       const remoteUpdated = summary.date_last_updated ? new Date(summary.date_last_updated) : null;
-      // Sinal autoritativo: se o date_last_updated não avançou, o pedido não
-      // mudou no ML — pula (mesmo que a "enriquecido" seja incerta). Só força
-      // reprocesso quando realmente mudou OU quando está claramente incompleto.
-      const unchanged = st && st.updated && remoteUpdated && st.updated.getTime() >= remoteUpdated.getTime();
+      // Pula ANTES de baixar: se já existe e o date_last_updated não avançou,
+      // o pedido não mudou no ML — não gasta detalhe/shipment/SLA com ele.
+      const unchanged = storedUpdated && remoteUpdated && storedUpdated.getTime() >= remoteUpdated.getTime();
       if (unchanged) { skippedCount++; continue; }
       toProcess.push(summary);
     }
@@ -1749,16 +1749,20 @@ router.post('/sync-account', authenticateToken, async (req, res) => {
         }
       }
       await clientDb.query('COMMIT');
+      // Pedidos que foram baixados mas cujos dados eram idênticos (não mudaram
+      // no banco) contam como "sem alteração", junto com os pulados antes de baixar.
+      const noopCount = Math.max(0, allRows.length - insertedCount - updatedCount);
+      const unchangedTotal = skippedCount + noopCount;
       const doneMsg = insertedCount > 0
-        ? `[${nickname}] Concluída. ${insertedCount} venda(s) nova(s), ${updatedCount} atualizada(s), ${skippedCount} sem mudança.`
-        : `[${nickname}] Concluída. Nenhuma venda nova (${updatedCount} atualizada(s), ${skippedCount} sem mudança).`;
+        ? `[${nickname}] Concluída. ${insertedCount} venda(s) nova(s), ${updatedCount} atualizada(s), ${unchangedTotal} sem mudança.`
+        : `[${nickname}] Concluída. Nenhuma venda nova (${updatedCount} atualizada(s), ${unchangedTotal} sem mudança).`;
       sendEvent(clientId, {
         progress: 100,
         message: doneMsg,
         type: 'success',
         newSalesCount: insertedCount,
         updatedCount: updatedCount,
-        skippedCount: skippedCount,
+        skippedCount: unchangedTotal,
         processedCount: allRows.length
       });
     } catch (e) {

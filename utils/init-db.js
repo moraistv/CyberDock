@@ -274,17 +274,31 @@ async function syncDatabaseSchema() {
         
         console.log('   -> Verificando índices de performance em public.sales...');
         // SET LOCAL remove o statement_timeout do pool só nesta transação, pois
-        // criar índice em tabela grande pode levar mais que o timeout padrão.
+        // criar índice/backfill em tabela grande pode levar mais que o timeout.
         await client.query('SET LOCAL statement_timeout = 0;');
+
+        // Coluna dedicada com o date_last_updated do pedido (cursor confiável de
+        // mudança). Extraída no momento de salvar; aqui fazemos o backfill dos
+        // registros existentes a partir do raw_api_data (uma vez).
+        await client.query('ALTER TABLE public.sales ADD COLUMN IF NOT EXISTS date_last_updated TIMESTAMPTZ;');
+        await client.query(`
+            UPDATE public.sales
+               SET date_last_updated = (raw_api_data->>'date_last_updated')::timestamptz
+             WHERE date_last_updated IS NULL
+               AND raw_api_data ? 'date_last_updated'
+               AND (raw_api_data->>'date_last_updated') ~ '^[0-9]{4}-';
+        `);
+
         await client.query('CREATE INDEX IF NOT EXISTS idx_sales_seller_id ON public.sales(seller_id);');
         await client.query('CREATE INDEX IF NOT EXISTS idx_sales_sale_date ON public.sales(sale_date DESC);');
         await client.query(`CREATE INDEX IF NOT EXISTS idx_sales_status ON public.sales((raw_api_data->>'status'));`);
         await client.query('CREATE INDEX IF NOT EXISTS idx_sales_seller_date ON public.sales(seller_id, sale_date DESC);');
         await client.query('CREATE INDEX IF NOT EXISTS idx_sales_uid ON public.sales(uid);');
         await client.query('CREATE INDEX IF NOT EXISTS idx_sales_uid_date ON public.sales(uid, sale_date DESC);');
-        // Índices para o last-sync (MAX(updated_at)) e o skip por conta.
+        // Índices para o last-sync e o skip por conta (cursor por date_last_updated).
         await client.query('CREATE INDEX IF NOT EXISTS idx_sales_uid_seller_updated ON public.sales(uid, seller_id, updated_at DESC);');
         await client.query('CREATE INDEX IF NOT EXISTS idx_sales_uid_seller_saledate ON public.sales(uid, seller_id, sale_date DESC);');
+        await client.query('CREATE INDEX IF NOT EXISTS idx_sales_uid_seller_dlu ON public.sales(uid, seller_id, date_last_updated DESC);');
 
         await client.query('COMMIT');
         console.log('✅ Esquema do banco de dados está atualizado.');
