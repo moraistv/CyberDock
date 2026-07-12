@@ -289,6 +289,22 @@ async function syncDatabaseSchema() {
                AND (raw_api_data->>'date_last_updated') ~ '^[0-9]{4}-';
         `);
 
+        // Assinatura de mudança relevante: status | shipping.status |
+        // shipping.substatus | tags(ordenadas). Se não muda, o pedido não teve
+        // mudança real (só "bump" interno do ML) e pode ser pulado sem baixar.
+        await client.query('ALTER TABLE public.sales ADD COLUMN IF NOT EXISTS sync_signature TEXT;');
+        await client.query(`
+            UPDATE public.sales
+               SET sync_signature =
+                     COALESCE(raw_api_data->>'status','') || '|' ||
+                     COALESCE(raw_api_data->'shipping'->>'status','') || '|' ||
+                     COALESCE(raw_api_data->'shipping'->>'substatus','') || '|' ||
+                     COALESCE((SELECT string_agg(t, ',' ORDER BY t)
+                                 FROM jsonb_array_elements_text(raw_api_data->'tags') t), '')
+             WHERE sync_signature IS NULL
+               AND raw_api_data IS NOT NULL;
+        `);
+
         await client.query('CREATE INDEX IF NOT EXISTS idx_sales_seller_id ON public.sales(seller_id);');
         await client.query('CREATE INDEX IF NOT EXISTS idx_sales_sale_date ON public.sales(sale_date DESC);');
         await client.query(`CREATE INDEX IF NOT EXISTS idx_sales_status ON public.sales((raw_api_data->>'status'));`);

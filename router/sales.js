@@ -56,6 +56,18 @@ async function safeJson(res) {
   }
 }
 
+// Assinatura de mudança relevante do pedido. Precisa bater EXATAMENTE com o
+// backfill em init-db (status | shipping.status | shipping.substatus | tags).
+// status/shipping.status usam o mesmo enum na busca de pedidos e no shipment,
+// então a comparação é consistente entre buscas.
+function computeSyncSignature(o) {
+  const tags = Array.isArray(o?.tags) ? o.tags.slice().sort().join(',') : '';
+  const st = o?.status || '';
+  const shp = o?.shipping?.status || '';
+  const sub = o?.shipping?.substatus || '';
+  return `${st}|${shp}|${sub}|${tags}`;
+}
+
 async function mapWithConcurrency(items, limit, mapper) {
   const ret = new Array(items.length);
   let i = 0;
@@ -162,6 +174,7 @@ function buildInsertBatchRows(orders, targetUid, nickname) {
         shipping_limit_date: finalShippingLimitDate,
         packages: packages,
         date_last_updated: order?.date_last_updated || null,
+        sync_signature: computeSyncSignature(order),
         raw_api_data: order
       });
     }
@@ -173,7 +186,7 @@ function buildMultiInsertQuery_DoUpdate(rows) {
   const cols = [
     'id', 'sku', 'uid', 'seller_id', 'channel', 'account_nickname',
     'sale_date', 'product_title', 'quantity', 'shipping_mode',
-    'shipping_limit_date', 'packages', 'date_last_updated', 'raw_api_data', 'updated_at'
+    'shipping_limit_date', 'packages', 'date_last_updated', 'sync_signature', 'raw_api_data', 'updated_at'
   ];
   const values = [];
   const params = [];
@@ -220,7 +233,7 @@ function buildMultiInsertQuery_DoUpdate(rows) {
     params.push(
       id, r.sku, r.uid, sellerId, 'ML', r.account_nickname,
       r.sale_date, r.product_title, quantity, r.shipping_mode,
-      r.shipping_limit_date, packages, r.date_last_updated || null, r.raw_api_data,
+      r.shipping_limit_date, packages, r.date_last_updated || null, r.sync_signature || null, r.raw_api_data,
       new Date()
     );
     const placeholders = cols.map(() => `$${p++}`).join(', ');
@@ -239,11 +252,12 @@ function buildMultiInsertQuery_DoUpdate(rows) {
       shipping_limit_date = EXCLUDED.shipping_limit_date,
       packages = EXCLUDED.packages,
       date_last_updated = EXCLUDED.date_last_updated,
+      sync_signature = EXCLUDED.sync_signature,
       raw_api_data = EXCLUDED.raw_api_data,
       updated_at = EXCLUDED.updated_at
     WHERE public.sales.processed_at IS NULL
       AND (
-        public.sales.date_last_updated IS DISTINCT FROM EXCLUDED.date_last_updated
+        public.sales.sync_signature IS DISTINCT FROM EXCLUDED.sync_signature
         OR public.sales.shipping_mode IS DISTINCT FROM EXCLUDED.shipping_mode
         OR public.sales.shipping_limit_date IS DISTINCT FROM EXCLUDED.shipping_limit_date
         OR public.sales.packages IS DISTINCT FROM EXCLUDED.packages
@@ -1641,49 +1655,35 @@ router.post('/sync-account', authenticateToken, async (req, res) => {
     sendEvent(clientId, { progress: 35, message: `[${nickname}] Verificando o que mudou desde a última sincronização...`, type: 'info' });
 
     const orderIdList = [...new Set(orderSummaries.map(o => o.id).filter(Boolean).map(id => parseInt(id, 10)).filter(n => !isNaN(n)))];
-    const savedState = new Map(); // id(string) -> { updated: Date|null, final: bool }
+    const savedSig = new Map(); // id(string) -> sync_signature salvo
     if (orderIdList.length > 0) {
-      // Além do date_last_updated (cursor), marcamos se o pedido está FINALIZADO
-      // (entregue/não entregue/cancelado). Pedido final não muda mais nada que
-      // interesse — mesmo que o ML "bumpe" o date_last_updated por evento interno.
       const stateRes = await db.query(
-        `SELECT id,
-                MAX(date_last_updated) AS stored_updated,
-                bool_or(
-                  (raw_api_data->'shipping'->>'status') IN ('delivered','not_delivered','cancelled')
-                  OR (raw_api_data->>'status') = 'cancelled'
-                ) AS is_final
+        `SELECT id, MAX(sync_signature) AS sig
            FROM public.sales
           WHERE uid = $1 AND id = ANY($2::bigint[])
           GROUP BY id`,
         [targetUid, orderIdList]
       );
       for (const r of stateRes.rows) {
-        savedState.set(String(r.id), {
-          updated: r.stored_updated ? new Date(r.stored_updated) : null,
-          final: r.is_final === true
-        });
+        savedSig.set(String(r.id), r.sig);
       }
     }
 
     const toProcess = [];
     let skippedCount = 0;
-    let finalizedSkipped = 0;
     for (const summary of orderSummaries) {
-      const st = savedState.get(String(summary.id));
-      if (st) {
-        // Pedido já finalizado (entregue/cancelado): nunca reprocessa. Ignora os
-        // "bumps" internos de date_last_updated do ML — é o que estava trazendo
-        // milhares de "atualizadas" fantasmas de vendas antigas.
-        if (st.final) { skippedCount++; finalizedSkipped++; continue; }
-        // Ativo: pula se o date_last_updated não avançou (nada mudou).
-        const remoteUpdated = summary.date_last_updated ? new Date(summary.date_last_updated) : null;
-        const unchanged = st.updated && remoteUpdated && st.updated.getTime() >= remoteUpdated.getTime();
-        if (unchanged) { skippedCount++; continue; }
+      const storedSig = savedSig.get(String(summary.id));
+      const remoteSig = computeSyncSignature(summary);
+      // Pula ANTES de baixar quando a assinatura (status/envio/substatus/tags) é
+      // idêntica à salva: nada relevante mudou, foi só "bump" interno do ML.
+      // Se a assinatura mudou (entregue, devolvido, reclamação, etc.), processa.
+      if (storedSig !== undefined && storedSig !== null && storedSig === remoteSig) {
+        skippedCount++;
+        continue;
       }
       toProcess.push(summary);
     }
-    console.log(`[SYNC] ${nickname} encontrados=${orderSummaries.length} paraProcessar=${toProcess.length} pulados=${skippedCount} (finalizados=${finalizedSkipped}, estadoSalvo=${savedState.size})`);
+    console.log(`[SYNC] ${nickname} encontrados=${orderSummaries.length} paraProcessar=${toProcess.length} pulados=${skippedCount} (estadoSalvo=${savedSig.size})`);
 
     if (toProcess.length === 0) {
       sendEvent(clientId, {
