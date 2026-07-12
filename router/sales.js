@@ -3,16 +3,32 @@ const express = require('express');
 const db = require('../utils/postgres');
 const { authenticateToken, requireMaster } = require('../utils/authMiddleware');
 const fetch = require('node-fetch');
+const { mlFetch } = require('../utils/mlClient');
 
 const router = express.Router();
 
+// Headers padrão para chamadas ao ML. x-format-new é recomendado pela doc
+// atual para /shipments, garantindo o formato novo de resposta.
+const mlHeaders = (access_token, extra = {}) => ({
+  Authorization: `Bearer ${access_token}`,
+  ...extra
+});
+const shipmentHeaders = (access_token) => mlHeaders(access_token, { 'x-format-new': 'true' });
+
 const clients = {};
+// Buffer de eventos por clientId para o caso de o job começar/terminar antes
+// do EventSource conectar (mais provável agora que o sync incremental é rápido).
+// Sem isto, o evento de progresso 100 poderia se perder e a tela ficaria presa.
+const pendingEvents = {};
+const PENDING_TTL_MS = 60000;
 
 const sleep = (ms) => new Promise(resolve => setTimeout(resolve, ms));
 
 const MAX_ORDERS = 5000;
 const PAGE_LIMIT = 50;
-const SLA_CONCURRENCY = 10;
+// Concorrência de despacho por conta. O teto real de chamadas simultâneas ao
+// ML é controlado GLOBALMENTE pelo limiter em utils/mlClient.js.
+const SLA_CONCURRENCY = parseInt(process.env.ML_JOB_CONCURRENCY || '15', 10);
 const UPSERT_BATCH_SIZE = 300;
 
 const MAX_PROCESS_BATCH = 500;
@@ -20,7 +36,16 @@ const MAX_PROCESS_BATCH = 500;
 const sendEvent = (clientId, data) => {
   if (clients[clientId]) {
     clients[clientId].res.write(`data: ${JSON.stringify(data)}\n\n`);
+    return;
   }
+  // Ainda não conectou o SSE: guarda o evento para descarregar na conexão.
+  if (!pendingEvents[clientId]) {
+    pendingEvents[clientId] = { events: [], timer: null };
+    pendingEvents[clientId].timer = setTimeout(() => {
+      delete pendingEvents[clientId];
+    }, PENDING_TTL_MS);
+  }
+  pendingEvents[clientId].events.push(data);
 };
 
 async function safeJson(res) {
@@ -201,6 +226,8 @@ function buildMultiInsertQuery_DoUpdate(rows) {
     values.push(`(${placeholders})`);
   }
 
+  // RETURNING (xmax = 0) permite distinguir INSERT de UPDATE no mesmo upsert:
+  // em linhas recém-inseridas xmax = 0; em linhas atualizadas xmax != 0.
   const query = `
     INSERT INTO public.sales (${cols.join(', ')})
     VALUES ${values.join(', ')}
@@ -210,7 +237,8 @@ function buildMultiInsertQuery_DoUpdate(rows) {
       packages = EXCLUDED.packages,
       raw_api_data = EXCLUDED.raw_api_data,
       updated_at = EXCLUDED.updated_at
-    WHERE public.sales.processed_at IS NULL;
+    WHERE public.sales.processed_at IS NULL
+    RETURNING (xmax = 0) AS inserted;
   `;
 
   return { query, params };
@@ -297,28 +325,10 @@ function buildMultiUpdateQuery_Backfill(rows) {
 async function runBackfillMissing({ db, clientId, nickname, targetUid, userId, access_token, isMaster = false }) {
   sendEvent(clientId, { progress: 40, message: `[${nickname}] Procurando vendas com dados faltantes...`, type: 'info' });
 
-  let candidatesQ, cand;
-  if (isMaster) {
-    // Para masters, busca vendas da conta específica sem restrição de seller_id
-    candidatesQ = `
-      SELECT id, sku, uid, seller_id, account_nickname, sale_date
-        FROM public.sales
-       WHERE uid = $1
-         AND (
-           raw_api_data IS NULL
-           OR raw_api_data->'shipping' IS NULL
-           OR raw_api_data->'sla_data' IS NULL
-           OR shipping_mode IS NULL
-           OR shipping_mode = 'Outros'
-           OR shipping_limit_date IS NULL
-         )
-       ORDER BY sale_date DESC
-       LIMIT $2;
-    `;
-    cand = await db.query(candidatesQ, [targetUid, MAX_ORDERS]);
-  } else {
-    // Para usuários normais, mantém a restrição de seller_id
-    candidatesQ = `
+  // Sempre restringir por (uid, seller_id). O backfill enriquece pedidos com o
+  // token de UMA conta específica; filtrar só por uid (master antigo) enriquecia
+  // vendas de outras contas do mesmo cliente com token errado (caller.id mismatch).
+  const candidatesQ = `
       SELECT id, sku, uid, seller_id, account_nickname, sale_date
         FROM public.sales
        WHERE uid = $1
@@ -334,8 +344,7 @@ async function runBackfillMissing({ db, clientId, nickname, targetUid, userId, a
        ORDER BY sale_date DESC
        LIMIT $3;
     `;
-    cand = await db.query(candidatesQ, [targetUid, userId, MAX_ORDERS]);
-  }
+  const cand = await db.query(candidatesQ, [targetUid, userId, MAX_ORDERS]);
 
   if (cand.rowCount === 0) {
     sendEvent(clientId, { progress: 55, message: `[${nickname}] Nada para completar. Nenhum dado faltante.`, type: 'success' });
@@ -354,16 +363,16 @@ async function runBackfillMissing({ db, clientId, nickname, targetUid, userId, a
   // 1) Detalhes do pedido + shipments + sla
   const detailedOrders = await mapWithConcurrency(orderIds, SLA_CONCURRENCY, async (orderId, idx) => {
     try {
-      const r = await fetch(`https://api.mercadolibre.com/orders/${orderId}`, {
-        headers: { Authorization: `Bearer ${access_token}` }
+      const r = await mlFetch(`https://api.mercadolibre.com/orders/${orderId}`, {
+        headers: mlHeaders(access_token)
       });
       let order = r.ok ? await r.json() : null;
 
       if (order?.shipping?.id) {
         const shipId = order.shipping.id;
         const [shipRes, slaRes] = await Promise.all([
-          fetch(`https://api.mercadolibre.com/shipments/${shipId}`, { headers: { Authorization: `Bearer ${access_token}` } }),
-          fetch(`https://api.mercadolibre.com/shipments/${shipId}/sla`, { headers: { Authorization: `Bearer ${access_token}` } }),
+          mlFetch(`https://api.mercadolibre.com/shipments/${shipId}`, { headers: shipmentHeaders(access_token) }),
+          mlFetch(`https://api.mercadolibre.com/shipments/${shipId}/sla`, { headers: shipmentHeaders(access_token) }),
         ]);
 
         if (shipRes.ok) {
@@ -470,7 +479,20 @@ router.get('/sync-status/:clientId', (req, res) => {
     'Cache-Control': 'no-cache'
   });
   clients[clientId] = { res };
-  sendEvent(clientId, { progress: 5, message: 'Conexão estabelecida. Aguardando início...', type: 'info' });
+
+  // Descarrega eventos que aconteceram antes do SSE conectar (incluindo um
+  // eventual progresso 100 se o job já tiver terminado).
+  const buffered = pendingEvents[clientId];
+  if (buffered) {
+    if (buffered.timer) clearTimeout(buffered.timer);
+    for (const ev of buffered.events) {
+      res.write(`data: ${JSON.stringify(ev)}\n\n`);
+    }
+    delete pendingEvents[clientId];
+  } else {
+    sendEvent(clientId, { progress: 5, message: 'Conexão estabelecida. Aguardando início...', type: 'info' });
+  }
+
   req.on('close', () => {
     delete clients[clientId];
   });
@@ -1523,7 +1545,7 @@ router.post('/sync-account', authenticateToken, async (req, res) => {
         `?seller=${userId}&offset=${offset}&limit=${limit}&sort=date_desc` +
         `&order.date_last_updated.from=${encodeURIComponent(lastSyncDate.toISOString())}`;
 
-      let ordersResponse = await fetch(ordersUrl, { headers: { Authorization: `Bearer ${access_token}` } });
+      let ordersResponse = await mlFetch(ordersUrl, { headers: mlHeaders(access_token) });
 
       if (ordersResponse.status === 401) {
         sendEvent(clientId, { progress: 25, message: `[${nickname}] Token expirado. Tentando renovar...`, type: 'info' });
@@ -1559,7 +1581,7 @@ router.post('/sync-account', authenticateToken, async (req, res) => {
           );
         }
         sendEvent(clientId, { progress: 30, message: `[${nickname}] Token atualizado. Retomando busca...`, type: 'info' });
-        ordersResponse = await fetch(ordersUrl, { headers: { Authorization: `Bearer ${access_token}` } });
+        ordersResponse = await mlFetch(ordersUrl, { headers: mlHeaders(access_token) });
       }
 
       if (!ordersResponse.ok) {
@@ -1588,70 +1610,113 @@ router.post('/sync-account', authenticateToken, async (req, res) => {
       const items = pageData.results || [];
       if (items.length === 0) break;
 
-      const filteredItems = items.filter((o) => new Date(o.date_created) >= lastSyncDate);
-      orderSummaries.push(...filteredItems);
-
-      if (items.length > 0) {
-        const lastDateInPage = new Date(items[items.length - 1]?.date_created);
-        if (lastDateInPage < lastSyncDate) break;
-      }
+      // A API já filtra por date_last_updated.from; aproveitamos todos os
+      // resultados (sem refiltrar por date_created, que descartava updates de
+      // pedidos antigos — bug #12 da auditoria).
+      orderSummaries.push(...items);
 
       if (items.length < limit) break;
       offset += limit;
     }
 
     if (orderSummaries.length === 0) {
-      sendEvent(clientId, { progress: 100, message: `[${nickname}] Nenhuma venda nova encontrada. Tudo atualizado!`, type: 'success' });
+      sendEvent(clientId, { progress: 100, message: `[${nickname}] Nenhuma venda nova encontrada. Tudo atualizado!`, type: 'success', newSalesCount: 0, updatedCount: 0, skippedCount: 0 });
       return;
     }
 
-    sendEvent(clientId, { progress: 45, message: `[${nickname}] Buscando detalhes de ${orderSummaries.length} vendas...`, type: 'info' });
-    const allOrders = await mapWithConcurrency(orderSummaries, SLA_CONCURRENCY, async (order, index) => {
+    // ====== SKIP DE PEDIDOS INALTERADOS (o maior ganho) ======
+    // Consulta o estado já salvo destes pedidos e pula os que não mudaram
+    // (date_last_updated igual) e já estão enriquecidos. Assim, clicar de novo
+    // não refaz detalhe/shipment/SLA do que não mudou — cai de milhares de
+    // chamadas para praticamente zero.
+    sendEvent(clientId, { progress: 35, message: `[${nickname}] Verificando o que mudou desde a última sincronização...`, type: 'info' });
+
+    const orderIdList = [...new Set(orderSummaries.map(o => o.id).filter(Boolean).map(id => parseInt(id, 10)).filter(n => !isNaN(n)))];
+    const savedState = new Map(); // id(string) -> { updated: Date|null, enriched: bool }
+    if (orderIdList.length > 0) {
+      const stateRes = await db.query(
+        `SELECT id,
+                MAX(raw_api_data->>'date_last_updated') AS stored_updated,
+                bool_and(
+                  (raw_api_data->'shipping'->>'id') IS NULL
+                  OR (raw_api_data->'shipping'->>'status') IS NOT NULL
+                ) AS enriched
+           FROM public.sales
+          WHERE uid = $1 AND seller_id = $2 AND id = ANY($3::bigint[])
+          GROUP BY id`,
+        [targetUid, userId, orderIdList]
+      );
+      for (const r of stateRes.rows) {
+        savedState.set(String(r.id), {
+          updated: r.stored_updated ? new Date(r.stored_updated) : null,
+          enriched: r.enriched === true
+        });
+      }
+    }
+
+    const toProcess = [];
+    let skippedCount = 0;
+    for (const summary of orderSummaries) {
+      const st = savedState.get(String(summary.id));
+      const remoteUpdated = summary.date_last_updated ? new Date(summary.date_last_updated) : null;
+      const unchanged = st && st.enriched && st.updated && remoteUpdated && st.updated.getTime() >= remoteUpdated.getTime();
+      if (unchanged) { skippedCount++; continue; }
+      toProcess.push(summary);
+    }
+
+    if (toProcess.length === 0) {
+      sendEvent(clientId, {
+        progress: 100,
+        message: `[${nickname}] Tudo atualizado. ${skippedCount} pedido(s) sem mudança.`,
+        type: 'success',
+        newSalesCount: 0,
+        updatedCount: 0,
+        skippedCount
+      });
+      return;
+    }
+
+    // Passagem ÚNICA: detalhe do pedido + shipment + SLA (em paralelo) por pedido.
+    // Só roda para os pedidos que realmente mudaram (toProcess).
+    sendEvent(clientId, { progress: 45, message: `[${nickname}] Processando ${toProcess.length} pedido(s) alterado(s) (${skippedCount} sem mudança)...`, type: 'info' });
+    let processedCount = 0;
+    const enrichedOrders = await mapWithConcurrency(toProcess, SLA_CONCURRENCY, async (summary) => {
+      let order = summary;
       try {
-        const orderDetailsRes = await fetch(`https://api.mercadolibre.com/orders/${order.id}`, { headers: { Authorization: `Bearer ${access_token}` } });
+        const orderDetailsRes = await mlFetch(`https://api.mercadolibre.com/orders/${summary.id}`, { headers: mlHeaders(access_token) });
         if (orderDetailsRes.ok) {
-          const orderDetails = await orderDetailsRes.json();
-          if (index > 0 && index % 10 === 0) {
-            const pct = 45 + Math.floor(((index + 1) / orderSummaries.length) * 15);
-            sendEvent(clientId, { progress: Math.min(60, pct), message: `[${nickname}] Detalhando... ${index + 1}/${orderSummaries.length}`, type: 'info' });
-          }
-          return orderDetails;
+          order = await orderDetailsRes.json();
         }
-        return order;
       } catch (e) {
-        console.error(`Falha ao buscar detalhes do pedido ${order.id}:`, e);
-        return order;
+        console.error(`Falha ao buscar detalhes do pedido ${summary.id}:`, e);
       }
-    });
 
-    sendEvent(clientId, { progress: 65, message: `[${nickname}] Enriquecendo dados de envio para ${allOrders.length} vendas...`, type: 'info' });
-    const enrichedOrders = await mapWithConcurrency(allOrders, SLA_CONCURRENCY, async (order, index) => {
       const shipmentId = order?.shipping?.id;
-      if (!shipmentId) return order;
-
-      try {
-        const shipmentRes = await fetch(`https://api.mercadolibre.com/shipments/${shipmentId}`, { headers: { Authorization: `Bearer ${access_token}` } });
-        if (shipmentRes.ok) {
-          const shipmentDetails = await safeJson(shipmentRes);
-          if (shipmentDetails) order.shipping = { ...order.shipping, ...shipmentDetails };
+      if (shipmentId) {
+        try {
+          const [shipRes, slaRes] = await Promise.all([
+            mlFetch(`https://api.mercadolibre.com/shipments/${shipmentId}`, { headers: shipmentHeaders(access_token) }),
+            mlFetch(`https://api.mercadolibre.com/shipments/${shipmentId}/sla`, { headers: shipmentHeaders(access_token) }),
+          ]);
+          if (shipRes.ok) {
+            const shipmentDetails = await safeJson(shipRes);
+            if (shipmentDetails) order.shipping = { ...order.shipping, ...shipmentDetails };
+          }
+          if (slaRes.ok) {
+            const slaData = await safeJson(slaRes);
+            if (slaData) order.sla_data = slaData;
+          }
+        } catch (e) {
+          console.error(`Falha ao enriquecer envio ${shipmentId}:`, e);
         }
-
-        const slaRes = await fetch(`https://api.mercadolibre.com/shipments/${shipmentId}/sla`, { headers: { Authorization: `Bearer ${access_token}` } });
-        if (slaRes.ok) {
-          const slaData = await safeJson(slaRes);
-          if (slaData) order.sla_data = slaData;
-        }
-
-        if (index > 0 && index % 10 === 0) {
-          const pct = 65 + Math.floor(((index + 1) / allOrders.length) * 20);
-          sendEvent(clientId, { progress: Math.min(85, pct), message: `[${nickname}] Enriquecendo... ${index + 1}/${allOrders.length}`, type: 'info' });
-        }
-
-        return order;
-      } catch (e) {
-        console.error(`Falha ao enriquecer dados para envio ${shipmentId}:`, e);
-        return order;
       }
+
+      processedCount++;
+      if (processedCount % 25 === 0) {
+        const pct = 45 + Math.floor((processedCount / toProcess.length) * 40);
+        sendEvent(clientId, { progress: Math.min(85, pct), message: `[${nickname}] Enriquecendo... ${processedCount}/${toProcess.length}`, type: 'info' });
+      }
+      return order;
     });
 
     const allRows = buildInsertBatchRows(enrichedOrders.filter(Boolean), targetUid, nickname);
@@ -1660,11 +1725,17 @@ router.post('/sync-account', authenticateToken, async (req, res) => {
     const clientDb = await db.pool.connect();
     try {
       await clientDb.query('BEGIN');
+      let insertedCount = 0;
+      let updatedCount = 0;
       for (let i = 0; i < allRows.length; i += UPSERT_BATCH_SIZE) {
         const chunk = allRows.slice(i, i + UPSERT_BATCH_SIZE);
 
         const { query, params } = buildMultiInsertQuery_DoUpdate(chunk);
-        await clientDb.query(query, params);
+        const result = await clientDb.query(query, params);
+        for (const row of result.rows) {
+          if (row.inserted) insertedCount++;
+          else updatedCount++;
+        }
 
         const pct = 85 + Math.floor(((i + chunk.length) / allRows.length) * 15);
         if (i === 0 || i + UPSERT_BATCH_SIZE >= allRows.length || i % (UPSERT_BATCH_SIZE * 3) === 0) {
@@ -1672,11 +1743,17 @@ router.post('/sync-account', authenticateToken, async (req, res) => {
         }
       }
       await clientDb.query('COMMIT');
-      sendEvent(clientId, { 
-        progress: 100, 
-        message: `[${nickname}] Sincronização concluída. ${allRows.length} itens processados.`, 
+      const doneMsg = insertedCount > 0
+        ? `[${nickname}] Concluída. ${insertedCount} venda(s) nova(s), ${updatedCount} atualizada(s), ${skippedCount} sem mudança.`
+        : `[${nickname}] Concluída. Nenhuma venda nova (${updatedCount} atualizada(s), ${skippedCount} sem mudança).`;
+      sendEvent(clientId, {
+        progress: 100,
+        message: doneMsg,
         type: 'success',
-        newSalesCount: allRows.length
+        newSalesCount: insertedCount,
+        updatedCount: updatedCount,
+        skippedCount: skippedCount,
+        processedCount: allRows.length
       });
     } catch (e) {
       await clientDb.query('ROLLBACK');
