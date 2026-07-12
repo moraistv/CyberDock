@@ -2036,4 +2036,124 @@ router.get('/last-sync/:mlAccountId', authenticateToken, async (req, res) => {
   }
 });
 
+/** ======== WEBHOOK DO MERCADO LIVRE (tempo real) ======== */
+// O ML envia POST aqui no instante em que um pedido/envio muda. A gente responde
+// 200 na hora e sincroniza SÓ aquele pedido. Sem clique, sem período, sem varrer.
+// Configurar a Callback URL no painel do app ML apontando para:
+//   https://api.cyberdock.com.br/api/sales/webhook/ml
+// Tópicos: orders / orders_v2 / created_orders / shipments.
+
+const webhookDedup = new Map(); // key -> timestamp (evita processar duplicatas em rajada)
+
+async function refreshAccountToken(userId, uid, refresh_token) {
+  const CLIENT_ID = process.env.ML_CLIENT_ID;
+  const CLIENT_SECRET = process.env.ML_CLIENT_SECRET;
+  const r = await fetch('https://api.mercadolibre.com/oauth/token', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+    body: new URLSearchParams({
+      grant_type: 'refresh_token',
+      client_id: CLIENT_ID,
+      client_secret: CLIENT_SECRET,
+      refresh_token
+    })
+  });
+  if (!r.ok) throw new Error('Falha ao renovar token no webhook.');
+  const t = await r.json();
+  await db.query(
+    "UPDATE public.ml_accounts SET access_token = $1, refresh_token = $2, expires_in = $3, status = 'active', updated_at = NOW() WHERE user_id = $4 AND uid = $5",
+    [t.access_token, t.refresh_token, t.expires_in, userId, uid]
+  );
+  return t.access_token;
+}
+
+async function fetchOrderEnriched(orderId, access_token) {
+  const r = await mlFetch(`https://api.mercadolibre.com/orders/${orderId}`, { headers: mlHeaders(access_token) });
+  if (r.status === 401) return { status: 401, order: null };
+  if (!r.ok) return { status: r.status, order: null };
+  const order = await r.json();
+  const shipmentId = order?.shipping?.id;
+  if (shipmentId) {
+    const [shipRes, slaRes] = await Promise.all([
+      mlFetch(`https://api.mercadolibre.com/shipments/${shipmentId}`, { headers: shipmentHeaders(access_token) }),
+      mlFetch(`https://api.mercadolibre.com/shipments/${shipmentId}/sla`, { headers: shipmentHeaders(access_token) }),
+    ]);
+    if (shipRes.ok) { const s = await safeJson(shipRes); if (s) order.shipping = { ...order.shipping, ...s }; }
+    if (slaRes.ok) { const s = await safeJson(slaRes); if (s) order.sla_data = s; }
+  }
+  return { status: 200, order };
+}
+
+async function upsertSingleOrder(order, targetUid, nickname) {
+  const rows = buildInsertBatchRows([order].filter(Boolean), targetUid, nickname);
+  if (rows.length === 0) return { inserted: 0, updated: 0 };
+  const { query, params } = buildMultiInsertQuery_DoUpdate(rows);
+  const result = await db.query(query, params);
+  let inserted = 0, updated = 0;
+  for (const row of result.rows) { if (row.inserted) inserted++; else updated++; }
+  return { inserted, updated };
+}
+
+router.post('/webhook/ml', async (req, res) => {
+  // Responde imediatamente (o ML exige 200 em até 20s, senão reenvia).
+  res.sendStatus(200);
+
+  try {
+    const body = req.body || {};
+    const resource = body.resource;
+    const topic = body.topic || '';
+    const sellerId = body.user_id;
+    if (!resource || !sellerId) return;
+
+    // Dedup simples: ignora o mesmo resource repetido em menos de 10s.
+    const key = `${sellerId}:${resource}`;
+    const now = Date.now();
+    const last = webhookDedup.get(key);
+    if (last && now - last < 10000) return;
+    webhookDedup.set(key, now);
+    if (webhookDedup.size > 5000) webhookDedup.clear();
+
+    // Resolve a conta (token + dono) pelo seller (user_id da notificação).
+    const accRes = await db.query(
+      'SELECT access_token, refresh_token, uid, nickname FROM public.ml_accounts WHERE user_id = $1 LIMIT 1',
+      [sellerId]
+    );
+    if (accRes.rowCount === 0) {
+      console.warn(`[WEBHOOK] Conta não encontrada para seller ${sellerId}`);
+      return;
+    }
+    let { access_token, refresh_token, uid, nickname } = accRes.rows[0];
+
+    // Descobre o orderId a partir do recurso.
+    let orderId = null;
+    if (resource.includes('/orders/')) {
+      orderId = resource.split('/orders/')[1].split(/[/?]/)[0];
+    } else if (resource.includes('/shipments/')) {
+      // Notificação de envio: busca o shipment para achar o order_id.
+      const shipId = resource.split('/shipments/')[1].split(/[/?]/)[0];
+      let sr = await mlFetch(`https://api.mercadolibre.com/shipments/${shipId}`, { headers: shipmentHeaders(access_token) });
+      if (sr.status === 401) {
+        access_token = await refreshAccountToken(sellerId, uid, refresh_token);
+        sr = await mlFetch(`https://api.mercadolibre.com/shipments/${shipId}`, { headers: shipmentHeaders(access_token) });
+      }
+      if (sr.ok) { const sj = await safeJson(sr); orderId = sj?.order_id; }
+    } else {
+      return; // tópico não tratado (items, questions, etc.)
+    }
+    if (!orderId) return;
+
+    let { status, order } = await fetchOrderEnriched(orderId, access_token);
+    if (status === 401) {
+      access_token = await refreshAccountToken(sellerId, uid, refresh_token);
+      ({ status, order } = await fetchOrderEnriched(orderId, access_token));
+    }
+    if (!order) return;
+
+    const { inserted, updated } = await upsertSingleOrder(order, uid, nickname);
+    console.log(`[WEBHOOK] ${topic} order=${orderId} seller=${sellerId} novas=${inserted} atualizadas=${updated}`);
+  } catch (e) {
+    console.error('[WEBHOOK] erro:', e.message);
+  }
+});
+
 module.exports = router;
