@@ -1634,17 +1634,21 @@ router.post('/sync-account', authenticateToken, async (req, res) => {
     const orderIdList = [...new Set(orderSummaries.map(o => o.id).filter(Boolean).map(id => parseInt(id, 10)).filter(n => !isNaN(n)))];
     const savedState = new Map(); // id(string) -> { updated: Date|null, enriched: bool }
     if (orderIdList.length > 0) {
+      // Filtra só por uid + id (o id do pedido já é único no ML). Não usamos
+      // seller_id aqui para não correr o risco de o seller_id salvo divergir do
+      // userId e a consulta voltar vazia (o que faria o skip nunca acontecer).
       const stateRes = await db.query(
         `SELECT id,
                 MAX(raw_api_data->>'date_last_updated') AS stored_updated,
                 bool_and(
                   (raw_api_data->'shipping'->>'id') IS NULL
+                  OR (raw_api_data ? 'sla_data')
                   OR (raw_api_data->'shipping'->>'status') IS NOT NULL
                 ) AS enriched
            FROM public.sales
-          WHERE uid = $1 AND seller_id = $2 AND id = ANY($3::bigint[])
+          WHERE uid = $1 AND id = ANY($2::bigint[])
           GROUP BY id`,
-        [targetUid, userId, orderIdList]
+        [targetUid, orderIdList]
       );
       for (const r of stateRes.rows) {
         savedState.set(String(r.id), {
@@ -1659,7 +1663,10 @@ router.post('/sync-account', authenticateToken, async (req, res) => {
     for (const summary of orderSummaries) {
       const st = savedState.get(String(summary.id));
       const remoteUpdated = summary.date_last_updated ? new Date(summary.date_last_updated) : null;
-      const unchanged = st && st.enriched && st.updated && remoteUpdated && st.updated.getTime() >= remoteUpdated.getTime();
+      // Sinal autoritativo: se o date_last_updated não avançou, o pedido não
+      // mudou no ML — pula (mesmo que a "enriquecido" seja incerta). Só força
+      // reprocesso quando realmente mudou OU quando está claramente incompleto.
+      const unchanged = st && st.updated && remoteUpdated && st.updated.getTime() >= remoteUpdated.getTime();
       if (unchanged) { skippedCount++; continue; }
       toProcess.push(summary);
     }
