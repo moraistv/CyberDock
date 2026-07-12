@@ -603,7 +603,8 @@ router.get('/download-label', authenticateToken, async (req, res) => {
       const dbRes = await db.query(`
         SELECT 
           s.raw_api_data->'shipping'->>'id' as shipping_id, 
-          s.sku, 
+          s.sku,
+          s.quantity,
           u.name as user_name 
         FROM public.sales s 
         JOIN public.users u ON s.uid = u.uid 
@@ -616,17 +617,17 @@ router.get('/download-label', authenticateToken, async (req, res) => {
     
     const infoMap = {};
     salesInfo.forEach(r => {
-      infoMap[String(r.shipping_id)] = { sku: r.sku, user_name: r.user_name };
+      infoMap[String(r.shipping_id)] = { sku: r.sku, quantity: r.quantity, user_name: r.user_name };
     });
 
-    const enrichPdf = async (pdfBuffer, sku, userName, logisticType) => {
+    const enrichPdf = async (pdfBuffer, sku, quantity, userName, logisticType) => {
       if (!sku && !userName) return pdfBuffer;
       try {
         const pdfDoc = await PDFDocument.load(pdfBuffer);
         const pages = pdfDoc.getPages();
         if (pages.length === 0) return pdfBuffer;
 
-        const text = `SKU: ${sku || 'N/A'} | Cliente: ${userName || 'N/A'}`;
+        const text = `Quantidade: ${quantity ?? 'N/A'} | SKU: ${sku || 'N/A'} | Cliente: ${userName || 'N/A'}`;
         const page = pages[0];
         const { height } = page.getSize();
         
@@ -661,9 +662,9 @@ router.get('/download-label', authenticateToken, async (req, res) => {
       }
     };
 
-    const enrichZpl = (zplString, sku, userName) => {
+    const enrichZpl = (zplString, sku, quantity, userName) => {
       if (!sku && !userName) return zplString;
-      const text = `SKU: ${sku || 'N/A'} | Cliente: ${userName || 'N/A'}`;
+      const text = `Quantidade: ${quantity ?? 'N/A'} | SKU: ${sku || 'N/A'} | Cliente: ${userName || 'N/A'}`;
       // Adiciona um bloco ZPL no fim da string para imprimir o texto
       // A maioria das etiquetas termina com ^XZ. Injetar logo antes ou enviar como nova etiqueta curta.
       // É mais seguro concatenar uma mini etiqueta logo após a principal para não estragar a formatação nativa.
@@ -709,9 +710,9 @@ router.get('/download-label', authenticateToken, async (req, res) => {
 
       if (isPDF) {
         const logisticType = logisticMap[id] || null;
-        buf = await enrichPdf(buf, info.sku, info.user_name, logisticType);
+        buf = await enrichPdf(buf, info.sku, info.quantity, info.user_name, logisticType);
       } else {
-        const zplStr = enrichZpl(buf.toString('utf-8'), info.sku, info.user_name);
+        const zplStr = enrichZpl(buf.toString('utf-8'), info.sku, info.quantity, info.user_name);
         buf = Buffer.from(zplStr, 'utf-8');
       }
       buffers.push(buf);
