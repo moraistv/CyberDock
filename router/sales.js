@@ -24,7 +24,10 @@ const PENDING_TTL_MS = 60000;
 
 const sleep = (ms) => new Promise(resolve => setTimeout(resolve, ms));
 
-const MAX_ORDERS = 5000;
+// Recovery ceiling for an account whose cursor was previously stale. Normal
+// incremental runs should be tiny; 10k lets an existing 5k backlog drain once
+// and then return to the fast cursor path.
+const MAX_ORDERS = parseInt(process.env.ML_MAX_ORDERS_PER_SYNC || '10000', 10);
 const PAGE_LIMIT = 50;
 // Concorrência de despacho por conta. O teto real de chamadas simultâneas ao
 // ML é controlado GLOBALMENTE pelo limiter em utils/mlClient.js.
@@ -1637,6 +1640,7 @@ router.post('/sync-account', authenticateToken, async (req, res) => {
 
       const pageData = await ordersResponse.json();
       const items = pageData.results || [];
+      const remoteTotal = Number(pageData?.paging?.total) || 0;
       if (items.length === 0) {
         searchFullyConsumed = true;
         break;
@@ -1646,6 +1650,13 @@ router.post('/sync-account', authenticateToken, async (req, res) => {
       // resultados (sem refiltrar por date_created, que descartava updates de
       // pedidos antigos — bug #12 da auditoria).
       orderSummaries.push(...items);
+      sendEvent(clientId, {
+        progress: 20 + Math.min(14, Math.floor((orderSummaries.length / Math.max(1, Math.min(remoteTotal, MAX_ORDERS))) * 14)),
+        message: `[${nickname}] Lendo alteracoes... ${orderSummaries.length}/${remoteTotal || orderSummaries.length}`,
+        type: 'info',
+        workCompleted: orderSummaries.length,
+        workTotal: Math.max(orderSummaries.length, Math.min(remoteTotal || orderSummaries.length, MAX_ORDERS))
+      });
 
       if (items.length < limit) {
         searchFullyConsumed = true;
@@ -1679,7 +1690,7 @@ router.post('/sync-account', authenticateToken, async (req, res) => {
     };
 
     if (orderSummaries.length === 0) {
-      sendEvent(clientId, { progress: 100, message: `[${nickname}] Nenhuma venda nova encontrada. Tudo atualizado!`, type: 'success', newSalesCount: 0, updatedCount: 0, skippedCount: 0 });
+      sendEvent(clientId, { progress: 100, message: `[${nickname}] Nenhuma venda nova encontrada. Tudo atualizado!`, type: 'success', newSalesCount: 0, updatedCount: 0, skippedCount: 0, workCompleted: 1, workTotal: 1 });
       return;
     }
 
@@ -1721,6 +1732,15 @@ router.post('/sync-account', authenticateToken, async (req, res) => {
     }
     console.log(`[SYNC] ${nickname} encontrados=${orderSummaries.length} paraProcessar=${toProcess.length} pulados=${skippedCount} (estadoSalvo=${savedSig.size})`);
 
+    const accountWorkTotal = orderSummaries.length + (toProcess.length * 3);
+    sendEvent(clientId, {
+      progress: 45,
+      message: `[${nickname}] ${toProcess.length} alterado(s), ${skippedCount} sem mudanca.`,
+      type: 'info',
+      workCompleted: orderSummaries.length,
+      workTotal: Math.max(1, accountWorkTotal)
+    });
+
     if (toProcess.length === 0) {
       await persistObservedCursor();
       sendEvent(clientId, {
@@ -1729,7 +1749,9 @@ router.post('/sync-account', authenticateToken, async (req, res) => {
         type: 'success',
         newSalesCount: 0,
         updatedCount: 0,
-        skippedCount
+        skippedCount,
+        workCompleted: Math.max(1, accountWorkTotal),
+        workTotal: Math.max(1, accountWorkTotal)
       });
       return;
     }
@@ -1772,7 +1794,13 @@ router.post('/sync-account', authenticateToken, async (req, res) => {
       processedCount++;
       if (processedCount % 25 === 0) {
         const pct = 45 + Math.floor((processedCount / toProcess.length) * 40);
-        sendEvent(clientId, { progress: Math.min(85, pct), message: `[${nickname}] Enriquecendo... ${processedCount}/${toProcess.length}`, type: 'info' });
+        sendEvent(clientId, {
+          progress: Math.min(85, pct),
+          message: `[${nickname}] Enriquecendo... ${processedCount}/${toProcess.length}`,
+          type: 'info',
+          workCompleted: orderSummaries.length + (processedCount * 3),
+          workTotal: Math.max(1, accountWorkTotal)
+        });
       }
       return order;
     });
@@ -1816,7 +1844,9 @@ router.post('/sync-account', authenticateToken, async (req, res) => {
         newSalesCount: insertedCount,
         updatedCount: updatedCount,
         skippedCount: unchangedTotal,
-        processedCount: allRows.length
+        processedCount: allRows.length,
+        workCompleted: Math.max(1, accountWorkTotal),
+        workTotal: Math.max(1, accountWorkTotal)
       });
     } catch (e) {
       await clientDb.query('ROLLBACK');
