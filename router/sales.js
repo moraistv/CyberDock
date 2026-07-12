@@ -1499,39 +1499,37 @@ router.post('/sync-account', authenticateToken, async (req, res) => {
     const maxLookbackDate = new Date();
     maxLookbackDate.setDate(maxLookbackDate.getDate() - 180);
 
-    if (daysToSync) {
-      lastSyncDate = new Date();
-      lastSyncDate.setDate(lastSyncDate.getDate() - parseInt(daysToSync, 10));
-      if (lastSyncDate < maxLookbackDate) lastSyncDate = maxLookbackDate;
-      sendEvent(clientId, { progress: 15, message: `[${nickname}] Sincronização dos últimos ${daysToSync} dias iniciada...`, type: 'info' });
-    } else if (force) {
-      lastSyncDate = maxLookbackDate;
-      sendEvent(clientId, { progress: 15, message: `[${nickname}] Sincronização forçada iniciada...`, type: 'info' });
-    } else {
-      let lastSyncRes;
-      if (req.user.role === 'master') {
-        // Para masters, busca a última venda da conta específica (seller_id)
-        // IMPORTANTE: filtrar por seller_id para suportar multi-contas (ex: MIMALE com 2 contas)
-        lastSyncRes = await db.query(
-          `SELECT MAX(updated_at) AS last_sale FROM public.sales WHERE uid = $1 AND seller_id = $2`,
-          [targetUid, userId]
-        );
-      } else {
-        // Para usuários normais, mantém a restrição de seller_id
-        lastSyncRes = await db.query(
-          `SELECT MAX(updated_at) AS last_sale FROM public.sales WHERE uid = $1 AND seller_id = $2`,
-          [targetUid, userId]
-        );
-      }
-      
-      lastSyncDate = lastSyncRes.rows[0]?.last_sale ? new Date(lastSyncRes.rows[0].last_sale) : null;
+    // Cursor incremental por conta: o MAIOR date_last_updated que já salvamos.
+    // É o marco confiável de "até onde já sincronizei". Buscar a partir dele
+    // (com pequena margem) faz o clique repetido, sem mudanças, voltar ZERO
+    // pedidos — em vez de reler os últimos N dias inteiros toda vez.
+    const cursorRes = await db.query(
+      `SELECT MAX((raw_api_data->>'date_last_updated')::timestamptz) AS cursor
+         FROM public.sales
+        WHERE uid = $1 AND seller_id = $2`,
+      [targetUid, userId]
+    );
+    const syncCursor = cursorRes.rows[0]?.cursor ? new Date(cursorRes.rows[0].cursor) : null;
 
-      if (!lastSyncDate || lastSyncDate < maxLookbackDate) {
-        lastSyncDate = maxLookbackDate;
+    if (force || !syncCursor) {
+      // Primeira sincronização da conta (sem cursor) ou forçada: janela ampla.
+      if (daysToSync && !force) {
+        lastSyncDate = new Date();
+        lastSyncDate.setDate(lastSyncDate.getDate() - parseInt(daysToSync, 10));
+        if (lastSyncDate < maxLookbackDate) lastSyncDate = maxLookbackDate;
+        sendEvent(clientId, { progress: 15, message: `[${nickname}] Primeira sincronização (últimos ${daysToSync} dias)...`, type: 'info' });
       } else {
-        lastSyncDate.setDate(lastSyncDate.getDate() - 1);
+        lastSyncDate = maxLookbackDate;
+        sendEvent(clientId, { progress: 15, message: `[${nickname}] Sincronização completa iniciada...`, type: 'info' });
       }
+    } else {
+      // Incremental: busca só o que mudou desde o último date_last_updated
+      // conhecido, com margem de 2 minutos por segurança de relógio/atraso.
+      lastSyncDate = new Date(syncCursor.getTime() - 2 * 60 * 1000);
+      if (lastSyncDate < maxLookbackDate) lastSyncDate = maxLookbackDate;
+      sendEvent(clientId, { progress: 15, message: `[${nickname}] Buscando novidades desde a última sincronização...`, type: 'info' });
     }
+    console.log(`[SYNC] ${nickname} uid=${targetUid} seller=${userId} cursor=${syncCursor ? syncCursor.toISOString() : 'none'} from=${lastSyncDate.toISOString()} force=${!!force} days=${daysToSync || '-'}`);
 
     sendEvent(clientId, { progress: 20, message: `[${nickname}] Buscando resumo de vendas desde ${lastSyncDate.toLocaleDateString('pt-BR')}...`, type: 'info' });
 
@@ -1670,6 +1668,7 @@ router.post('/sync-account', authenticateToken, async (req, res) => {
       if (unchanged) { skippedCount++; continue; }
       toProcess.push(summary);
     }
+    console.log(`[SYNC] ${nickname} encontrados=${orderSummaries.length} paraProcessar=${toProcess.length} pulados=${skippedCount} (estadoSalvo=${savedState.size})`);
 
     if (toProcess.length === 0) {
       sendEvent(clientId, {
