@@ -28,7 +28,7 @@ const MAX_ORDERS = 5000;
 const PAGE_LIMIT = 50;
 // Concorrência de despacho por conta. O teto real de chamadas simultâneas ao
 // ML é controlado GLOBALMENTE pelo limiter em utils/mlClient.js.
-const SLA_CONCURRENCY = parseInt(process.env.ML_JOB_CONCURRENCY || '15', 10);
+const SLA_CONCURRENCY = parseInt(process.env.ML_JOB_CONCURRENCY || '24', 10);
 const UPSERT_BATCH_SIZE = 300;
 
 const MAX_PROCESS_BATCH = 500;
@@ -1526,9 +1526,14 @@ router.post('/sync-account', authenticateToken, async (req, res) => {
     // Cursor incremental por conta: o MAIOR date_last_updated já salvo (coluna
     // dedicada, confiável e indexada).
     const cursorRes = await db.query(
-      `SELECT MAX(date_last_updated) AS cursor
-         FROM public.sales
-        WHERE uid = $1 AND seller_id = $2`,
+      `SELECT COALESCE(
+                (SELECT last_remote_updated_at
+                   FROM public.ml_sync_cursors
+                  WHERE uid = $1 AND seller_id = $2),
+                (SELECT MAX(date_last_updated)
+                   FROM public.sales
+                  WHERE uid = $1 AND seller_id = $2)
+              ) AS cursor`,
       [targetUid, userId]
     );
     const syncCursor = cursorRes.rows[0]?.cursor ? new Date(cursorRes.rows[0].cursor) : null;
@@ -1538,12 +1543,12 @@ router.post('/sync-account', authenticateToken, async (req, res) => {
     // - senão, forçada = 180 dias;
     // - senão, incremental pelo cursor (só o que mudou desde a última vez).
     // Em todos os casos o "skip antes de baixar" garante velocidade.
-    if (daysToSync) {
+    if (!syncCursor && daysToSync) {
       lastSyncDate = new Date();
       lastSyncDate.setDate(lastSyncDate.getDate() - parseInt(daysToSync, 10));
       if (lastSyncDate < maxLookbackDate) lastSyncDate = maxLookbackDate;
       sendEvent(clientId, { progress: 15, message: `[${nickname}] Verificando alterações dos últimos ${daysToSync} dias...`, type: 'info' });
-    } else if (force) {
+    } else if (!syncCursor && force) {
       lastSyncDate = maxLookbackDate;
       sendEvent(clientId, { progress: 15, message: `[${nickname}] Sincronização completa iniciada...`, type: 'info' });
     } else if (syncCursor) {
@@ -1560,6 +1565,7 @@ router.post('/sync-account', authenticateToken, async (req, res) => {
 
     let orderSummaries = [];
     let offset = 0;
+    let searchFullyConsumed = false;
 
     while (orderSummaries.length < MAX_ORDERS) {
       const limit = Math.min(PAGE_LIMIT, MAX_ORDERS - orderSummaries.length);
@@ -1631,16 +1637,46 @@ router.post('/sync-account', authenticateToken, async (req, res) => {
 
       const pageData = await ordersResponse.json();
       const items = pageData.results || [];
-      if (items.length === 0) break;
+      if (items.length === 0) {
+        searchFullyConsumed = true;
+        break;
+      }
 
       // A API já filtra por date_last_updated.from; aproveitamos todos os
       // resultados (sem refiltrar por date_created, que descartava updates de
       // pedidos antigos — bug #12 da auditoria).
       orderSummaries.push(...items);
 
-      if (items.length < limit) break;
+      if (items.length < limit) {
+        searchFullyConsumed = true;
+        break;
+      }
       offset += limit;
     }
+
+    // Keep an API cursor independent from the rows that need an upsert. The ML
+    // may advance date_last_updated for an internal event while the relevant
+    // order signature stays unchanged. Those orders are skipped, but the API
+    // cursor must still move forward or the same range is fetched forever.
+    const observedCursor = orderSummaries.reduce((max, order) => {
+      const value = order?.date_last_updated ? new Date(order.date_last_updated) : null;
+      return value && !Number.isNaN(value.getTime()) && (!max || value > max) ? value : max;
+    }, null);
+    const persistObservedCursor = async () => {
+      // Never move past unseen results when the safety cap was reached.
+      if (!observedCursor || !searchFullyConsumed) return;
+      await db.query(
+        `INSERT INTO public.ml_sync_cursors (uid, seller_id, last_remote_updated_at, updated_at)
+         VALUES ($1, $2, $3, NOW())
+         ON CONFLICT (uid, seller_id) DO UPDATE
+             SET last_remote_updated_at = GREATEST(
+                   public.ml_sync_cursors.last_remote_updated_at,
+                   EXCLUDED.last_remote_updated_at
+                 ),
+                 updated_at = NOW()`,
+        [targetUid, userId, observedCursor]
+      );
+    };
 
     if (orderSummaries.length === 0) {
       sendEvent(clientId, { progress: 100, message: `[${nickname}] Nenhuma venda nova encontrada. Tudo atualizado!`, type: 'success', newSalesCount: 0, updatedCount: 0, skippedCount: 0 });
@@ -1686,6 +1722,7 @@ router.post('/sync-account', authenticateToken, async (req, res) => {
     console.log(`[SYNC] ${nickname} encontrados=${orderSummaries.length} paraProcessar=${toProcess.length} pulados=${skippedCount} (estadoSalvo=${savedSig.size})`);
 
     if (toProcess.length === 0) {
+      await persistObservedCursor();
       sendEvent(clientId, {
         progress: 100,
         message: `[${nickname}] Tudo atualizado. ${skippedCount} pedido(s) sem mudança.`,
@@ -1764,6 +1801,7 @@ router.post('/sync-account', authenticateToken, async (req, res) => {
         }
       }
       await clientDb.query('COMMIT');
+      await persistObservedCursor();
       // Pedidos que foram baixados mas cujos dados eram idênticos (não mudaram
       // no banco) contam como "sem alteração", junto com os pulados antes de baixar.
       const noopCount = Math.max(0, allRows.length - insertedCount - updatedCount);

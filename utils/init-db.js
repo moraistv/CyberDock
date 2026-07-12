@@ -42,6 +42,14 @@ const schema = {
             updated_at TIMESTAMP WITH TIME ZONE,
             PRIMARY KEY (uid, user_id)
         );`,
+    ml_sync_cursors: `
+        CREATE TABLE public.ml_sync_cursors (
+            uid VARCHAR(255) NOT NULL,
+            seller_id BIGINT NOT NULL,
+            last_remote_updated_at TIMESTAMP WITH TIME ZONE NOT NULL,
+            updated_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            PRIMARY KEY (uid, seller_id)
+        );`,
     sales: `
         CREATE TABLE public.sales (
             id BIGINT NOT NULL,

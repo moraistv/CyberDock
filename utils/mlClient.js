@@ -12,27 +12,41 @@
 
 const fetch = require('node-fetch');
 
-const HARD_MAX = parseInt(process.env.ML_MAX_CONCURRENCY || '24', 10); // teto absoluto
+const HARD_MAX = parseInt(process.env.ML_MAX_CONCURRENCY || '48', 10); // teto absoluto
 const MIN_LIMIT = parseInt(process.env.ML_MIN_CONCURRENCY || '4', 10); // piso quando em 429
+const INITIAL_LIMIT = Math.min(
+  HARD_MAX,
+  Math.max(MIN_LIMIT, parseInt(process.env.ML_INITIAL_CONCURRENCY || '24', 10))
+);
+const RECOVER_INTERVAL_MS = parseInt(process.env.ML_RECOVER_INTERVAL_MS || '1000', 10);
+const RECOVER_SUCCESS_COUNT = parseInt(process.env.ML_RECOVER_SUCCESS_COUNT || '12', 10);
 const DEFAULT_TIMEOUT = parseInt(process.env.ML_TIMEOUT_MS || '15000', 10);
 const MAX_RETRIES = parseInt(process.env.ML_MAX_RETRIES || '4', 10);
 
 // Estado do limitador global (por processo).
-let currentLimit = HARD_MAX;   // limite dinâmico atual
+let currentLimit = INITIAL_LIMIT; // limite dinâmico atual
 let active = 0;                // requisições em voo
 const queue = [];              // resolvers aguardando vaga
 let lastRecoverAt = Date.now();
+let successfulSinceRecovery = 0;
+let total429 = 0;
 
 function sleep(ms) {
   return new Promise((r) => setTimeout(r, ms));
 }
 
 // Recupera 1 slot de concorrência a cada X ms de saúde (sem 429).
-function tryRecover() {
+function recordSuccess() {
+  successfulSinceRecovery++;
   const now = Date.now();
-  if (currentLimit < HARD_MAX && now - lastRecoverAt > 5000) {
+  if (
+    currentLimit < HARD_MAX &&
+    successfulSinceRecovery >= RECOVER_SUCCESS_COUNT &&
+    now - lastRecoverAt >= RECOVER_INTERVAL_MS
+  ) {
     currentLimit = Math.min(HARD_MAX, currentLimit + 1);
     lastRecoverAt = now;
+    successfulSinceRecovery = 0;
   }
 }
 
@@ -40,6 +54,8 @@ function tryRecover() {
 function throttleDown() {
   currentLimit = Math.max(MIN_LIMIT, Math.floor(currentLimit / 2));
   lastRecoverAt = Date.now();
+  successfulSinceRecovery = 0;
+  total429++;
 }
 
 function acquire() {
@@ -58,7 +74,6 @@ function acquire() {
 
 function release() {
   active = Math.max(0, active - 1);
-  tryRecover();
   // Libera o próximo respeitando o limite atual (que pode ter mudado).
   while (queue.length > 0 && active < currentLimit) {
     const grant = queue.shift();
@@ -89,12 +104,13 @@ function backoffDelay(attempt, retryAfterHeader) {
 async function mlFetch(url, options = {}) {
   const { timeoutMs = DEFAULT_TIMEOUT, retries = MAX_RETRIES, ...fetchOpts } = options;
 
-  await acquire();
-  try {
-    let attempt = 0;
-    let lastErr = null;
+  let attempt = 0;
+  let lastErr = null;
 
-    while (attempt <= retries) {
+  while (attempt <= retries) {
+    await acquire();
+    let retryDelay = null;
+    try {
       const controller = new AbortController();
       const timer = setTimeout(() => controller.abort(), timeoutMs);
       try {
@@ -103,34 +119,37 @@ async function mlFetch(url, options = {}) {
 
         if (res.status === 429) {
           throttleDown();
+        } else if (res.ok) {
+          recordSuccess();
         }
 
         if (isRetryableStatus(res.status) && attempt < retries) {
-          const delay = backoffDelay(attempt, res.headers.get('retry-after'));
+          retryDelay = backoffDelay(attempt, res.headers.get('retry-after'));
           attempt++;
-          await sleep(delay);
-          continue;
+        } else {
+          return res; // sucesso ou 4xx funcional (não deve repetir)
         }
-
-        return res; // sucesso ou 4xx funcional (não deve repetir)
       } catch (err) {
         clearTimeout(timer);
         lastErr = err;
         if (attempt < retries) {
-          const delay = backoffDelay(attempt, null);
+          retryDelay = backoffDelay(attempt, null);
           attempt++;
-          await sleep(delay);
-          continue;
+        } else {
+          throw lastErr;
         }
-        throw lastErr;
       }
+    } finally {
+      // Backoff nunca deve segurar uma vaga global. A tentativa seguinte entra
+      // novamente na fila, preservando fairness entre contas.
+      release();
     }
-    if (lastErr) throw lastErr;
-    // teoricamente inalcançável
-    throw new Error('mlFetch: falha inesperada sem resposta.');
-  } finally {
-    release();
+
+    if (retryDelay !== null) await sleep(retryDelay);
   }
+
+  if (lastErr) throw lastErr;
+  throw new Error('mlFetch: falha inesperada sem resposta.');
 }
 
 // Helper: mlFetch + json, retornando null em corpo inválido.
@@ -146,7 +165,15 @@ async function mlFetchJson(url, options = {}) {
 }
 
 function getLimiterStats() {
-  return { currentLimit, active, queued: queue.length, hardMax: HARD_MAX };
+  return {
+    currentLimit,
+    active,
+    queued: queue.length,
+    hardMax: HARD_MAX,
+    initialLimit: INITIAL_LIMIT,
+    successfulSinceRecovery,
+    total429
+  };
 }
 
 module.exports = { mlFetch, mlFetchJson, getLimiterStats };
