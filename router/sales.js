@@ -13,7 +13,10 @@ const mlHeaders = (access_token, extra = {}) => ({
   Authorization: `Bearer ${access_token}`,
   ...extra
 });
-const shipmentHeaders = (access_token) => mlHeaders(access_token, { 'x-format-new': 'true' });
+// NÃO usar x-format-new: o formato novo do ML muda a estrutura do shipment e o
+// campo logistic_type deixa de vir onde o código espera, fazendo a modalidade
+// cair em "Outros". Mantemos o formato clássico (que traz logistic_type).
+const shipmentHeaders = (access_token) => mlHeaders(access_token);
 
 const clients = {};
 // Buffer de eventos por clientId para o caso de o job começar/terminar antes
@@ -108,7 +111,7 @@ function buildInsertBatchRows(orders, targetUid, nickname) {
       order?.shipping?.shipping_option?.estimated_delivery_time?.shipping_limit_date ||
       null;
 
-    let shippingMode = order?.shipping?.logistic_type || order?.shipping?.mode;
+    let shippingMode = order?.shipping?.logistic_type || order?.shipping?.mode || order?.shipping?.shipping_mode;
     if (!shippingMode && Array.isArray(order.tags)) {
       if (order.tags.includes('fulfillment') || order.tags.includes('pack_order')) {
         shippingMode = 'fulfillment';
@@ -1712,35 +1715,38 @@ router.post('/sync-account', authenticateToken, async (req, res) => {
     sendEvent(clientId, { progress: 35, message: `[${nickname}] Verificando o que mudou desde a última sincronização...`, type: 'info' });
 
     const orderIdList = [...new Set(orderSummaries.map(o => o.id).filter(Boolean).map(id => parseInt(id, 10)).filter(n => !isNaN(n)))];
-    const savedSig = new Map(); // id(string) -> sync_signature salvo
+    const savedState = new Map(); // id(string) -> { sig, needsFix }
     if (orderIdList.length > 0) {
       const stateRes = await db.query(
-        `SELECT id, MAX(sync_signature) AS sig
+        `SELECT id,
+                MAX(sync_signature) AS sig,
+                bool_or(shipping_mode IS NULL OR shipping_mode = 'Outros') AS needs_fix
            FROM public.sales
           WHERE uid = $1 AND id = ANY($2::bigint[])
           GROUP BY id`,
         [targetUid, orderIdList]
       );
       for (const r of stateRes.rows) {
-        savedSig.set(String(r.id), r.sig);
+        savedState.set(String(r.id), { sig: r.sig, needsFix: r.needs_fix === true });
       }
     }
 
     const toProcess = [];
     let skippedCount = 0;
     for (const summary of orderSummaries) {
-      const storedSig = savedSig.get(String(summary.id));
+      const st = savedState.get(String(summary.id));
       const remoteSig = computeSyncSignature(summary);
       // Pula ANTES de baixar quando a assinatura (status/envio/substatus/tags) é
       // idêntica à salva: nada relevante mudou, foi só "bump" interno do ML.
-      // Se a assinatura mudou (entregue, devolvido, reclamação, etc.), processa.
-      if (storedSig !== undefined && storedSig !== null && storedSig === remoteSig) {
+      // EXCEÇÃO: se a venda ficou com modalidade "Outros"/nula (efeito do header
+      // antigo), reprocessa uma vez para corrigir a modalidade.
+      if (st && st.sig != null && st.sig === remoteSig && !st.needsFix) {
         skippedCount++;
         continue;
       }
       toProcess.push(summary);
     }
-    console.log(`[SYNC] ${nickname} encontrados=${orderSummaries.length} paraProcessar=${toProcess.length} pulados=${skippedCount} (estadoSalvo=${savedSig.size})`);
+    console.log(`[SYNC] ${nickname} encontrados=${orderSummaries.length} paraProcessar=${toProcess.length} pulados=${skippedCount} (estadoSalvo=${savedState.size})`);
 
     const accountWorkTotal = orderSummaries.length + (toProcess.length * 3);
     sendEvent(clientId, {
