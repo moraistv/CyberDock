@@ -127,8 +127,11 @@ function buildInsertBatchRows(orders, targetUid, nickname) {
       null;
 
     let shippingMode = order?.shipping?.logistic_type || order?.shipping?.mode || order?.shipping?.shipping_mode;
+    // Só a tag 'fulfillment' indica FULL. NÃO usar 'pack_order' (isso é só um
+    // pacote com múltiplos itens/unidades e pode ser FLEX/Correios/etc.) —
+    // usar pack_order marcava FLEX como FULL por engano.
     if (!shippingMode && Array.isArray(order.tags)) {
-      if (order.tags.includes('fulfillment') || order.tags.includes('pack_order')) {
+      if (order.tags.includes('fulfillment')) {
         shippingMode = 'fulfillment';
       }
     }
@@ -2184,7 +2187,8 @@ router.get('/fix-shipping-modes', async (req, res) => {
     const totalRes = await db.query(
       `SELECT COUNT(DISTINCT id) AS total
          FROM public.sales
-        WHERE (shipping_mode IS NULL OR shipping_mode = 'Outros')
+        WHERE (shipping_mode IS NULL OR shipping_mode = 'Outros'
+               OR (shipping_mode = 'FULL' AND (raw_api_data->'shipping'->>'logistic_type') IS DISTINCT FROM 'fulfillment'))
           AND raw_api_data->'shipping'->>'id' IS NOT NULL
           ${sellerFilter ? 'AND seller_id = $1' : ''}`,
       sellerFilter ? [sellerFilter] : []
@@ -2196,7 +2200,8 @@ router.get('/fix-shipping-modes', async (req, res) => {
       `SELECT DISTINCT ON (id) id, uid, seller_id,
               raw_api_data->'shipping'->>'id' AS shipment_id
          FROM public.sales
-        WHERE (shipping_mode IS NULL OR shipping_mode = 'Outros')
+        WHERE (shipping_mode IS NULL OR shipping_mode = 'Outros'
+               OR (shipping_mode = 'FULL' AND (raw_api_data->'shipping'->>'logistic_type') IS DISTINCT FROM 'fulfillment'))
           AND raw_api_data->'shipping'->>'id' IS NOT NULL
           ${sellerFilter ? 'AND seller_id = $2' : ''}
         ORDER BY id
@@ -2246,7 +2251,8 @@ router.get('/fix-shipping-modes', async (req, res) => {
                   ),
                   updated_at = NOW()
             WHERE id = $3 AND uid = $4 AND seller_id = $5
-              AND (shipping_mode IS NULL OR shipping_mode = 'Outros')`,
+              AND (shipping_mode IS NULL OR shipping_mode = 'Outros'
+                   OR (shipping_mode = 'FULL' AND (raw_api_data->'shipping'->>'logistic_type') IS DISTINCT FROM 'fulfillment'))`,
           [mapped, logisticType, c.id, c.uid, c.seller_id]
         );
         fixed++;
