@@ -422,3 +422,57 @@ Diagnóstico nos logs do Coolify:
 | `ML_JOB_CONCURRENCY` | 15 | Concorrência de despacho por conta |
 | `PGPOOL_MAX` | 15 | Máx. de conexões no pool PostgreSQL |
 | `ML_CLIENT_ID` / `ML_CLIENT_SECRET` | — | OAuth do app ML (refresh de token) |
+
+---
+
+## 10. Correção do "Outros" na modalidade de envio (pós-otimização)
+
+### O que apareceu
+Depois das mudanças de sincronização, várias vendas passaram a aparecer com a
+modalidade **"Outros"** — o que **nunca acontecia** antes. Modalidades válidas:
+FULL, FLEX, Correios, Agência, Coleta, Envio Padrão. "Outros" é o fallback.
+
+### Causa raiz
+A modalidade é derivada de `order.shipping.logistic_type`, que é preenchido pelo
+**detalhe do shipment** (`/shipments/{id}`). Na fase de otimização eu havia
+adicionado o header **`x-format-new: true`** nessas chamadas (era uma
+"recomendação" da auditoria, item #13). No **formato novo** do ML a estrutura do
+shipment muda e o `logistic_type` **não vem no mesmo lugar** → o código lia
+`undefined` → `mapShippingType(undefined)` retornava **"Outros"**.
+
+Ou seja: foi um efeito colateral do `x-format-new`, não um problema de dados.
+
+### Correções aplicadas (backend `CyberDock`)
+- **Removido o `x-format-new`** dos shipments (voltou o formato clássico, que
+  traz `logistic_type`). (commit `5b4386c`)
+- **Fallback** na resolução da modalidade:
+  `order.shipping.logistic_type || order.shipping.mode || order.shipping.shipping_mode`.
+- **Autocorreção incremental**: o skip por assinatura abre exceção para vendas
+  salvas como "Outros"/nula, reprocessando-as uma vez para gravar a modalidade
+  correta.
+- **Endpoint de manutenção** `GET /api/sales/fix-shipping-modes` (master):
+  rebusca o shipment (com `logistic_type`), recalcula e corrige em lotes; aceita
+  `?limit=` e `?sellerId=`. (commits `41d5a0c`, `d518745`)
+
+### Descoberta útil da API (documentada para o futuro)
+O `/orders/search` já retorna, por pedido: `status`, `shipping.status`,
+`shipping.substatus`, `tags`, `date_created`, `date_last_updated`,
+`order_items`, `shipping.id`, `shipping.shipping_mode`. Por isso a decisão de
+"mudou ou não" (assinatura) e a modalidade podem sair da própria busca, barato.
+
+### Resultado e limpeza de UI
+- Rodada a correção pelo botão do master: **mais de 4.000 vendas** reprocessadas,
+  **tudo OK**, "Outros" zerado.
+- Como não deve mais existir "Outros", foi **removida a opção "Outros"** do
+  filtro de Modo de Envio (tabelão master).
+- O **botão "Corrigir modalidades"** foi **removido** após cumprir o papel (o
+  endpoint de backend permanece disponível para manutenção futura, se preciso).
+
+### Bônus: falha de deploy no Coolify (infra, não código)
+Dois deploys do frontend falharam — um morrendo no `npm run build` e outro ainda
+antes, no `apt-get` (unpacking do curl). São sintomas de **falta de recurso na
+VPS** (disco cheio e/ou RAM/memória esgotada), não de erro de código (compila
+100% local). Mitigações: `productionSourceMap: false` no `vue.config.js` (menos
+memória/tempo de build, bundle menor — commit `4dd867e`) e, na VPS, limpar
+imagens/cache do Docker (`docker builder/image/system prune -af`, sem
+`--volumes`) e adicionar swap se a RAM for baixa.
