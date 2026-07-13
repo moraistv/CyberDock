@@ -2155,7 +2155,27 @@ router.get('/last-sync/:mlAccountId', authenticateToken, async (req, res) => {
 // Opcional: &sellerId=123 para uma conta específica.
 // Rebusca o shipment (formato clássico, com logistic_type), recalcula a
 // modalidade e corrige as vendas que ficaram como "Outros"/nula.
-router.get('/fix-shipping-modes', authenticateToken, requireMaster, async (req, res) => {
+router.get('/fix-shipping-modes', async (req, res) => {
+  // Autenticação flexível: aceita JWT no header Authorization OU em ?token=
+  // (para poder abrir a URL direto no navegador). Exige role master.
+  const jwt = require('jsonwebtoken');
+  const JWT_SECRET = process.env.JWT_SECRET || 'seu-segredo-super-secreto-para-jwt';
+  const authHeader = req.headers['authorization'];
+  const tokenFromHeader = authHeader && authHeader.split(' ')[1];
+  const token = tokenFromHeader || req.query.token;
+  if (!token) {
+    return res.status(401).json({ error: 'Não autorizado. Passe ?token=<seu JWT de master> na URL.' });
+  }
+  let authUser;
+  try {
+    authUser = jwt.verify(token, JWT_SECRET);
+  } catch (e) {
+    return res.status(403).json({ error: 'Token inválido ou expirado.' });
+  }
+  if (!authUser || authUser.role !== 'master') {
+    return res.status(403).json({ error: 'Acesso negado. Apenas master.' });
+  }
+
   const limit = Math.min(parseInt(req.query.limit, 10) || 500, 5000);
   const sellerFilter = (req.query.sellerId || '').trim();
 
