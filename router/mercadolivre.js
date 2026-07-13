@@ -632,14 +632,18 @@ router.get('/download-label', authenticateToken, async (req, res) => {
         const { width, height } = page.getSize();
         const font = await pdfDoc.embedFont(StandardFonts.Helvetica);
 
-        // Posição VERTICAL varia por modalidade (fica na área certa da etiqueta).
+        const margin = 16;
+
+        // Posição VERTICAL: ancorada pela BASE da página e limitada aos limites
+        // da página. Antes usava height-480 para FLEX, que em etiqueta térmica
+        // (baixa) dava valor NEGATIVO -> texto saía fora da página (sumia).
         const lt = (logisticType || '').toLowerCase();
-        const yPos = lt === 'self_service' ? (height - 480) : (height - 295);
+        const desired = lt === 'self_service' ? 26 : (height - 295);
+        const yPos = Math.min(height - 20, Math.max(20, desired));
 
         // Fonte que caiba na largura da etiqueta (encolhe até caber, com margem).
-        const margin = 16;
         const maxWidth = width - margin * 2;
-        let fontSize = 7;
+        let fontSize = 8;
         while (fontSize > 4 && font.widthOfTextAtSize(text, fontSize) > maxWidth) {
           fontSize -= 0.5;
         }
