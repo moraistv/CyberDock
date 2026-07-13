@@ -5,7 +5,7 @@ const fetch = require('node-fetch'); // v2.x (web streams no v3 mudam o pipe)
 const crypto = require('crypto');
 const db = require('../utils/postgres');
 const { authenticateToken } = require('../utils/authMiddleware');
-const { PDFDocument, rgb } = require('pdf-lib');
+const { PDFDocument, rgb, StandardFonts } = require('pdf-lib');
 
 const router = express.Router();
 
@@ -629,28 +629,30 @@ router.get('/download-label', authenticateToken, async (req, res) => {
 
         const text = `Quantidade: ${quantity ?? 'N/A'} | SKU: ${sku || 'N/A'} | Cliente: ${userName || 'N/A'}`;
         const page = pages[0];
-        const { height } = page.getSize();
-        
-        // Posição ajustada por modalidade de envio
-        const lt = (logisticType || '').toLowerCase();
-        let xPos, yPos, fontSize;
+        const { width, height } = page.getSize();
+        const font = await pdfDoc.embedFont(StandardFonts.Helvetica);
 
-        if (lt === 'self_service') {
-          // FLEX: texto abaixo do bloco Destinatário (mais embaixo na página)
-          xPos = 70;
-          yPos = height - 480;
-          fontSize = 7;
-        } else {
-          // AGÊNCIA / DROP-OFF / COLETA / FULL e demais: posição padrão (abaixo de SEX dd/mm NF)
-          xPos = 95;
-          yPos = height - 295;
-          fontSize = 7;
+        // Posição VERTICAL varia por modalidade (fica na área certa da etiqueta).
+        const lt = (logisticType || '').toLowerCase();
+        const yPos = lt === 'self_service' ? (height - 480) : (height - 295);
+
+        // Fonte que caiba na largura da etiqueta (encolhe até caber, com margem).
+        const margin = 16;
+        const maxWidth = width - margin * 2;
+        let fontSize = 7;
+        while (fontSize > 4 && font.widthOfTextAtSize(text, fontSize) > maxWidth) {
+          fontSize -= 0.5;
         }
-        
+
+        // Centraliza SEMPRE na horizontal.
+        const textWidth = font.widthOfTextAtSize(text, fontSize);
+        const xPos = Math.max(margin, (width - textWidth) / 2);
+
         page.drawText(text, {
           x: xPos,
           y: yPos,
           size: fontSize,
+          font,
           color: rgb(0, 0, 0)
         });
 
