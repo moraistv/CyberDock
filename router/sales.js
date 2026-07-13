@@ -632,6 +632,12 @@ router.get('/all', authenticateToken, requireMaster, async (req, res) => {
       params.push(shippingLimitEnd + 'T23:59:59.999Z');
       paramIdx++;
     }
+    // Ao filtrar por PRAZO DE EXPEDIÇÃO, exclui FULL: o vendedor não despacha
+    // pedido FULL (o ML expede), então ele não faz parte da fila de expedição.
+    // IS DISTINCT FROM mantém linhas com shipping_mode NULL.
+    if (shippingLimitStart || shippingLimitEnd) {
+      conditions.push(`s.shipping_mode IS DISTINCT FROM 'FULL'`);
+    }
 
     // Default system filter: do not show sales of inactive users in the master table
     conditions.push(`COALESCE(u.active, true) = true`);
@@ -913,6 +919,10 @@ router.get('/my-sales', authenticateToken, async (req, res) => {
       conditions.push(`COALESCE(s.raw_api_data->'sla_data'->>'expected_date', s.shipping_limit_date::text) <= $${paramIdx}`);
       params.push(shippingLimitEnd + 'T23:59:59.999Z');
       paramIdx++;
+    }
+    // Ao filtrar por PRAZO DE EXPEDIÇÃO, exclui FULL (vendedor não despacha FULL).
+    if (shippingLimitStart || shippingLimitEnd) {
+      conditions.push(`s.shipping_mode IS DISTINCT FROM 'FULL'`);
     }
 
     const whereClause = 'WHERE ' + conditions.join(' AND ');
