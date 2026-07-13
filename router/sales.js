@@ -62,6 +62,21 @@ async function safeJson(res) {
   }
 }
 
+// Mapeia logistic_type/mode do ML para a modalidade exibida (mesma regra do
+// buildInsertBatchRows). Usado também pela rota de correção de modalidades.
+function mapShippingTypeMode(mode) {
+  if (!mode) return 'Outros';
+  switch (String(mode).toLowerCase()) {
+    case 'fulfillment': return 'FULL';
+    case 'self_service': return 'FLEX';
+    case 'drop_off': return 'Correios';
+    case 'xd_drop_off': return 'Agência';
+    case 'cross_docking': return 'Coleta';
+    case 'me2': return 'Envio Padrão';
+    default: return 'Outros';
+  }
+}
+
 // Assinatura de mudança relevante do pedido. Precisa bater EXATAMENTE com o
 // backfill em init-db (status | shipping.status | shipping.substatus | tags).
 // status/shipping.status usam o mesmo enum na busca de pedidos e no shipment,
@@ -2132,6 +2147,106 @@ router.get('/last-sync/:mlAccountId', authenticateToken, async (req, res) => {
   } catch (error) {
     console.error('Erro ao verificar última sincronização:', error);
     res.status(500).json({ error: 'Erro interno do servidor' });
+  }
+});
+
+/** ======== CORREÇÃO DE MODALIDADES "Outros" (uso manual do master) ======== */
+// URL discreta (sem botão). Ex.: GET /api/sales/fix-shipping-modes?limit=1000
+// Opcional: &sellerId=123 para uma conta específica.
+// Rebusca o shipment (formato clássico, com logistic_type), recalcula a
+// modalidade e corrige as vendas que ficaram como "Outros"/nula.
+router.get('/fix-shipping-modes', authenticateToken, requireMaster, async (req, res) => {
+  const limit = Math.min(parseInt(req.query.limit, 10) || 500, 5000);
+  const sellerFilter = (req.query.sellerId || '').trim();
+
+  try {
+    // Total de candidatos (para saber quanto ainda falta).
+    const totalRes = await db.query(
+      `SELECT COUNT(DISTINCT id) AS total
+         FROM public.sales
+        WHERE (shipping_mode IS NULL OR shipping_mode = 'Outros')
+          AND raw_api_data->'shipping'->>'id' IS NOT NULL
+          ${sellerFilter ? 'AND seller_id = $1' : ''}`,
+      sellerFilter ? [sellerFilter] : []
+    );
+    const totalRemaining = parseInt(totalRes.rows[0].total, 10);
+
+    // Candidatos desta rodada (um por pedido).
+    const candRes = await db.query(
+      `SELECT DISTINCT ON (id) id, uid, seller_id,
+              raw_api_data->'shipping'->>'id' AS shipment_id
+         FROM public.sales
+        WHERE (shipping_mode IS NULL OR shipping_mode = 'Outros')
+          AND raw_api_data->'shipping'->>'id' IS NOT NULL
+          ${sellerFilter ? 'AND seller_id = $2' : ''}
+        ORDER BY id
+        LIMIT $1`,
+      sellerFilter ? [limit, sellerFilter] : [limit]
+    );
+    const candidates = candRes.rows;
+    if (candidates.length === 0) {
+      return res.json({ message: 'Nenhuma venda em "Outros" para corrigir.', totalRemaining, processed: 0, fixed: 0 });
+    }
+
+    // Tokens por conta (seller_id).
+    const sellerIds = [...new Set(candidates.map(c => c.seller_id).filter(Boolean))];
+    const tokRes = await db.query(
+      'SELECT user_id AS seller_id, uid, access_token, refresh_token FROM public.ml_accounts WHERE user_id = ANY($1::bigint[])',
+      [sellerIds]
+    );
+    const tokenBySeller = new Map();
+    for (const r of tokRes.rows) tokenBySeller.set(String(r.seller_id), { access_token: r.access_token, refresh_token: r.refresh_token, uid: r.uid });
+
+    let fixed = 0, stillOutros = 0, failed = 0;
+
+    await mapWithConcurrency(candidates, SLA_CONCURRENCY, async (c) => {
+      const acc = tokenBySeller.get(String(c.seller_id));
+      if (!acc) { failed++; return; }
+      try {
+        let r = await mlFetch(`https://api.mercadolibre.com/shipments/${c.shipment_id}`, { headers: mlHeaders(acc.access_token) });
+        if (r.status === 401) {
+          acc.access_token = await refreshAccountToken(c.seller_id, acc.uid, acc.refresh_token);
+          r = await mlFetch(`https://api.mercadolibre.com/shipments/${c.shipment_id}`, { headers: mlHeaders(acc.access_token) });
+        }
+        if (!r.ok) { failed++; return; }
+        const ship = await safeJson(r);
+        const logisticType = ship?.logistic_type || null;
+        const mapped = mapShippingTypeMode(logisticType);
+        if (mapped === 'Outros') { stillOutros++; return; }
+
+        // Corrige a modalidade e grava o logistic_type no raw_api_data.
+        await db.query(
+          `UPDATE public.sales
+              SET shipping_mode = $1,
+                  raw_api_data = jsonb_set(
+                    COALESCE(raw_api_data, '{}'::jsonb),
+                    '{shipping,logistic_type}',
+                    to_jsonb($2::text),
+                    true
+                  ),
+                  updated_at = NOW()
+            WHERE id = $3 AND uid = $4 AND seller_id = $5
+              AND (shipping_mode IS NULL OR shipping_mode = 'Outros')`,
+          [mapped, logisticType, c.id, c.uid, c.seller_id]
+        );
+        fixed++;
+      } catch (e) {
+        failed++;
+      }
+    });
+
+    return res.json({
+      message: 'Correção de modalidades concluída (rodada).',
+      totalRemaining,
+      processed: candidates.length,
+      fixed,
+      stillOutros,
+      failed,
+      hint: totalRemaining > candidates.length ? `Ainda restam ~${totalRemaining - fixed}. Rode novamente para continuar.` : 'Tudo processado.'
+    });
+  } catch (error) {
+    console.error('[FIX-MODES] erro:', error);
+    return res.status(500).json({ error: error.message || 'Erro ao corrigir modalidades.' });
   }
 });
 
