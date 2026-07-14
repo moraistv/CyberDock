@@ -899,12 +899,13 @@ router.get('/my-sales', authenticateToken, async (req, res) => {
     }
     if (saleDateStart) {
       conditions.push(`s.sale_date >= $${paramIdx}`);
-      params.push(saleDateStart);
+      // Limite do dia em horário de Brasília (UTC-3), consistente com o tabelão.
+      params.push(saleDateStart + 'T00:00:00-03:00');
       paramIdx++;
     }
     if (saleDateEnd) {
       conditions.push(`s.sale_date <= $${paramIdx}`);
-      params.push(saleDateEnd + 'T23:59:59.999Z');
+      params.push(saleDateEnd + 'T23:59:59.999-03:00');
       paramIdx++;
     }
     if (account) {
