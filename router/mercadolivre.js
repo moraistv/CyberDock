@@ -3,11 +3,63 @@
 const express = require('express');
 const fetch = require('node-fetch'); // v2.x (web streams no v3 mudam o pipe)
 const crypto = require('crypto');
+const zlib = require('zlib');
 const db = require('../utils/postgres');
 const { authenticateToken } = require('../utils/authMiddleware');
 const { PDFDocument, rgb, StandardFonts } = require('pdf-lib');
 
 const router = express.Router();
+
+/* ---------- Helpers de análise do PDF da etiqueta ---------- */
+
+// Decodifica o(s) content stream(s) de uma página do pdf-lib para texto (latin1).
+// Tenta inflar (Flate); se falhar, usa cru. Retorna string vazia em erro.
+function decodePdfPageContent(page) {
+  try {
+    const decodeOne = (stream) => {
+      const raw = stream && stream.contents;
+      if (!raw) return '';
+      try { return zlib.inflateSync(Buffer.from(raw)).toString('latin1'); }
+      catch (e) { return Buffer.from(raw).toString('latin1'); }
+    };
+    const c = page.node.Contents();
+    if (!c) return '';
+    if (c.constructor && c.constructor.name === 'PDFArray') {
+      let out = '';
+      for (let i = 0; i < c.size(); i++) out += decodeOne(c.lookup(i)) + '\n';
+      return out;
+    }
+    return decodeOne(c);
+  } catch (e) {
+    return '';
+  }
+}
+
+// É uma página de "declaração de conteúdo" / lista de separação do ML?
+// Marcador sem acentos (confiável): "Despache a sua venda".
+function isDeclaracaoConteudoContent(content) {
+  const lc = (content || '').toLowerCase();
+  return lc.includes('despache a sua venda') || lc.includes('declaracao de conteudo');
+}
+
+// Calcula a caixa (bounding box) da etiqueta a partir dos retângulos "re"
+// desenhados no content stream. Retorna {minX,minY,maxX,maxY} ou null.
+function getLabelBoxFromContent(content) {
+  if (!content) return null;
+  const re = /(-?[\d.]+)\s+(-?[\d.]+)\s+(-?[\d.]+)\s+(-?[\d.]+)\s+re\b/g;
+  let m, minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity, count = 0;
+  while ((m = re.exec(content))) {
+    const x = parseFloat(m[1]); const y = parseFloat(m[2]);
+    const w = parseFloat(m[3]); const h = parseFloat(m[4]);
+    if ([x, y, w, h].some((n) => Number.isNaN(n))) continue;
+    const x2 = x + w; const y2 = y + h;
+    minX = Math.min(minX, x, x2); minY = Math.min(minY, y, y2);
+    maxX = Math.max(maxX, x, x2); maxY = Math.max(maxY, y, y2);
+    count++;
+  }
+  if (!count || !isFinite(minX)) return null;
+  return { minX, minY, maxX, maxY };
+}
 
 /**
  * >>> CONFIGURAÇÕES DO MERCADO LIVRE <<<
@@ -632,44 +684,74 @@ router.get('/download-label', authenticateToken, async (req, res) => {
     });
 
     const enrichPdf = async (pdfBuffer, sku, quantity, userName, logisticType) => {
-      if (!sku && !userName) return pdfBuffer;
       try {
-        const pdfDoc = await PDFDocument.load(pdfBuffer);
-        const pages = pdfDoc.getPages();
-        if (pages.length === 0) return pdfBuffer;
+        const srcDoc = await PDFDocument.load(pdfBuffer);
+        const srcPages = srcDoc.getPages();
+        if (srcPages.length === 0) return pdfBuffer;
 
-        const text = `Quantidade: ${quantity ?? 'N/A'} | SKU: ${sku || 'N/A'} | Cliente: ${userName || 'N/A'}`;
-        const page = pages[0];
-        const { width, height } = page.getSize();
-        const font = await pdfDoc.embedFont(StandardFonts.Helvetica);
-
-        const margin = 16;
-
-        // Posição VERTICAL: ancorada pela BASE da página e limitada aos limites
-        // da página. Antes usava height-480 para FLEX, que em etiqueta térmica
-        // (baixa) dava valor NEGATIVO -> texto saía fora da página (sumia).
-        const lt = (logisticType || '').toLowerCase();
-        const desired = lt === 'self_service' ? 26 : (height - 295);
-        const yPos = Math.min(height - 20, Math.max(20, desired));
-
-        // Fonte que caiba na largura da etiqueta (encolhe até caber, com margem).
-        const maxWidth = width - margin * 2;
-        let fontSize = 8;
-        while (fontSize > 4 && font.widthOfTextAtSize(text, fontSize) > maxWidth) {
-          fontSize -= 0.5;
+        // 1) REMOVER páginas de "declaração de conteúdo" (o cliente quer só a
+        //    etiqueta). Detecta pelo texto. Monta a lista de páginas a MANTER.
+        //    Nunca remove tudo — se todas forem declaração, mantém o original.
+        const keepIdx = [];
+        for (let i = 0; i < srcPages.length; i++) {
+          if (!isDeclaracaoConteudoContent(decodePdfPageContent(srcPages[i]))) keepIdx.push(i);
         }
 
-        // Centraliza SEMPRE na horizontal.
-        const textWidth = font.widthOfTextAtSize(text, fontSize);
-        const xPos = Math.max(margin, (width - textWidth) / 2);
+        let pdfDoc;
+        if (keepIdx.length > 0 && keepIdx.length < srcPages.length) {
+          // Copia só as páginas de etiqueta para um doc novo e limpo.
+          pdfDoc = await PDFDocument.create();
+          const copied = await pdfDoc.copyPages(srcDoc, keepIdx);
+          copied.forEach((p) => pdfDoc.addPage(p));
+        } else {
+          // Nada a remover (ou tudo é declaração -> mantém tudo por segurança).
+          pdfDoc = srcDoc;
+        }
+        const pages = pdfDoc.getPages();
 
-        page.drawText(text, {
-          x: xPos,
-          y: yPos,
-          size: fontSize,
-          font,
-          color: rgb(0, 0, 0)
-        });
+        // Se não há nada pra escrever, devolve já sem a declaração.
+        if (!sku && !userName) return Buffer.from(await pdfDoc.save());
+
+        const text = `Quantidade: ${quantity ?? 'N/A'} | SKU: ${sku || 'N/A'} | Cliente: ${userName || 'N/A'}`;
+        const font = await pdfDoc.embedFont(StandardFonts.Helvetica);
+
+        // Escreve o texto em TODAS as páginas restantes (todas são etiqueta).
+        // Para cada uma, tenta ancorar DENTRO da caixa da etiqueta (retângulos
+        // "re"); se não achar caixa, usa fallback pela página inteira.
+        for (let pi = 0; pi < pages.length; pi++) {
+          const page = pages[pi];
+          const { width, height } = page.getSize();
+          // Recalcula o conteúdo caso os índices tenham mudado após remoção.
+          const content = decodePdfPageContent(page);
+          const box = getLabelBoxFromContent(content);
+
+          let x, y, maxWidth;
+          const usableBox = box && (box.maxX - box.minX) > 40 && (box.maxY - box.minY) > 40
+            && (box.maxX - box.minX) < width && (box.maxY - box.minY) <= height;
+
+          if (usableBox) {
+            // Dentro do quadro da etiqueta, na base, centralizado na largura da caixa.
+            maxWidth = (box.maxX - box.minX) - 8;
+            let fontSize = 8;
+            while (fontSize > 4 && font.widthOfTextAtSize(text, fontSize) > maxWidth) fontSize -= 0.5;
+            const textWidth = font.widthOfTextAtSize(text, fontSize);
+            x = box.minX + Math.max(0, ((box.maxX - box.minX) - textWidth) / 2);
+            y = box.minY + 6; // logo acima da borda inferior, dentro do quadro
+            page.drawText(text, { x, y, size: fontSize, font, color: rgb(0, 0, 0) });
+          } else {
+            // Fallback antigo (não achou a caixa): ancora pela base da página.
+            const margin = 16;
+            const lt = (logisticType || '').toLowerCase();
+            const desired = lt === 'self_service' ? 26 : (height - 295);
+            y = Math.min(height - 20, Math.max(20, desired));
+            maxWidth = width - margin * 2;
+            let fontSize = 8;
+            while (fontSize > 4 && font.widthOfTextAtSize(text, fontSize) > maxWidth) fontSize -= 0.5;
+            const textWidth = font.widthOfTextAtSize(text, fontSize);
+            x = Math.max(margin, (width - textWidth) / 2);
+            page.drawText(text, { x, y, size: fontSize, font, color: rgb(0, 0, 0) });
+          }
+        }
 
         const bytes = await pdfDoc.save();
         return Buffer.from(bytes);
