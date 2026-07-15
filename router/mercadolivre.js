@@ -39,7 +39,13 @@ function decodePdfPageContent(page) {
 // Marcador sem acentos (confiável): "Despache a sua venda".
 function isDeclaracaoConteudoContent(content) {
   const lc = (content || '').toLowerCase();
-  return lc.includes('despache a sua venda') || lc.includes('declaracao de conteudo');
+  // "quanto antes" cobre singular ("Despache a sua venda o quanto antes")
+  // e plural ("Despache as suas vendas o quanto antes"). Nunca aparece numa
+  // etiqueta de envio. Mantemos outros marcadores como reforço.
+  return lc.includes('quanto antes')
+    || lc.includes('despache a sua venda')
+    || lc.includes('despache as suas venda')
+    || lc.includes('declaracao de conteudo');
 }
 
 // Calcula a caixa (bounding box) da etiqueta a partir dos retângulos "re"
