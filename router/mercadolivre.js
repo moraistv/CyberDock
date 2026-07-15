@@ -588,7 +588,13 @@ router.get('/download-label', authenticateToken, async (req, res) => {
     });
 
     const notPrintable = statusChecks.filter((s) => !s.printable);
-    if (notPrintable.length > 0) {
+    const printableIds = statusChecks.filter((s) => s.printable).map((s) => String(s.id));
+
+    // Comportamento tolerante em LOTE ("one bad apple" não derruba os demais):
+    // - Se é um único envio e ele não imprime -> erro (comportamento antigo).
+    // - Se é lote e NENHUM imprime -> erro.
+    // - Se é lote e alguns imprimem -> segue apenas com os imprimíveis (pula os ruins).
+    if (printableIds.length === 0) {
       const details = notPrintable.map((x) => `Envio ${x.id} (${getHumanError(x.status)})`).join(', ');
       return res.status(400).json({
         error: 'Etiqueta Indisponível',
@@ -596,6 +602,11 @@ router.get('/download-label', authenticateToken, async (req, res) => {
         details: { shipmentIdsTried: ids, blockedByStatus: notPrintable },
       });
     }
+
+    // A partir daqui usamos apenas os imprimíveis.
+    const skippedIds = notPrintable.map((x) => ({ id: String(x.id), status: x.status, reason: getHumanError(x.status) }));
+    ids.length = 0;
+    ids.push(...printableIds);
 
     // 2) Buscar SKU e Cliente no DB para enriquecer a etiqueta
     let salesInfo = [];
@@ -760,6 +771,12 @@ router.get('/download-label', authenticateToken, async (req, res) => {
     res.setHeader('Content-Type', ct);
     res.setHeader('Content-Disposition', cd);
     res.setHeader('Content-Length', String(finalBuffer.length));
+    // Informa ao frontend quantos/quais envios foram pulados por não serem imprimíveis.
+    if (skippedIds.length > 0) {
+      res.setHeader('X-Labels-Skipped', String(skippedIds.length));
+      res.setHeader('Access-Control-Expose-Headers', 'X-Labels-Skipped, X-Labels-Printed');
+    }
+    res.setHeader('X-Labels-Printed', String(buffers.length));
     return res.status(200).end(finalBuffer);
   } catch (error) {
     console.error('Erro no servidor ao baixar etiqueta:', error);
