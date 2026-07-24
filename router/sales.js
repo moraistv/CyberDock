@@ -575,6 +575,7 @@ router.get('/all', authenticateToken, requireMaster, async (req, res) => {
     const shippingLimitStart = (req.query.shippingLimitStart || '').trim();
     const shippingLimitEnd = (req.query.shippingLimitEnd || '').trim();
     const shippingMode = (req.query.shippingMode || '').trim();
+    const processed = (req.query.processed || '').trim(); // 'yes' = processados | 'no' = não processados
 
     const conditions = [];
     const params = [];
@@ -638,6 +639,12 @@ router.get('/all', authenticateToken, requireMaster, async (req, res) => {
         params.push(modes);
         paramIdx++;
       }
+    }
+    // Filtro de PROCESSADO / NÃO PROCESSADO (abatimento de estoque).
+    if (processed === 'yes') {
+      conditions.push(`s.processed_at IS NOT NULL`);
+    } else if (processed === 'no') {
+      conditions.push(`s.processed_at IS NULL`);
     }
     const userNickname = (req.query.userNickname || '').trim();
     if (userNickname) {
@@ -872,6 +879,7 @@ router.get('/my-sales', authenticateToken, async (req, res) => {
     const shippingLimitStart = (req.query.shippingLimitStart || '').trim();
     const shippingLimitEnd = (req.query.shippingLimitEnd || '').trim();
     const shippingMode = (req.query.shippingMode || '').trim();
+    const processed = (req.query.processed || '').trim(); // 'yes' = processados | 'no' = não processados
 
     const conditions = ['s.uid = $1'];
     const params = [uid];
@@ -947,6 +955,12 @@ router.get('/my-sales', authenticateToken, async (req, res) => {
     // Ao filtrar por PRAZO DE EXPEDIÇÃO, exclui FULL (vendedor não despacha FULL).
     if (shippingLimitStart || shippingLimitEnd) {
       conditions.push(`s.shipping_mode IS DISTINCT FROM 'FULL'`);
+    }
+    // Filtro de PROCESSADO / NÃO PROCESSADO (abatimento de estoque).
+    if (processed === 'yes') {
+      conditions.push(`s.processed_at IS NOT NULL`);
+    } else if (processed === 'no') {
+      conditions.push(`s.processed_at IS NULL`);
     }
 
     const whereClause = 'WHERE ' + conditions.join(' AND ');
