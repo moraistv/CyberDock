@@ -684,12 +684,29 @@ router.get('/download-label', authenticateToken, async (req, res) => {
       console.error('Erro ao buscar dados de vendas para etiqueta:', err);
     }
     
+    // Agrupa por ENVIO: um shipment pode ter VÁRIOS itens (SKUs) diferentes no
+    // MESMO pacote/etiqueta (comprador leva 2 produtos distintos). Antes o map
+    // sobrescrevia e sobrava só 1 SKU — agora acumulamos a lista de itens.
     const infoMap = {};
     salesInfo.forEach(r => {
-      infoMap[String(r.shipping_id)] = { sku: r.sku, quantity: r.quantity, user_name: r.user_name };
+      const key = String(r.shipping_id);
+      if (!infoMap[key]) infoMap[key] = { user_name: r.user_name, items: [] };
+      if (r.sku) infoMap[key].items.push({ sku: r.sku, quantity: r.quantity });
+      if (!infoMap[key].user_name && r.user_name) infoMap[key].user_name = r.user_name;
     });
 
-    const enrichPdf = async (pdfBuffer, sku, quantity, userName, logisticType) => {
+    // Linhas de texto da etiqueta: uma por item (Qtd | SKU) + a linha do Cliente.
+    // Assim, com 2+ itens, os SKUs saem um embaixo do outro.
+    const buildLabelLines = (items, userName) => {
+      const lines = (items || []).map(
+        (it) => `Qtd: ${it.quantity ?? 'N/A'} | SKU: ${it.sku || 'N/A'}`,
+      );
+      if (lines.length === 0) lines.push('Qtd: N/A | SKU: N/A');
+      lines.push(`Cliente: ${userName || 'N/A'}`);
+      return lines;
+    };
+
+    const enrichPdf = async (pdfBuffer, items, userName, logisticType) => {
       try {
         const srcDoc = await PDFDocument.load(pdfBuffer);
         const srcPages = srcDoc.getPages();
@@ -716,9 +733,10 @@ router.get('/download-label', authenticateToken, async (req, res) => {
         const pages = pdfDoc.getPages();
 
         // Se não há nada pra escrever, devolve já sem a declaração.
-        if (!sku && !userName) return Buffer.from(await pdfDoc.save());
+        const hasItems = Array.isArray(items) && items.length > 0;
+        if (!hasItems && !userName) return Buffer.from(await pdfDoc.save());
 
-        const text = `Quantidade: ${quantity ?? 'N/A'} | SKU: ${sku || 'N/A'} | Cliente: ${userName || 'N/A'}`;
+        const lines = buildLabelLines(items, userName);
         const font = await pdfDoc.embedFont(StandardFonts.Helvetica);
 
         // Escreve o texto em TODAS as páginas restantes (todas são etiqueta).
@@ -731,31 +749,40 @@ router.get('/download-label', authenticateToken, async (req, res) => {
           const content = decodePdfPageContent(page);
           const box = getLabelBoxFromContent(content);
 
-          let x, y, maxWidth;
           const usableBox = box && (box.maxX - box.minX) > 40 && (box.maxY - box.minY) > 40
             && (box.maxX - box.minX) < width && (box.maxY - box.minY) <= height;
 
+          // Âncora base (canto inferior) + largura disponível, conforme caixa/fallback.
+          let baseY, maxWidth, fallbackX;
           if (usableBox) {
-            // Dentro do quadro da etiqueta, na base, centralizado na largura da caixa.
             maxWidth = (box.maxX - box.minX) - 8;
-            let fontSize = 8;
-            while (fontSize > 4 && font.widthOfTextAtSize(text, fontSize) > maxWidth) fontSize -= 0.5;
-            const textWidth = font.widthOfTextAtSize(text, fontSize);
-            x = box.minX + Math.max(0, ((box.maxX - box.minX) - textWidth) / 2);
-            y = box.minY + 6; // logo acima da borda inferior, dentro do quadro
-            page.drawText(text, { x, y, size: fontSize, font, color: rgb(0, 0, 0) });
+            baseY = box.minY + 6; // base do bloco, dentro do quadro
+            fallbackX = null;
           } else {
-            // Fallback antigo (não achou a caixa): ancora pela base da página.
             const margin = 16;
             const lt = (logisticType || '').toLowerCase();
             const desired = lt === 'self_service' ? 26 : (height - 295);
-            y = Math.min(height - 20, Math.max(20, desired));
+            baseY = Math.min(height - 20, Math.max(20, desired));
             maxWidth = width - margin * 2;
-            let fontSize = 8;
-            while (fontSize > 4 && font.widthOfTextAtSize(text, fontSize) > maxWidth) fontSize -= 0.5;
-            const textWidth = font.widthOfTextAtSize(text, fontSize);
-            x = Math.max(margin, (width - textWidth) / 2);
-            page.drawText(text, { x, y, size: fontSize, font, color: rgb(0, 0, 0) });
+            fallbackX = margin;
+          }
+
+          // Fonte que faz a MAIOR linha caber na largura disponível.
+          let fontSize = 8;
+          const widest = () => lines.reduce((m, l) => Math.max(m, font.widthOfTextAtSize(l, fontSize)), 0);
+          while (fontSize > 4 && widest() > maxWidth) fontSize -= 0.5;
+
+          const lineHeight = fontSize + 2;
+          const n = lines.length;
+          // Empilha de cima pra baixo: 1ª linha no topo, "Cliente" embaixo.
+          for (let li = 0; li < n; li++) {
+            const line = lines[li];
+            const textWidth = font.widthOfTextAtSize(line, fontSize);
+            const y = baseY + (n - 1 - li) * lineHeight;
+            const x = usableBox
+              ? box.minX + Math.max(0, ((box.maxX - box.minX) - textWidth) / 2)
+              : Math.max(fallbackX, (width - textWidth) / 2);
+            page.drawText(line, { x, y, size: fontSize, font, color: rgb(0, 0, 0) });
           }
         }
 
@@ -767,13 +794,19 @@ router.get('/download-label', authenticateToken, async (req, res) => {
       }
     };
 
-    const enrichZpl = (zplString, sku, quantity, userName) => {
-      if (!sku && !userName) return zplString;
-      const text = `Quantidade: ${quantity ?? 'N/A'} | SKU: ${sku || 'N/A'} | Cliente: ${userName || 'N/A'}`;
-      // Adiciona um bloco ZPL no fim da string para imprimir o texto
-      // A maioria das etiquetas termina com ^XZ. Injetar logo antes ou enviar como nova etiqueta curta.
-      // É mais seguro concatenar uma mini etiqueta logo após a principal para não estragar a formatação nativa.
-      const extraTag = `^XA^FO50,50^A0N,30,30^FD${text}^FS^XZ\n`;
+    const enrichZpl = (zplString, items, userName) => {
+      const hasItems = Array.isArray(items) && items.length > 0;
+      if (!hasItems && !userName) return zplString;
+      const lines = buildLabelLines(items, userName);
+      // Adiciona uma mini etiqueta ZPL no fim, com uma linha por item (Y incremental).
+      // Concatenar depois da principal evita estragar a formatação nativa.
+      let y = 50;
+      let fd = '';
+      for (const ln of lines) {
+        fd += `^FO50,${y}^A0N,30,30^FD${ln}^FS`;
+        y += 35;
+      }
+      const extraTag = `^XA${fd}^XZ\n`;
       return zplString + '\n' + extraTag;
     };
 
@@ -815,9 +848,9 @@ router.get('/download-label', authenticateToken, async (req, res) => {
 
       if (isPDF) {
         const logisticType = logisticMap[id] || null;
-        buf = await enrichPdf(buf, info.sku, info.quantity, info.user_name, logisticType);
+        buf = await enrichPdf(buf, info.items, info.user_name, logisticType);
       } else {
-        const zplStr = enrichZpl(buf.toString('utf-8'), info.sku, info.quantity, info.user_name);
+        const zplStr = enrichZpl(buf.toString('utf-8'), info.items, info.user_name);
         buf = Buffer.from(zplStr, 'utf-8');
       }
       buffers.push(buf);
