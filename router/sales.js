@@ -578,6 +578,8 @@ function buildSeparacaoWhere(req) {
   const account = (req.query.account || '').trim();
   const userNickname = (req.query.userNickname || '').trim();
   const search = (req.query.search || '').trim();
+  // Situação de despacho: 'nao' (default, a despachar) | 'sim' (despachados) | 'todos'
+  const despacho = (req.query.despacho || 'nao').trim();
 
   if (saleDateStart) {
     conditions.push(`s.sale_date >= $${paramIdx}`);
@@ -637,14 +639,21 @@ function buildSeparacaoWhere(req) {
   conditions.push(`COALESCE(u.active, true) = true`);
 
   // ===== Regras da FILA DE SEPARAÇÃO =====
-  // 1) FULL não entra: quem separa/expede FULL é o próprio Mercado Livre.
+  // 1) FULL nunca entra: quem separa/expede FULL é o próprio Mercado Livre.
   conditions.push(`s.shipping_mode IS DISTINCT FROM 'FULL'`);
   // 2) Não mostrar pedidos cancelados.
   conditions.push(`COALESCE(s.raw_api_data->>'status','') <> 'cancelled'`);
-  // 3) Só o que ainda falta separar: exclui já despachado/entregue/não entregue.
-  //    Usa o status REAL do envio (raw_api_data->shipping->status), não a coluna
-  //    local shipping_status (que é alterada durante o processamento).
-  conditions.push(`COALESCE(s.raw_api_data->'shipping'->>'status','') NOT IN ('shipped','delivered','not_delivered','cancelled','canceled')`);
+  // 3) Situação de despacho. Usa o status REAL do envio (raw shipping.status),
+  //    não a coluna local shipping_status (alterada durante o processamento).
+  if (despacho === 'sim') {
+    // Já despachados (enviados/entregues)
+    conditions.push(`COALESCE(s.raw_api_data->'shipping'->>'status','') IN ('shipped','delivered')`);
+  } else if (despacho === 'todos') {
+    // Todos (a despachar + despachados), mantendo apenas a exclusão de cancelados/FULL
+  } else {
+    // Padrão: só o que falta separar (não despachado)
+    conditions.push(`COALESCE(s.raw_api_data->'shipping'->>'status','') NOT IN ('shipped','delivered','not_delivered','cancelled','canceled')`);
+  }
 
   const whereClause = conditions.length > 0 ? 'WHERE ' + conditions.join(' AND ') : '';
   return { whereClause, params, paramIdx };
@@ -697,11 +706,6 @@ router.get('/separacao', authenticateToken, requireMaster, async (req, res) => {
       LEFT JOIN public.users u ON s.uid = u.uid
       ${whereClause}
     `;
-    const summaryResult = await db.query(summaryQuery, params);
-    const sRow = summaryResult.rows[0] || {};
-    const totalItens = parseInt(sRow.total_itens, 10) || 0;
-    const total = totalItens;
-
     // Contagem por modalidade
     const modeQuery = `
       SELECT COALESCE(s.shipping_mode, 'Outros') AS mode, COUNT(*) AS count
@@ -711,20 +715,6 @@ router.get('/separacao', authenticateToken, requireMaster, async (req, res) => {
       GROUP BY COALESCE(s.shipping_mode, 'Outros')
       ORDER BY count DESC
     `;
-    const modeResult = await db.query(modeQuery, params);
-    const porModalidade = {};
-    for (const r of modeResult.rows) {
-      porModalidade[r.mode] = parseInt(r.count, 10) || 0;
-    }
-
-    const summary = {
-      totalItens,
-      totalUnidades: parseInt(sRow.total_unidades, 10) || 0,
-      atrasados: parseInt(sRow.atrasados, 10) || 0,
-      despacharHoje: parseInt(sRow.despachar_hoje, 10) || 0,
-      usuariosAtivos: parseInt(sRow.usuarios_ativos, 10) || 0,
-      porModalidade,
-    };
 
     // Página de itens
     const dataQuery = `
@@ -742,7 +732,31 @@ router.get('/separacao', authenticateToken, requireMaster, async (req, res) => {
       ORDER BY ${orderBy}
       LIMIT $${paramIdx} OFFSET $${paramIdx + 1};
     `;
-    const dataResult = await db.query(dataQuery, [...params, limit, offset]);
+
+    // Executa as 3 queries em paralelo (mais rápido)
+    const [summaryResult, modeResult, dataResult] = await Promise.all([
+      db.query(summaryQuery, params),
+      db.query(modeQuery, params),
+      db.query(dataQuery, [...params, limit, offset]),
+    ]);
+
+    const sRow = summaryResult.rows[0] || {};
+    const totalItens = parseInt(sRow.total_itens, 10) || 0;
+    const total = totalItens;
+
+    const porModalidade = {};
+    for (const r of modeResult.rows) {
+      porModalidade[r.mode] = parseInt(r.count, 10) || 0;
+    }
+
+    const summary = {
+      totalItens,
+      totalUnidades: parseInt(sRow.total_unidades, 10) || 0,
+      atrasados: parseInt(sRow.atrasados, 10) || 0,
+      despacharHoje: parseInt(sRow.despachar_hoje, 10) || 0,
+      usuariosAtivos: parseInt(sRow.usuarios_ativos, 10) || 0,
+      porModalidade,
+    };
 
     res.json({
       items: dataResult.rows,
