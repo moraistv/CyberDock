@@ -636,6 +636,16 @@ function buildSeparacaoWhere(req) {
   // Não mostrar vendas de usuários inativos
   conditions.push(`COALESCE(u.active, true) = true`);
 
+  // ===== Regras da FILA DE SEPARAÇÃO =====
+  // 1) FULL não entra: quem separa/expede FULL é o próprio Mercado Livre.
+  conditions.push(`s.shipping_mode IS DISTINCT FROM 'FULL'`);
+  // 2) Não mostrar pedidos cancelados.
+  conditions.push(`COALESCE(s.raw_api_data->>'status','') <> 'cancelled'`);
+  // 3) Só o que ainda falta separar: exclui já despachado/entregue/não entregue.
+  //    Usa o status REAL do envio (raw_api_data->shipping->status), não a coluna
+  //    local shipping_status (que é alterada durante o processamento).
+  conditions.push(`COALESCE(s.raw_api_data->'shipping'->>'status','') NOT IN ('shipped','delivered','not_delivered','cancelled','canceled')`);
+
   const whereClause = conditions.length > 0 ? 'WHERE ' + conditions.join(' AND ') : '';
   return { whereClause, params, paramIdx };
 }
@@ -670,24 +680,18 @@ router.get('/separacao', authenticateToken, requireMaster, async (req, res) => {
         break;
     }
 
-    // Total de linhas (itens)
-    const countQuery = `
-      SELECT COUNT(*) AS total
-      FROM public.sales s
-      LEFT JOIN public.users u ON s.uid = u.uid
-      ${whereClause}
-    `;
-    const countResult = await db.query(countQuery, params);
-    const total = parseInt(countResult.rows[0].total, 10) || 0;
+    // Expressão do prazo de despacho (SLA quando houver, senão shipping_limit_date),
+    // convertida para data no fuso de Brasília para os buckets atrasado/hoje.
+    const prazoDateExpr = `(NULLIF(COALESCE(s.raw_api_data->'sla_data'->>'expected_date', s.shipping_limit_date::text), '')::timestamptz AT TIME ZONE 'America/Sao_Paulo')::date`;
+    const hojeExpr = `(now() AT TIME ZONE 'America/Sao_Paulo')::date`;
 
-    // Resumo agregado sobre TODO o conjunto filtrado
+    // Resumo agregado sobre TODO o conjunto filtrado (fila de separação)
     const summaryQuery = `
       SELECT
         COUNT(*) AS total_itens,
         COALESCE(SUM(s.quantity), 0) AS total_unidades,
-        COUNT(*) FILTER (
-          WHERE COALESCE(s.shipping_status, s.raw_api_data->'shipping'->>'status') IN ('shipped','delivered')
-        ) AS despachados,
+        COUNT(*) FILTER (WHERE ${prazoDateExpr} < ${hojeExpr}) AS atrasados,
+        COUNT(*) FILTER (WHERE ${prazoDateExpr} = ${hojeExpr}) AS despachar_hoje,
         COUNT(DISTINCT s.uid) AS usuarios_ativos
       FROM public.sales s
       LEFT JOIN public.users u ON s.uid = u.uid
@@ -696,7 +700,7 @@ router.get('/separacao', authenticateToken, requireMaster, async (req, res) => {
     const summaryResult = await db.query(summaryQuery, params);
     const sRow = summaryResult.rows[0] || {};
     const totalItens = parseInt(sRow.total_itens, 10) || 0;
-    const despachados = parseInt(sRow.despachados, 10) || 0;
+    const total = totalItens;
 
     // Contagem por modalidade
     const modeQuery = `
@@ -716,8 +720,8 @@ router.get('/separacao', authenticateToken, requireMaster, async (req, res) => {
     const summary = {
       totalItens,
       totalUnidades: parseInt(sRow.total_unidades, 10) || 0,
-      despachados,
-      aDespachar: Math.max(0, totalItens - despachados),
+      atrasados: parseInt(sRow.atrasados, 10) || 0,
+      despacharHoje: parseInt(sRow.despachar_hoje, 10) || 0,
       usuariosAtivos: parseInt(sRow.usuarios_ativos, 10) || 0,
       porModalidade,
     };
