@@ -560,6 +560,200 @@ router.get('/filter-options', authenticateToken, requireMaster, async (req, res)
   }
 });
 
+// ======== SEPARAÇÃO DE ITENS ========
+// Lista os itens para separação/despacho (visão master) com filtros por
+// período de venda, prazo para despachar, modalidade, conta e usuário.
+// Retorna { items, total, summary } — o resumo é agregado sobre TODO o
+// conjunto filtrado (não apenas a página), para os cards e o relatório PDF.
+function buildSeparacaoWhere(req) {
+  const conditions = [];
+  const params = [];
+  let paramIdx = 1;
+
+  const saleDateStart = (req.query.saleDateStart || '').trim();
+  const saleDateEnd = (req.query.saleDateEnd || '').trim();
+  const shippingLimitStart = (req.query.shippingLimitStart || '').trim();
+  const shippingLimitEnd = (req.query.shippingLimitEnd || '').trim();
+  const shippingMode = (req.query.shippingMode || '').trim();
+  const account = (req.query.account || '').trim();
+  const userNickname = (req.query.userNickname || '').trim();
+  const search = (req.query.search || '').trim();
+
+  if (saleDateStart) {
+    conditions.push(`s.sale_date >= $${paramIdx}`);
+    params.push(saleDateStart + 'T00:00:00-03:00');
+    paramIdx++;
+  }
+  if (saleDateEnd) {
+    conditions.push(`s.sale_date <= $${paramIdx}`);
+    params.push(saleDateEnd + 'T23:59:59.999-03:00');
+    paramIdx++;
+  }
+  if (shippingLimitStart) {
+    conditions.push(`COALESCE(s.raw_api_data->'sla_data'->>'expected_date', s.shipping_limit_date::text) >= $${paramIdx}`);
+    params.push(shippingLimitStart);
+    paramIdx++;
+  }
+  if (shippingLimitEnd) {
+    conditions.push(`COALESCE(s.raw_api_data->'sla_data'->>'expected_date', s.shipping_limit_date::text) <= $${paramIdx}`);
+    params.push(shippingLimitEnd + 'T23:59:59.999Z');
+    paramIdx++;
+  }
+  if (shippingMode) {
+    const modes = shippingMode.split(',').map(m => m.trim()).filter(Boolean);
+    if (modes.length === 1) {
+      conditions.push(`s.shipping_mode = $${paramIdx}`);
+      params.push(modes[0]);
+      paramIdx++;
+    } else if (modes.length > 1) {
+      conditions.push(`s.shipping_mode = ANY($${paramIdx})`);
+      params.push(modes);
+      paramIdx++;
+    }
+  }
+  if (account) {
+    conditions.push(`(s.seller_id::text = $${paramIdx} OR s.account_nickname ILIKE $${paramIdx + 1})`);
+    params.push(account, `%${account}%`);
+    paramIdx += 2;
+  }
+  if (userNickname) {
+    conditions.push(`u.name ILIKE $${paramIdx}`);
+    params.push(`%${userNickname}%`);
+    paramIdx++;
+  }
+  if (search) {
+    conditions.push(`(
+      s.product_title ILIKE $${paramIdx}
+      OR s.sku ILIKE $${paramIdx}
+      OR s.account_nickname ILIKE $${paramIdx}
+      OR u.name ILIKE $${paramIdx}
+      OR CAST(s.id AS TEXT) ILIKE $${paramIdx}
+    )`);
+    params.push(`%${search}%`);
+    paramIdx++;
+  }
+
+  // Não mostrar vendas de usuários inativos
+  conditions.push(`COALESCE(u.active, true) = true`);
+
+  const whereClause = conditions.length > 0 ? 'WHERE ' + conditions.join(' AND ') : '';
+  return { whereClause, params, paramIdx };
+}
+
+router.get('/separacao', authenticateToken, requireMaster, async (req, res) => {
+  try {
+    const full = String(req.query.full || '') === '1';
+    const page = Math.max(1, parseInt(req.query.page) || 1);
+    const limit = full
+      ? 5000
+      : Math.min(200, Math.max(1, parseInt(req.query.limit) || 20));
+    const offset = (page - 1) * limit;
+
+    const { whereClause, params, paramIdx } = buildSeparacaoWhere(req);
+
+    // Ordenação: por prazo de despacho (mais próximo primeiro) por padrão.
+    const sort = (req.query.sort || 'prazo_asc').trim();
+    let orderBy;
+    switch (sort) {
+      case 'prazo_desc':
+        orderBy = `COALESCE(s.raw_api_data->'sla_data'->>'expected_date', s.shipping_limit_date::text) DESC NULLS LAST`;
+        break;
+      case 'venda_desc':
+        orderBy = `s.sale_date DESC`;
+        break;
+      case 'venda_asc':
+        orderBy = `s.sale_date ASC`;
+        break;
+      case 'prazo_asc':
+      default:
+        orderBy = `COALESCE(s.raw_api_data->'sla_data'->>'expected_date', s.shipping_limit_date::text) ASC NULLS LAST`;
+        break;
+    }
+
+    // Total de linhas (itens)
+    const countQuery = `
+      SELECT COUNT(*) AS total
+      FROM public.sales s
+      LEFT JOIN public.users u ON s.uid = u.uid
+      ${whereClause}
+    `;
+    const countResult = await db.query(countQuery, params);
+    const total = parseInt(countResult.rows[0].total, 10) || 0;
+
+    // Resumo agregado sobre TODO o conjunto filtrado
+    const summaryQuery = `
+      SELECT
+        COUNT(*) AS total_itens,
+        COALESCE(SUM(s.quantity), 0) AS total_unidades,
+        COUNT(*) FILTER (
+          WHERE COALESCE(s.shipping_status, s.raw_api_data->'shipping'->>'status') IN ('shipped','delivered')
+        ) AS despachados,
+        COUNT(DISTINCT s.uid) AS usuarios_ativos
+      FROM public.sales s
+      LEFT JOIN public.users u ON s.uid = u.uid
+      ${whereClause}
+    `;
+    const summaryResult = await db.query(summaryQuery, params);
+    const sRow = summaryResult.rows[0] || {};
+    const totalItens = parseInt(sRow.total_itens, 10) || 0;
+    const despachados = parseInt(sRow.despachados, 10) || 0;
+
+    // Contagem por modalidade
+    const modeQuery = `
+      SELECT COALESCE(s.shipping_mode, 'Outros') AS mode, COUNT(*) AS count
+      FROM public.sales s
+      LEFT JOIN public.users u ON s.uid = u.uid
+      ${whereClause}
+      GROUP BY COALESCE(s.shipping_mode, 'Outros')
+      ORDER BY count DESC
+    `;
+    const modeResult = await db.query(modeQuery, params);
+    const porModalidade = {};
+    for (const r of modeResult.rows) {
+      porModalidade[r.mode] = parseInt(r.count, 10) || 0;
+    }
+
+    const summary = {
+      totalItens,
+      totalUnidades: parseInt(sRow.total_unidades, 10) || 0,
+      despachados,
+      aDespachar: Math.max(0, totalItens - despachados),
+      usuariosAtivos: parseInt(sRow.usuarios_ativos, 10) || 0,
+      porModalidade,
+    };
+
+    // Página de itens
+    const dataQuery = `
+      SELECT s.id, s.sku, s.uid, s.account_nickname, s.quantity,
+        s.product_title, s.shipping_mode, s.shipping_limit_date, s.shipping_status,
+        u.name AS user_nickname,
+        s.raw_api_data->'sla_data'->>'expected_date' AS sla_expected_date,
+        COALESCE(s.shipping_status, s.raw_api_data->'shipping'->>'status') AS shipping_status_live,
+        s.raw_api_data->'buyer'->>'first_name' AS buyer_first_name,
+        s.raw_api_data->'buyer'->>'last_name' AS buyer_last_name,
+        s.raw_api_data->'buyer'->>'nickname' AS buyer_nickname
+      FROM public.sales s
+      LEFT JOIN public.users u ON s.uid = u.uid
+      ${whereClause}
+      ORDER BY ${orderBy}
+      LIMIT $${paramIdx} OFFSET $${paramIdx + 1};
+    `;
+    const dataResult = await db.query(dataQuery, [...params, limit, offset]);
+
+    res.json({
+      items: dataResult.rows,
+      total,
+      page,
+      limit,
+      totalPages: Math.ceil(total / limit),
+      summary,
+    });
+  } catch (err) {
+    console.error('Erro ao buscar separação de itens:', err);
+    res.status(500).json({ error: 'Falha ao buscar itens de separação' });
+  }
+});
+
 router.get('/all', authenticateToken, requireMaster, async (req, res) => {
   try {
     const page = Math.max(1, parseInt(req.query.page) || 1);
