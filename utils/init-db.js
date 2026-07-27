@@ -324,6 +324,15 @@ async function syncDatabaseSchema() {
         await client.query('CREATE INDEX IF NOT EXISTS idx_sales_uid_seller_saledate ON public.sales(uid, seller_id, sale_date DESC);');
         await client.query('CREATE INDEX IF NOT EXISTS idx_sales_uid_seller_dlu ON public.sales(uid, seller_id, date_last_updated DESC);');
 
+        // Índices para a tela de Separação de Itens (fila de despacho). As
+        // queries filtram por prazo de despacho, modalidade e status do envio.
+        await client.query('CREATE INDEX IF NOT EXISTS idx_sales_shipping_limit_date ON public.sales(shipping_limit_date);');
+        await client.query('CREATE INDEX IF NOT EXISTS idx_sales_shipping_mode ON public.sales(shipping_mode);');
+        await client.query(`CREATE INDEX IF NOT EXISTS idx_sales_ship_status ON public.sales((raw_api_data->'shipping'->>'status'));`);
+        // Índice funcional no MESMO campo usado no filtro de prazo (SLA -> limite),
+        // permitindo range scan rápido quando a tela filtra por "despachar hoje".
+        await client.query(`CREATE INDEX IF NOT EXISTS idx_sales_prazo_despacho ON public.sales((COALESCE(raw_api_data->'sla_data'->>'expected_date', shipping_limit_date::text)));`);
+
         await client.query('COMMIT');
         console.log('✅ Esquema do banco de dados está atualizado.');
     } catch (error) {
