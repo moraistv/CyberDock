@@ -11,7 +11,6 @@ async function run() {
     await db.query('CREATE INDEX IF NOT EXISTS idx_sales_shipping_limit_date ON public.sales(shipping_limit_date);');
     await db.query('CREATE INDEX IF NOT EXISTS idx_sales_shipping_mode ON public.sales(shipping_mode);');
     await db.query(`CREATE INDEX IF NOT EXISTS idx_sales_ship_status ON public.sales((raw_api_data->'shipping'->>'status'));`);
-    await db.query(`CREATE INDEX IF NOT EXISTS idx_sales_prazo_despacho ON public.sales((COALESCE(raw_api_data->'sla_data'->>'expected_date', shipping_limit_date::text)));`);
     console.log('Indexes created successfully');
   } catch (e) {
     console.error('Error:', e);

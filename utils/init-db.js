@@ -329,9 +329,6 @@ async function syncDatabaseSchema() {
         await client.query('CREATE INDEX IF NOT EXISTS idx_sales_shipping_limit_date ON public.sales(shipping_limit_date);');
         await client.query('CREATE INDEX IF NOT EXISTS idx_sales_shipping_mode ON public.sales(shipping_mode);');
         await client.query(`CREATE INDEX IF NOT EXISTS idx_sales_ship_status ON public.sales((raw_api_data->'shipping'->>'status'));`);
-        // Índice funcional no MESMO campo usado no filtro de prazo (SLA -> limite),
-        // permitindo range scan rápido quando a tela filtra por "despachar hoje".
-        await client.query(`CREATE INDEX IF NOT EXISTS idx_sales_prazo_despacho ON public.sales((COALESCE(raw_api_data->'sla_data'->>'expected_date', shipping_limit_date::text)));`);
 
         await client.query('COMMIT');
         console.log('✅ Esquema do banco de dados está atualizado.');

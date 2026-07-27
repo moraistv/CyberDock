@@ -591,14 +591,16 @@ function buildSeparacaoWhere(req) {
     params.push(saleDateEnd + 'T23:59:59.999-03:00');
     paramIdx++;
   }
+  // Filtro de prazo usa a coluna indexada shipping_limit_date (timestamptz),
+  // com limites no fuso de Brasília — sargável e rápido (usa o índice).
   if (shippingLimitStart) {
-    conditions.push(`COALESCE(s.raw_api_data->'sla_data'->>'expected_date', s.shipping_limit_date::text) >= $${paramIdx}`);
-    params.push(shippingLimitStart);
+    conditions.push(`s.shipping_limit_date >= $${paramIdx}`);
+    params.push(shippingLimitStart + 'T00:00:00-03:00');
     paramIdx++;
   }
   if (shippingLimitEnd) {
-    conditions.push(`COALESCE(s.raw_api_data->'sla_data'->>'expected_date', s.shipping_limit_date::text) <= $${paramIdx}`);
-    params.push(shippingLimitEnd + 'T23:59:59.999Z');
+    conditions.push(`s.shipping_limit_date <= $${paramIdx}`);
+    params.push(shippingLimitEnd + 'T23:59:59.999-03:00');
     paramIdx++;
   }
   if (shippingMode) {
@@ -675,7 +677,7 @@ router.get('/separacao', authenticateToken, requireMaster, async (req, res) => {
     let orderBy;
     switch (sort) {
       case 'prazo_desc':
-        orderBy = `COALESCE(s.raw_api_data->'sla_data'->>'expected_date', s.shipping_limit_date::text) DESC NULLS LAST`;
+        orderBy = `s.shipping_limit_date DESC NULLS LAST`;
         break;
       case 'venda_desc':
         orderBy = `s.sale_date DESC`;
@@ -685,13 +687,13 @@ router.get('/separacao', authenticateToken, requireMaster, async (req, res) => {
         break;
       case 'prazo_asc':
       default:
-        orderBy = `COALESCE(s.raw_api_data->'sla_data'->>'expected_date', s.shipping_limit_date::text) ASC NULLS LAST`;
+        orderBy = `s.shipping_limit_date ASC NULLS LAST`;
         break;
     }
 
     // Expressão do prazo de despacho (SLA quando houver, senão shipping_limit_date),
     // convertida para data no fuso de Brasília para os buckets atrasado/hoje.
-    const prazoDateExpr = `(NULLIF(COALESCE(s.raw_api_data->'sla_data'->>'expected_date', s.shipping_limit_date::text), '')::timestamptz AT TIME ZONE 'America/Sao_Paulo')::date`;
+    const prazoDateExpr = `(s.shipping_limit_date AT TIME ZONE 'America/Sao_Paulo')::date`;
     const hojeExpr = `(now() AT TIME ZONE 'America/Sao_Paulo')::date`;
 
     // Resumo agregado sobre TODO o conjunto filtrado (fila de separação)
