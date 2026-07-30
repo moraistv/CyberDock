@@ -724,6 +724,13 @@ router.get('/separacao', authenticateToken, requireMaster, async (req, res) => {
       SELECT s.id, s.sku, s.uid, s.account_nickname, s.quantity,
         s.product_title, s.shipping_mode, s.shipping_limit_date, s.shipping_status,
         u.name AS user_nickname,
+        -- Descrição interna cadastrada no Armazenamento (prioridade 1 na exibição)
+        (SELECT sk.descricao FROM public.skus sk
+          WHERE sk.user_id = s.uid
+            AND UPPER(TRIM(sk.sku)) = UPPER(TRIM(s.sku))
+            AND sk.descricao IS NOT NULL AND TRIM(sk.descricao) <> ''
+          ORDER BY sk.ativo DESC
+          LIMIT 1) AS sku_descricao,
         s.raw_api_data->'sla_data'->>'expected_date' AS sla_expected_date,
         COALESCE(s.shipping_status, s.raw_api_data->'shipping'->>'status') AS shipping_status_live,
         s.raw_api_data->'buyer'->>'first_name' AS buyer_first_name,
@@ -910,7 +917,14 @@ router.get('/all', authenticateToken, requireMaster, async (req, res) => {
         s.raw_api_data->'buyer'->>'first_name' as buyer_first_name,
         s.raw_api_data->'buyer'->>'last_name' as buyer_last_name,
         s.raw_api_data->'buyer'->>'nickname' as buyer_nickname,
-        EXISTS (SELECT 1 FROM public.skus sk WHERE sk.user_id = s.uid AND UPPER(TRIM(sk.sku)) = UPPER(TRIM(s.sku)) AND sk.ativo = true) as is_sku_mapped
+        EXISTS (SELECT 1 FROM public.skus sk WHERE sk.user_id = s.uid AND UPPER(TRIM(sk.sku)) = UPPER(TRIM(s.sku)) AND sk.ativo = true) as is_sku_mapped,
+        -- Descrição interna cadastrada no Armazenamento (prioridade 1 na exibição)
+        (SELECT sk.descricao FROM public.skus sk
+          WHERE sk.user_id = s.uid
+            AND UPPER(TRIM(sk.sku)) = UPPER(TRIM(s.sku))
+            AND sk.descricao IS NOT NULL AND TRIM(sk.descricao) <> ''
+          ORDER BY sk.ativo DESC
+          LIMIT 1) AS sku_descricao
       FROM public.sales s
       LEFT JOIN public.users u ON s.uid = u.uid
       ${whereClause}
@@ -1200,7 +1214,14 @@ router.get('/my-sales', authenticateToken, async (req, res) => {
         s.raw_api_data->'buyer'->>'first_name' as buyer_first_name,
         s.raw_api_data->'buyer'->>'last_name' as buyer_last_name,
         s.raw_api_data->'buyer'->>'nickname' as buyer_nickname,
-        EXISTS (SELECT 1 FROM public.skus sk WHERE sk.user_id = $1 AND UPPER(TRIM(sk.sku)) = UPPER(TRIM(s.sku)) AND sk.ativo = true) as is_sku_mapped
+        EXISTS (SELECT 1 FROM public.skus sk WHERE sk.user_id = $1 AND UPPER(TRIM(sk.sku)) = UPPER(TRIM(s.sku)) AND sk.ativo = true) as is_sku_mapped,
+        -- Descrição interna cadastrada no Armazenamento (prioridade 1 na exibição)
+        (SELECT sk.descricao FROM public.skus sk
+          WHERE sk.user_id = $1
+            AND UPPER(TRIM(sk.sku)) = UPPER(TRIM(s.sku))
+            AND sk.descricao IS NOT NULL AND TRIM(sk.descricao) <> ''
+          ORDER BY sk.ativo DESC
+          LIMIT 1) AS sku_descricao
       FROM public.sales s
       ${whereClause}
       ORDER BY s.sale_date DESC
