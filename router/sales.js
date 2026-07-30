@@ -731,6 +731,17 @@ router.get('/separacao', authenticateToken, requireMaster, async (req, res) => {
             AND sk.descricao IS NOT NULL AND TRIM(sk.descricao) <> ''
           ORDER BY sk.ativo DESC
           LIMIT 1) AS sku_descricao,
+        -- Variação escolhida na venda (cor, tamanho...). Casa o item do pedido
+        -- pelo seller_sku da linha; se não achar, usa o primeiro item.
+        COALESCE(
+          (SELECT oi->'item'->'variation_attributes'
+             FROM jsonb_array_elements(COALESCE(s.raw_api_data->'order_items', '[]'::jsonb)) oi
+            WHERE UPPER(TRIM(COALESCE(oi->'item'->>'seller_sku', oi->'item'->>'id', ''))) = UPPER(TRIM(s.sku))
+            LIMIT 1),
+          (SELECT oi->'item'->'variation_attributes'
+             FROM jsonb_array_elements(COALESCE(s.raw_api_data->'order_items', '[]'::jsonb)) oi
+            LIMIT 1)
+        ) AS variation_attributes,
         s.raw_api_data->'sla_data'->>'expected_date' AS sla_expected_date,
         COALESCE(s.shipping_status, s.raw_api_data->'shipping'->>'status') AS shipping_status_live,
         s.raw_api_data->'buyer'->>'first_name' AS buyer_first_name,
@@ -924,7 +935,17 @@ router.get('/all', authenticateToken, requireMaster, async (req, res) => {
             AND UPPER(TRIM(sk.sku)) = UPPER(TRIM(s.sku))
             AND sk.descricao IS NOT NULL AND TRIM(sk.descricao) <> ''
           ORDER BY sk.ativo DESC
-          LIMIT 1) AS sku_descricao
+          LIMIT 1) AS sku_descricao,
+        -- Variação escolhida na venda (cor, tamanho...)
+        COALESCE(
+          (SELECT oi->'item'->'variation_attributes'
+             FROM jsonb_array_elements(COALESCE(s.raw_api_data->'order_items', '[]'::jsonb)) oi
+            WHERE UPPER(TRIM(COALESCE(oi->'item'->>'seller_sku', oi->'item'->>'id', ''))) = UPPER(TRIM(s.sku))
+            LIMIT 1),
+          (SELECT oi->'item'->'variation_attributes'
+             FROM jsonb_array_elements(COALESCE(s.raw_api_data->'order_items', '[]'::jsonb)) oi
+            LIMIT 1)
+        ) AS variation_attributes
       FROM public.sales s
       LEFT JOIN public.users u ON s.uid = u.uid
       ${whereClause}
@@ -1221,7 +1242,17 @@ router.get('/my-sales', authenticateToken, async (req, res) => {
             AND UPPER(TRIM(sk.sku)) = UPPER(TRIM(s.sku))
             AND sk.descricao IS NOT NULL AND TRIM(sk.descricao) <> ''
           ORDER BY sk.ativo DESC
-          LIMIT 1) AS sku_descricao
+          LIMIT 1) AS sku_descricao,
+        -- Variação escolhida na venda (cor, tamanho...)
+        COALESCE(
+          (SELECT oi->'item'->'variation_attributes'
+             FROM jsonb_array_elements(COALESCE(s.raw_api_data->'order_items', '[]'::jsonb)) oi
+            WHERE UPPER(TRIM(COALESCE(oi->'item'->>'seller_sku', oi->'item'->>'id', ''))) = UPPER(TRIM(s.sku))
+            LIMIT 1),
+          (SELECT oi->'item'->'variation_attributes'
+             FROM jsonb_array_elements(COALESCE(s.raw_api_data->'order_items', '[]'::jsonb)) oi
+            LIMIT 1)
+        ) AS variation_attributes
       FROM public.sales s
       ${whereClause}
       ORDER BY s.sale_date DESC
