@@ -15,7 +15,6 @@
 //     get_order_detail (lotes de até 50) → get_escrow_detail (financeiro real).
 
 const express = require('express');
-const crypto = require('crypto');
 const db = require('../utils/postgres');
 const { authenticateToken, requireMaster } = require('../utils/authMiddleware');
 const {
@@ -32,16 +31,18 @@ const { calculateShopeeFinancials, SHOPEE_FINANCIAL_RULE_VERSION } = require('..
 
 const router = express.Router();
 
-const REDIRECT_URI = process.env.SHOPEE_REDIRECT_URI || 'https://api.cyberdock.com.br/api/shopee/callback';
 const FRONTEND_URL = process.env.FRONTEND_URL || 'https://cyberdock.com.br';
 
-const oauthStates = new Map(); // state -> { uid, createdAt }
-setInterval(() => {
-  const now = Date.now();
-  for (const [k, v] of oauthStates.entries()) {
-    if (now - v.createdAt > 15 * 60 * 1000) oauthStates.delete(k);
-  }
-}, 5 * 60 * 1000);
+// A Shopee valida o DOMÍNIO do redirect contra o "Redirect URL Domain"
+// cadastrado no console do parceiro. O console da CyberDock declara
+// cyberdock.com.br (domínio do frontend), não api.cyberdock.com.br, então o
+// retorno da autorização precisa cair no FRONTEND. A página recebe `code` e
+// `shop_id` e chama POST /api/shopee/connect para concluir a troca de tokens.
+//
+// Efeito colateral positivo: o vínculo com o usuário passa a vir do JWT no
+// momento do connect, em vez de um mapa de `state` em memória — que se perdia
+// a cada restart do servidor e quebraria com mais de uma instância.
+const REDIRECT_URI = process.env.SHOPEE_REDIRECT_URI || `${FRONTEND_URL}/shopee/callback`;
 
 /* --------------------------- SSE (mesmo padrão de /sales) --------------------------- */
 const clients = {};
@@ -98,27 +99,34 @@ router.get('/auth', (req, res) => {
     return res.status(500).json({ error: 'Credenciais Shopee ausentes (SHOPEE_PARTNER_ID / SHOPEE_PARTNER_KEY).' });
   }
 
-  const state = crypto.randomUUID();
-  oauthStates.set(state, { uid, createdAt: Date.now() });
-
-  const authUrl = getShopeeAuthUrl(partnerId, partnerKey, `${REDIRECT_URI}?state=${state}`);
+  // Sem `state` na URL: a Shopee acrescenta ?code=..&shop_id=.. ao redirect, e
+  // um query string já existente tornaria a montagem ambígua. A identidade do
+  // usuário é resolvida no /connect, pelo JWT.
+  console.log(`[Shopee Auth] Iniciando autenticação para UID: ${uid}`);
+  console.log(`[Shopee Auth] Redirect: ${REDIRECT_URI}`);
+  const authUrl = getShopeeAuthUrl(partnerId, partnerKey, REDIRECT_URI);
   res.redirect(authUrl);
 });
 
-/* ----------------------------- OAuth: Callback ----------------------------- */
-router.get('/callback', async (req, res) => {
-  const { code, shop_id, state } = req.query;
-  const shopId = shop_id || req.query.shopid;
+/* ----------------------------- OAuth: Conclusão ---------------------------- */
+/**
+ * Conclui a conexão da loja. Chamado pelo FRONTEND (página /shopee/callback)
+ * com o `code` e o `shop_id` que a Shopee devolveu, autenticado por JWT.
+ */
+router.post('/connect', authenticateToken, async (req, res) => {
+  const { code, shopId } = req.body;
+  const { uid } = req.user;
 
-  const stateObj = state ? oauthStates.get(state) : null;
-  if (!code || !shopId || !stateObj) {
-    return res.redirect(`${FRONTEND_URL}/contas?error=${encodeURIComponent('Autorização Shopee falhou. Dados ausentes ou sessão expirada.')}`);
+  if (!code || !shopId) {
+    return res.status(400).json({ error: 'Parâmetros code e shopId são obrigatórios.' });
   }
-  oauthStates.delete(state);
-  const { uid } = stateObj;
 
   try {
     const { partnerId, partnerKey } = getShopeePartnerCredentials();
+    if (!partnerId || !partnerKey) {
+      return res.status(500).json({ error: 'Credenciais Shopee ausentes no servidor.' });
+    }
+
     const tokens = await exchangeShopeeCode(code, shopId, partnerId, partnerKey);
     const expiresAt = new Date(Date.now() + Math.max(30, tokens.expire_in - 60) * 1000);
     const shopName = await getShopeeShopName(tokens.shop_id, tokens.access_token, partnerId, partnerKey);
@@ -147,11 +155,28 @@ router.get('/callback', async (req, res) => {
       expiresAt,
     ]);
 
-    res.redirect(`${FRONTEND_URL}/contas?success=${encodeURIComponent(`Loja Shopee ${shopName || tokens.shop_id} conectada com sucesso!`)}`);
+    const label = shopName || tokens.shop_id;
+    console.log(`[Shopee Connect] Loja ${label} conectada para UID ${uid}`);
+    res.json({ message: `Loja Shopee ${label} conectada com sucesso!`, shopId: tokens.shop_id, shopName });
   } catch (error) {
-    console.error('[Shopee Callback] Erro:', error);
-    res.redirect(`${FRONTEND_URL}/contas?error=${encodeURIComponent(error.message || 'Erro desconhecido ao conectar loja Shopee.')}`);
+    console.error('[Shopee Connect] Erro:', error);
+    res.status(400).json({ error: error.message || 'Erro ao conectar loja Shopee.' });
   }
+});
+
+/**
+ * Callback direto no backend. Mantido para o caso de o console da Shopee ser
+ * configurado com o domínio da API; o fluxo padrão hoje passa pelo frontend.
+ */
+router.get('/callback', async (req, res) => {
+  const { code, shop_id } = req.query;
+  const shopId = shop_id || req.query.shopid;
+  const target = `${FRONTEND_URL}/shopee/callback`;
+  if (!code || !shopId) {
+    return res.redirect(`${FRONTEND_URL}/contas?error=${encodeURIComponent('Autorização Shopee falhou: code ou shop_id ausente.')}`);
+  }
+  // Repassa para a página do frontend, que tem a sessão para concluir.
+  res.redirect(`${target}?code=${encodeURIComponent(code)}&shop_id=${encodeURIComponent(shopId)}`);
 });
 
 /* -------------------------------- Contas -------------------------------- */

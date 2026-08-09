@@ -86,6 +86,9 @@ const CLIENT_SECRET = process.env.ML_CLIENT_SECRET || 'WWYgt9KH0HtZFH4YzD2yhrOLY
 const ALLOWED_REDIRECT_URIS = [
   'http://localhost:3001/api/ml/callback',
   'https://cyberdock-backend.onrender.com/api/ml/callback',
+  // Domínio atual da API em produção. Sem ele o log enche de aviso falso de
+  // "URL não permitida" mesmo com o fluxo funcionando normalmente.
+  'https://api.cyberdock.com.br/api/ml/callback',
 ];
 
 const codeVerifiers = new Map(); // state -> { codeVerifier, createdAt }
