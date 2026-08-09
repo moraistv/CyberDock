@@ -75,6 +75,47 @@ const schema = {
             value JSONB,
             updated_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
         );`,
+    shopee_accounts: `
+        CREATE TABLE public.shopee_accounts (
+            uid VARCHAR(255) NOT NULL,
+            shop_id BIGINT NOT NULL,
+            shop_name VARCHAR(255),
+            merchant_id VARCHAR(255),
+            access_token TEXT NOT NULL,
+            refresh_token TEXT NOT NULL,
+            expires_at TIMESTAMP WITH TIME ZONE,
+            status VARCHAR(50) DEFAULT 'active',
+            connected_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
+            updated_at TIMESTAMP WITH TIME ZONE,
+            PRIMARY KEY (uid, shop_id)
+        );`,
+    shopee_sales: `
+        CREATE TABLE public.shopee_sales (
+            order_sn VARCHAR(50) NOT NULL,
+            sku VARCHAR(255) NOT NULL,
+            uid VARCHAR(255) NOT NULL,
+            shop_id BIGINT NOT NULL,
+            account_nickname VARCHAR(255),
+            sale_date TIMESTAMP WITH TIME ZONE,
+            product_title TEXT,
+            quantity INTEGER,
+            unit_price NUMERIC(10, 2),
+            total_amount NUMERIC(10, 2),
+            platform_fee NUMERIC(10, 2),
+            freight NUMERIC(10, 2),
+            net_revenue NUMERIC(10, 2),
+            order_status VARCHAR(50),
+            buyer_username VARCHAR(255),
+            recipient_name VARCHAR(255),
+            tracking_number VARCHAR(255),
+            shipping_carrier VARCHAR(100),
+            ship_by_date TIMESTAMP WITH TIME ZONE,
+            shipping_status VARCHAR(100) DEFAULT 'Pendente',
+            raw_api_data JSONB,
+            updated_at TIMESTAMP WITH TIME ZONE,
+            processed_at TIMESTAMP WITH TIME ZONE,
+            PRIMARY KEY (order_sn, sku, uid)
+        );`,
     skus: `
         CREATE TABLE public.skus (
             id SERIAL PRIMARY KEY,
@@ -176,7 +217,7 @@ async function syncDatabaseSchema() {
         const tablesInOrder = [
             'users', 'package_types', 'services', 'ml_accounts', 'ml_sync_cursors', 'system_settings',
             'user_statuses', 'user_contracts', 'skus', 'sku_kit_components', 'kit_parents', 'sales', 'stock_movements',
-            'invoices', 'invoice_items'
+            'invoices', 'invoice_items', 'shopee_accounts', 'shopee_sales'
         ];
 
         await client.query('BEGIN');
@@ -329,6 +370,13 @@ async function syncDatabaseSchema() {
         await client.query('CREATE INDEX IF NOT EXISTS idx_sales_shipping_limit_date ON public.sales(shipping_limit_date);');
         await client.query('CREATE INDEX IF NOT EXISTS idx_sales_shipping_mode ON public.sales(shipping_mode);');
         await client.query(`CREATE INDEX IF NOT EXISTS idx_sales_ship_status ON public.sales((raw_api_data->'shipping'->>'status'));`);
+
+        console.log('   -> Verificando índices de performance em public.shopee_sales...');
+        await client.query('CREATE INDEX IF NOT EXISTS idx_shopee_sales_uid ON public.shopee_sales(uid);');
+        await client.query('CREATE INDEX IF NOT EXISTS idx_shopee_sales_shop_id ON public.shopee_sales(shop_id);');
+        await client.query('CREATE INDEX IF NOT EXISTS idx_shopee_sales_sale_date ON public.shopee_sales(sale_date DESC);');
+        await client.query('CREATE INDEX IF NOT EXISTS idx_shopee_sales_uid_saledate ON public.shopee_sales(uid, sale_date DESC);');
+        await client.query('CREATE INDEX IF NOT EXISTS idx_shopee_sales_uid_shop ON public.shopee_sales(uid, shop_id);');
 
         await client.query('COMMIT');
         console.log('✅ Esquema do banco de dados está atualizado.');
