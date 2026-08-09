@@ -548,10 +548,30 @@ router.get('/sync-status/:clientId', (req, res) => {
 
 router.get('/filter-options', authenticateToken, requireMaster, async (req, res) => {
   try {
-    const accResult = await db.query("SELECT DISTINCT nickname FROM public.ml_accounts WHERE nickname IS NOT NULL AND status = 'active' ORDER BY nickname");
-    const userResult = await db.query("SELECT DISTINCT name FROM public.users WHERE name IS NOT NULL AND active = true ORDER BY name");
+    // Contas dos DOIS marketplaces. `accounts` continua sendo uma lista de
+    // nicknames (compatibilidade com o filtro atual) e `accountsDetailed`
+    // traz o marketplace de cada uma, para a tela exibir o logo correto.
+    const [mlResult, shopeeResult, userResult] = await Promise.all([
+      db.query("SELECT DISTINCT nickname FROM public.ml_accounts WHERE nickname IS NOT NULL AND status = 'active' ORDER BY nickname"),
+      db.query("SELECT DISTINCT shop_id, shop_name FROM public.shopee_accounts WHERE status = 'active' ORDER BY shop_name"),
+      db.query("SELECT DISTINCT name FROM public.users WHERE name IS NOT NULL AND active = true ORDER BY name"),
+    ]);
+
+    const mlAccounts = mlResult.rows.map((r) => ({
+      marketplace: 'ML',
+      label: r.nickname,
+      value: r.nickname,
+    }));
+    const shopeeAccounts = shopeeResult.rows.map((r) => ({
+      marketplace: 'Shopee',
+      label: r.shop_name || String(r.shop_id),
+      value: r.shop_name || String(r.shop_id),
+    }));
+
     res.json({
-      accounts: accResult.rows.map(r => r.nickname),
+      accounts: [...mlAccounts, ...shopeeAccounts].map((a) => a.label),
+      accountsDetailed: [...mlAccounts, ...shopeeAccounts],
+      marketplaces: ['ML', 'Shopee'],
       users: userResult.rows.map(r => r.name)
     });
   } catch (err) {
@@ -1130,17 +1150,27 @@ router.get('/my-sales', authenticateToken, async (req, res) => {
     const shippingLimitEnd = (req.query.shippingLimitEnd || '').trim();
     const shippingMode = (req.query.shippingMode || '').trim();
     const processed = (req.query.processed || '').trim(); // 'yes' = processados | 'no' = não processados
+    // 'ML' | 'Shopee' | vazio = todos os marketplaces.
+    const marketplace = (req.query.marketplace || '').trim();
 
+    // Consulta a view unificada (public.unified_sales): as colunas já vêm
+    // normalizadas entre Mercado Livre e Shopee, então um único conjunto de
+    // filtros serve para os dois canais.
     const conditions = ['s.uid = $1'];
     const params = [uid];
     let paramIdx = 2;
 
+    if (marketplace) {
+      conditions.push(`s.marketplace = $${paramIdx}`);
+      params.push(marketplace);
+      paramIdx++;
+    }
     if (search) {
       conditions.push(`(
         s.product_title ILIKE $${paramIdx}
         OR s.sku ILIKE $${paramIdx}
         OR s.account_nickname ILIKE $${paramIdx}
-        OR CAST(s.id AS TEXT) ILIKE $${paramIdx}
+        OR s.id ILIKE $${paramIdx}
       )`);
       params.push(`%${search}%`);
       paramIdx++;
@@ -1151,7 +1181,7 @@ router.get('/my-sales', authenticateToken, async (req, res) => {
       paramIdx++;
     }
     if (saleStatus) {
-      conditions.push(`s.raw_api_data->>'status' = $${paramIdx}`);
+      conditions.push(`s.order_status = $${paramIdx}`);
       params.push(saleStatus);
       paramIdx++;
     }
@@ -1167,16 +1197,12 @@ router.get('/my-sales', authenticateToken, async (req, res) => {
       paramIdx++;
     }
     if (account) {
-      conditions.push(`(s.seller_id::text = $${paramIdx} OR s.account_nickname ILIKE $${paramIdx + 1})`);
+      conditions.push(`(s.account_id = $${paramIdx} OR s.account_nickname ILIKE $${paramIdx + 1})`);
       params.push(account, `%${account}%`);
       paramIdx += 2;
     }
     if (buyer) {
-      conditions.push(`(
-        s.raw_api_data->'buyer'->>'first_name' ILIKE $${paramIdx}
-        OR s.raw_api_data->'buyer'->>'last_name' ILIKE $${paramIdx}
-        OR s.raw_api_data->'buyer'->>'nickname' ILIKE $${paramIdx}
-      )`);
+      conditions.push(`(s.buyer_name ILIKE $${paramIdx} OR s.buyer_nickname ILIKE $${paramIdx})`);
       params.push(`%${buyer}%`);
       paramIdx++;
     }
@@ -1193,13 +1219,13 @@ router.get('/my-sales', authenticateToken, async (req, res) => {
       }
     }
     if (shippingLimitStart) {
-      conditions.push(`COALESCE(s.raw_api_data->'sla_data'->>'expected_date', s.shipping_limit_date::text) >= $${paramIdx}`);
-      params.push(shippingLimitStart);
+      conditions.push(`s.shipping_deadline >= $${paramIdx}`);
+      params.push(shippingLimitStart + 'T00:00:00-03:00');
       paramIdx++;
     }
     if (shippingLimitEnd) {
-      conditions.push(`COALESCE(s.raw_api_data->'sla_data'->>'expected_date', s.shipping_limit_date::text) <= $${paramIdx}`);
-      params.push(shippingLimitEnd + 'T23:59:59.999Z');
+      conditions.push(`s.shipping_deadline <= $${paramIdx}`);
+      params.push(shippingLimitEnd + 'T23:59:59.999-03:00');
       paramIdx++;
     }
     // Ao filtrar por PRAZO DE EXPEDIÇÃO, exclui FULL (vendedor não despacha FULL).
@@ -1216,25 +1242,31 @@ router.get('/my-sales', authenticateToken, async (req, res) => {
     const whereClause = 'WHERE ' + conditions.join(' AND ');
 
     // Count total
-    const countQuery = `SELECT COUNT(*) as total FROM public.sales s ${whereClause}`;
+    const countQuery = `SELECT COUNT(*) as total FROM public.unified_sales s ${whereClause}`;
     const countResult = await db.query(countQuery, params);
     const total = parseInt(countResult.rows[0].total);
 
-    // Fetch page
+    // Fetch page. Os aliases mantêm os nomes que o frontend já consome
+    // (seller_id, sale_status, shipping_limit_date, ml_item_id) para não
+    // quebrar a tela existente ao trocar a origem para a view.
     const dataQuery = `
-      SELECT s.id, s.sku, s.uid, s.seller_id, s.channel, s.account_nickname, s.sale_date,
-        s.product_title, s.quantity, s.shipping_mode, s.shipping_limit_date,
-        s.packages, s.shipping_status, s.updated_at, s.processed_at,
+      SELECT s.id, s.sku, s.uid, s.marketplace,
+        s.marketplace AS channel,
+        s.account_id AS seller_id,
+        s.account_nickname, s.sale_date,
+        s.product_title, s.quantity, s.shipping_mode,
+        s.shipping_deadline AS shipping_limit_date,
+        s.shipping_status, s.updated_at, s.processed_at,
         s.raw_api_data as raw_api_data,
-        s.raw_api_data->>'status' as sale_status,
-        s.raw_api_data->'shipping'->>'id' as shipping_id,
-        s.raw_api_data->'sla_data'->>'expected_date' as sla_expected_date,
-        (s.raw_api_data->'order_items'->0->'item'->>'thumbnail') as product_thumbnail,
-        (s.raw_api_data->'order_items'->0->'item'->>'permalink') as product_permalink,
-        (s.raw_api_data->'order_items'->0->'item'->>'id') as ml_item_id,
-        s.raw_api_data->'buyer'->>'first_name' as buyer_first_name,
-        s.raw_api_data->'buyer'->>'last_name' as buyer_last_name,
-        s.raw_api_data->'buyer'->>'nickname' as buyer_nickname,
+        s.order_status as sale_status,
+        s.shipping_id,
+        s.shipping_deadline as sla_expected_date,
+        s.product_thumbnail,
+        s.product_permalink,
+        s.item_id as ml_item_id,
+        s.buyer_name as buyer_first_name,
+        NULL::text as buyer_last_name,
+        s.buyer_nickname,
         EXISTS (SELECT 1 FROM public.skus sk WHERE sk.user_id = $1 AND UPPER(TRIM(sk.sku)) = UPPER(TRIM(s.sku)) AND sk.ativo = true) as is_sku_mapped,
         -- Descrição interna cadastrada no Armazenamento (prioridade 1 na exibição)
         (SELECT sk.descricao FROM public.skus sk
@@ -1243,8 +1275,9 @@ router.get('/my-sales', authenticateToken, async (req, res) => {
             AND sk.descricao IS NOT NULL AND TRIM(sk.descricao) <> ''
           ORDER BY sk.ativo DESC
           LIMIT 1) AS sku_descricao,
-        -- Variação escolhida na venda (cor, tamanho...)
-        COALESCE(
+        -- Variação escolhida na venda (cor, tamanho...). Só o ML publica
+        -- variation_attributes; na Shopee a variação vem no nome do modelo.
+        CASE WHEN s.marketplace = 'ML' THEN COALESCE(
           (SELECT oi->'item'->'variation_attributes'
              FROM jsonb_array_elements(COALESCE(s.raw_api_data->'order_items', '[]'::jsonb)) oi
             WHERE UPPER(TRIM(COALESCE(oi->'item'->>'seller_sku', oi->'item'->>'id', ''))) = UPPER(TRIM(s.sku))
@@ -1252,8 +1285,8 @@ router.get('/my-sales', authenticateToken, async (req, res) => {
           (SELECT oi->'item'->'variation_attributes'
              FROM jsonb_array_elements(COALESCE(s.raw_api_data->'order_items', '[]'::jsonb)) oi
             LIMIT 1)
-        ) AS variation_attributes
-      FROM public.sales s
+        ) END AS variation_attributes
+      FROM public.unified_sales s
       ${whereClause}
       ORDER BY s.sale_date DESC
       LIMIT $${paramIdx} OFFSET $${paramIdx + 1};
@@ -1266,9 +1299,12 @@ router.get('/my-sales', authenticateToken, async (req, res) => {
       const rows = dataResult.rows;
       const thumbMap = {};
 
+      // Só o Mercado Livre precisa deste enriquecimento: a Shopee já traz a
+      // imagem no raw_api_data, e mandar um item_id da Shopee para a API do
+      // ML gastaria chamada para nada.
       const byAccount = {};
       for (const row of rows) {
-        if (!row.product_thumbnail && row.ml_item_id) {
+        if (row.marketplace === 'ML' && !row.product_thumbnail && row.ml_item_id) {
           const acct = row.account_nickname || '__unknown__';
           if (!byAccount[acct]) byAccount[acct] = new Set();
           byAccount[acct].add(String(row.ml_item_id).toUpperCase());
@@ -1337,7 +1373,9 @@ router.get('/my-sales', authenticateToken, async (req, res) => {
         const idsToCache = [];
         let injected = 0;
         for (const row of rows) {
-          if (!row.product_thumbnail && row.ml_item_id) {
+          // O cache grava em public.sales (id BIGINT); manter a guarda de
+          // marketplace evita tentar converter um order_sn da Shopee.
+          if (row.marketplace === 'ML' && !row.product_thumbnail && row.ml_item_id) {
             const key = String(row.ml_item_id).toUpperCase();
             if (thumbMap[key]) {
               row.product_thumbnail = thumbMap[key] === 'not_found' ? null : thumbMap[key];

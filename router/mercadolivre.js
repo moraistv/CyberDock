@@ -374,10 +374,19 @@ router.get('/img-proxy', async (req, res) => {
   const imageUrl = req.query.url;
   if (!imageUrl) return res.status(400).send('URL da imagem é obrigatória.');
 
-  // Segurança: só permite URLs do mlstatic (domínio de imagens do ML)
+  // Segurança: whitelist de domínios de imagem dos marketplaces suportados.
+  // Sem isso o endpoint viraria um proxy aberto (SSRF).
+  const ALLOWED_IMAGE_HOSTS = [
+    'mlstatic.com',      // Mercado Livre
+    'susercontent.com',  // Shopee (CDN de imagens)
+    'shopee.com.br',     // Shopee
+  ];
   try {
     const parsed = new URL(imageUrl);
-    if (!parsed.hostname.endsWith('mlstatic.com')) {
+    const allowed = ALLOWED_IMAGE_HOSTS.some(
+      (host) => parsed.hostname === host || parsed.hostname.endsWith(`.${host}`)
+    );
+    if (!allowed) {
       return res.status(403).send('Domínio não permitido.');
     }
   } catch {
@@ -386,12 +395,17 @@ router.get('/img-proxy', async (req, res) => {
 
   try {
     const safeUrl = String(imageUrl).replace(/^http:\/\//i, 'https://');
-    
+
+    // O Referer precisa combinar com a origem da imagem: os CDNs bloqueiam
+    // hotlink quando o Referer é de outro domínio.
+    const isShopee = /(?:^|\.)(?:susercontent\.com|shopee\.com\.br)$/i.test(new URL(safeUrl).hostname);
+    const referer = isShopee ? 'https://shopee.com.br/' : 'https://www.mercadolivre.com.br/';
+
     const imgResponse = await fetch(safeUrl, {
       headers: {
         'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
         'Accept': 'image/webp,image/apng,image/*,*/*;q=0.8',
-        'Referer': 'https://www.mercadolivre.com.br/',
+        'Referer': referer,
       },
     });
 

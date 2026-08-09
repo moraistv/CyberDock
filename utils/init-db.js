@@ -371,6 +371,98 @@ async function syncDatabaseSchema() {
         await client.query('CREATE INDEX IF NOT EXISTS idx_sales_shipping_mode ON public.sales(shipping_mode);');
         await client.query(`CREATE INDEX IF NOT EXISTS idx_sales_ship_status ON public.sales((raw_api_data->'shipping'->>'status'));`);
 
+        // ------------------------------------------------------------------
+        // View unificada de vendas (Mercado Livre + Shopee).
+        //
+        // As telas de venda/expedição da CyberDock são por natureza
+        // multi-marketplace: quem separa pedido precisa de UMA fila, não de
+        // uma tela por canal. Esta view normaliza as duas tabelas num formato
+        // comum para que filtros, busca e paginação funcionem sobre o
+        // conjunto inteiro, sem duplicar endpoint nem componente.
+        //
+        // `id` é TEXT porque o ML usa order_id numérico e a Shopee usa
+        // order_sn alfanumérico. Colunas exclusivas de um canal vêm NULL no
+        // outro (ex.: shipping_id do ML, usado só para etiqueta).
+        // ------------------------------------------------------------------
+        // DROP antes de criar: CREATE OR REPLACE VIEW falha se a lista de
+        // colunas mudar (nome, tipo ou ordem), o que travaria o boot numa
+        // futura evolução do schema.
+        console.log('   -> Criando/atualizando view public.unified_sales...');
+        await client.query('DROP VIEW IF EXISTS public.unified_sales;');
+        await client.query(`
+            CREATE VIEW public.unified_sales AS
+            SELECT
+                'ML'::text                              AS marketplace,
+                s.id::text                              AS id,
+                s.sku,
+                s.uid,
+                s.seller_id::text                       AS account_id,
+                s.account_nickname,
+                s.sale_date,
+                s.product_title,
+                s.quantity,
+                s.shipping_mode,
+                -- O SLA do ML é o prazo real de despacho e tem precedência.
+                -- O cast é guardado por regex: um valor malformado no JSON
+                -- derrubaria toda a consulta da view, não apenas a linha.
+                COALESCE(
+                    CASE
+                        WHEN s.raw_api_data->'sla_data'->>'expected_date' ~ '^\\d{4}-\\d{2}-\\d{2}'
+                        THEN (s.raw_api_data->'sla_data'->>'expected_date')::timestamptz
+                    END,
+                    s.shipping_limit_date
+                )                                       AS shipping_deadline,
+                s.shipping_status,
+                s.processed_at,
+                s.updated_at,
+                s.raw_api_data->>'status'               AS order_status,
+                s.raw_api_data->'shipping'->>'id'       AS shipping_id,
+                s.raw_api_data->'order_items'->0->'item'->>'thumbnail'  AS product_thumbnail,
+                s.raw_api_data->'order_items'->0->'item'->>'permalink'  AS product_permalink,
+                s.raw_api_data->'order_items'->0->'item'->>'id'         AS item_id,
+                TRIM(CONCAT_WS(' ',
+                    s.raw_api_data->'buyer'->>'first_name',
+                    s.raw_api_data->'buyer'->>'last_name'
+                ))                                      AS buyer_name,
+                s.raw_api_data->'buyer'->>'nickname'    AS buyer_nickname,
+                s.raw_api_data                          AS raw_api_data
+            FROM public.sales s
+
+            UNION ALL
+
+            SELECT
+                'Shopee'::text                          AS marketplace,
+                sp.order_sn                             AS id,
+                sp.sku,
+                sp.uid,
+                sp.shop_id::text                        AS account_id,
+                sp.account_nickname,
+                sp.sale_date,
+                sp.product_title,
+                sp.quantity,
+                -- A Shopee não tem o conceito de modalidade do ML (FULL/FLEX).
+                -- Usamos a transportadora do pacote como modalidade exibida.
+                COALESCE(NULLIF(sp.shipping_carrier, ''), 'Shopee')     AS shipping_mode,
+                sp.ship_by_date                         AS shipping_deadline,
+                sp.shipping_status,
+                sp.processed_at,
+                sp.updated_at,
+                sp.order_status,
+                NULL::text                              AS shipping_id,
+                sp.raw_api_data->'item_list'->0->'image_info'->>'image_url' AS product_thumbnail,
+                CASE
+                    WHEN sp.raw_api_data->'item_list'->0->>'item_id' IS NOT NULL
+                    THEN 'https://shopee.com.br/product/' || sp.shop_id::text || '/' ||
+                         (sp.raw_api_data->'item_list'->0->>'item_id')
+                    ELSE NULL
+                END                                     AS product_permalink,
+                sp.raw_api_data->'item_list'->0->>'item_id'             AS item_id,
+                sp.recipient_name                       AS buyer_name,
+                sp.buyer_username                       AS buyer_nickname,
+                sp.raw_api_data                         AS raw_api_data
+            FROM public.shopee_sales sp;
+        `);
+
         console.log('   -> Verificando índices de performance em public.shopee_sales...');
         await client.query('CREATE INDEX IF NOT EXISTS idx_shopee_sales_uid ON public.shopee_sales(uid);');
         await client.query('CREATE INDEX IF NOT EXISTS idx_shopee_sales_shop_id ON public.shopee_sales(shop_id);');
