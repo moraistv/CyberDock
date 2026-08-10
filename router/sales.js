@@ -294,6 +294,108 @@ function buildMultiInsertQuery_DoUpdate(rows) {
 
 /** ======== HELPERS PARA BACKFILL ======== */
 
+/**
+ * Aquece o cache de thumbnails do Mercado Livre EM BACKGROUND.
+ *
+ * Antes isto rodava dentro do request, antes do res.json(): para cada conta
+ * fazia lotes de chamadas à API do ML com sleep(200) entre eles, tudo
+ * serializado. Numa página de 50 vendas isso somava SEGUNDOS a cada
+ * carregamento — era a maior causa de lentidão das telas de venda.
+ *
+ * Agora a resposta sai direto do banco (milissegundos) e esta função roda
+ * depois, só para gravar a thumbnail no raw_api_data. Na próxima visita a
+ * imagem já vem do banco. O sync normal também popula esse campo, então a
+ * maioria das linhas nunca precisa disto.
+ *
+ * @param {Array} rows Linhas já retornadas ao cliente (não são mutadas).
+ * @param {string|null} uid Quando informado, restringe o UPDATE a esse dono.
+ */
+async function warmMlThumbnailCache(rows, uid = null) {
+  try {
+    // `marketplace` só existe nas linhas vindas da view unificada. Consultas
+    // diretas em public.sales (ex.: /all) não têm o campo e são sempre ML.
+    const isMlRow = (row) => !row.marketplace || row.marketplace === 'ML';
+
+    const byAccount = {};
+    for (const row of rows) {
+      // Só ML: a Shopee já traz a imagem no payload e um item_id dela na API
+      // do ML seria chamada perdida.
+      if (isMlRow(row) && !row.product_thumbnail && row.ml_item_id) {
+        const acct = row.account_nickname || '__unknown__';
+        if (!byAccount[acct]) byAccount[acct] = new Set();
+        byAccount[acct].add(String(row.ml_item_id).toUpperCase());
+      }
+    }
+
+    const accountNames = Object.keys(byAccount);
+    if (accountNames.length === 0) return;
+
+    const tokenResult = await db.query(
+      "SELECT access_token, nickname FROM public.ml_accounts WHERE status = 'active' ORDER BY updated_at DESC NULLS LAST"
+    );
+    if (tokenResult.rowCount === 0) return;
+
+    const tokenByNickname = {};
+    for (const t of tokenResult.rows) {
+      if (t.nickname && !tokenByNickname[t.nickname]) tokenByNickname[t.nickname] = t.access_token;
+    }
+    const fallbackToken = tokenResult.rows[0].access_token;
+
+    const thumbMap = {};
+    const BATCH_SIZE = 20;
+
+    for (const acctName of accountNames) {
+      const itemIds = Array.from(byAccount[acctName]);
+      const token = tokenByNickname[acctName] || fallbackToken;
+      if (!token) continue;
+
+      for (let i = 0; i < itemIds.length; i += BATCH_SIZE) {
+        const batch = itemIds.slice(i, i + BATCH_SIZE).filter((id) => !thumbMap[id]);
+        if (batch.length === 0) continue;
+        try {
+          const url = `https://api.mercadolibre.com/items?ids=${batch.join(',')}&attributes=id,thumbnail,secure_thumbnail`;
+          const res = await mlFetch(url, { headers: { Authorization: `Bearer ${token}` } });
+          if (res.ok) {
+            const data = await res.json();
+            for (const entry of data) {
+              if (entry.code === 200 && entry.body) {
+                const thumb = entry.body.secure_thumbnail || entry.body.thumbnail;
+                if (thumb) thumbMap[String(entry.body.id).toUpperCase()] = thumb;
+              }
+            }
+          }
+        } catch { /* ignora: é só aquecimento de cache */ }
+      }
+    }
+
+    if (Object.keys(thumbMap).length === 0) return;
+
+    // Grava a thumbnail encontrada nas vendas correspondentes. Só ML, pois o
+    // destino é public.sales (id BIGINT).
+    for (const row of rows) {
+      if (!isMlRow(row) || row.product_thumbnail || !row.ml_item_id) continue;
+      const thumb = thumbMap[String(row.ml_item_id).toUpperCase()];
+      if (!thumb) continue;
+      try {
+        const sql = `
+          UPDATE public.sales
+             SET raw_api_data = jsonb_set(
+                   COALESCE(raw_api_data, '{}')::jsonb,
+                   '{order_items,0,item,thumbnail}',
+                   $1::jsonb
+                 )
+           WHERE id = $2 AND sku = $3` + (uid ? ' AND uid = $4' : '');
+        const args = uid
+          ? [JSON.stringify(thumb), row.id, row.sku, uid]
+          : [JSON.stringify(thumb), row.id, row.sku];
+        await db.query(sql, args);
+      } catch { /* ignora linha problemática */ }
+    }
+  } catch (err) {
+    console.warn('[THUMB] Falha ao aquecer cache de thumbnails:', err.message);
+  }
+}
+
 function uniqByIdSku(rows) {
   const seen = new Set();
   const out = [];
@@ -976,132 +1078,8 @@ router.get('/all', authenticateToken, requireMaster, async (req, res) => {
 
     const dataResult = await db.query(dataQuery, [...params, limit, offset]);
 
-    // ========== ENRICHMENT: Batch fetch thumbnails from ML Items API ==========
-    // Itens de catálogo retornam 403 se o token não pertence ao vendedor.
-    // Solução: agrupar por conta e usar o token correspondente.
-    try {
-      const rows = dataResult.rows;
-      const thumbMap = {};
-
-      // Agrupa itens sem thumbnail por account_nickname (cada conta tem seu token)
-      const byAccount = {};  // { nickname: [ml_item_id, ...] }
-      for (const row of rows) {
-        if (!row.product_thumbnail && row.ml_item_id) {
-          const acct = row.account_nickname || '__unknown__';
-          if (!byAccount[acct]) byAccount[acct] = new Set();
-          byAccount[acct].add(String(row.ml_item_id).toUpperCase());
-        }
-      }
-
-      const accountNames = Object.keys(byAccount);
-      if (accountNames.length > 0) {
-        // Busca TODOS os tokens ativos mapeados por nickname
-        const tokenResult = await db.query(
-          "SELECT access_token, nickname, user_id FROM public.ml_accounts WHERE status = 'active' ORDER BY updated_at DESC NULLS LAST"
-        );
-        const tokenByNickname = {};
-        const allTokens = [];
-        for (const t of tokenResult.rows) {
-          if (t.nickname && !tokenByNickname[t.nickname]) {
-            tokenByNickname[t.nickname] = t.access_token;
-          }
-          allTokens.push(t);
-        }
-
-        const BATCH_SIZE = 20;
-
-        // Função que busca thumbnails para um batch de IDs com headers
-        const fetchThumbBatch = async (batch, headers) => {
-          const url = `https://api.mercadolibre.com/items?ids=${batch.join(',')}&attributes=id,thumbnail,secure_thumbnail`;
-          const res = await fetch(url, { headers });
-          if (!res.ok) return 0;
-          const data = await res.json();
-          let found = 0;
-          for (const entry of data) {
-            if (entry.code === 200 && entry.body) {
-              const thumb = entry.body.secure_thumbnail || entry.body.thumbnail;
-              if (thumb) {
-                thumbMap[String(entry.body.id).toUpperCase()] = thumb;
-                found++;
-              }
-            }
-          }
-          return found;
-        };
-
-        // Para cada conta, busca thumbnails com o token DELA
-        for (const acctName of accountNames) {
-          const itemIds = Array.from(byAccount[acctName]);
-          const ownToken = tokenByNickname[acctName];
-
-          for (let i = 0; i < itemIds.length; i += BATCH_SIZE) {
-            const batch = itemIds.slice(i, i + BATCH_SIZE);
-            // Filtra apenas IDs que ainda não temos thumb
-            const pending = batch.filter(id => !thumbMap[id]);
-            if (pending.length === 0) continue;
-
-            let tokenToUse = ownToken || (allTokens.length > 0 ? allTokens[0].access_token : null);
-            if (tokenToUse) {
-              try { await fetchThumbBatch(pending, { 'Authorization': `Bearer ${tokenToUse}` }); } catch (e) { /* silencia */ }
-            }
-
-            const stillMissing = pending.filter(id => !thumbMap[id]);
-            for (const missing of stillMissing) {
-              thumbMap[missing] = 'not_found';
-            }
-
-            if (i + BATCH_SIZE < itemIds.length) {
-              await sleep(200);
-            }
-          }
-        }
-
-        // Injeta thumbnails nos resultados
-        const idsToCache = [];
-        let injected = 0;
-        for (const row of rows) {
-          if (!row.product_thumbnail && row.ml_item_id) {
-            const key = String(row.ml_item_id).toUpperCase();
-            if (thumbMap[key]) {
-              row.product_thumbnail = thumbMap[key] === 'not_found' ? null : thumbMap[key];
-              idsToCache.push({ id: row.id, sku: row.sku, thumb: thumbMap[key] });
-              if (thumbMap[key] !== 'not_found') injected++;
-            }
-          }
-        }
-
-        if (injected > 0 || Object.keys(thumbMap).length > 0) {
-          console.log(`[THUMB] ✅ ${injected} thumbnails injetadas de ${Object.keys(thumbMap).length} encontradas`);
-        }
-
-        // Persiste thumbnails no raw_api_data (fire & forget)
-        if (idsToCache.length > 0) {
-          setImmediate(async () => {
-            try {
-              for (const item of idsToCache) {
-                await db.query(
-                  `UPDATE public.sales
-                     SET raw_api_data = jsonb_set(
-                       COALESCE(raw_api_data, '{}')::jsonb,
-                       '{order_items,0,item,thumbnail}',
-                       $1::jsonb
-                     )
-                   WHERE id = $2 AND sku = $3`,
-                  [JSON.stringify(item.thumb), item.id, item.sku]
-                );
-              }
-              console.log(`[THUMB] ✅ ${idsToCache.length} thumbnails cacheadas no banco`);
-            } catch (cacheErr) {
-              console.warn('[THUMB] Erro ao cachear:', cacheErr.message);
-            }
-          });
-        }
-      }
-    } catch (enrichErr) {
-      console.warn('[THUMB] Erro no enriquecimento:', enrichErr.message);
-    }
-    // ========== END ENRICHMENT ==========
-
+    // Resposta imediata; o enriquecimento de thumbnails do ML roda em
+    // background (ver warmMlThumbnailCache) para não somar segundos ao request.
     res.json({
       data: dataResult.rows,
       total,
@@ -1109,6 +1087,8 @@ router.get('/all', authenticateToken, requireMaster, async (req, res) => {
       limit,
       totalPages: Math.ceil(total / limit) || 1
     });
+
+    setImmediate(() => warmMlThumbnailCache(dataResult.rows));
   } catch (error) {
     console.error("Erro interno ao buscar todas as vendas:", error);
     res.status(500).json({ error: 'Erro interno ao buscar vendas globais.' });
@@ -1294,119 +1274,9 @@ router.get('/my-sales', authenticateToken, async (req, res) => {
 
     const dataResult = await db.query(dataQuery, [...params, limit, offset]);
 
-    // ========== ENRICHMENT: Batch fetch thumbnails from ML Items API ==========
-    try {
-      const rows = dataResult.rows;
-      const thumbMap = {};
-
-      // Só o Mercado Livre precisa deste enriquecimento: a Shopee já traz a
-      // imagem no raw_api_data, e mandar um item_id da Shopee para a API do
-      // ML gastaria chamada para nada.
-      const byAccount = {};
-      for (const row of rows) {
-        if (row.marketplace === 'ML' && !row.product_thumbnail && row.ml_item_id) {
-          const acct = row.account_nickname || '__unknown__';
-          if (!byAccount[acct]) byAccount[acct] = new Set();
-          byAccount[acct].add(String(row.ml_item_id).toUpperCase());
-        }
-      }
-
-      const accountNames = Object.keys(byAccount);
-      if (accountNames.length > 0) {
-        const tokenResult = await db.query(
-          "SELECT access_token, nickname FROM public.ml_accounts WHERE status = 'active' ORDER BY updated_at DESC NULLS LAST"
-        );
-        const tokenByNickname = {};
-        const allTokens = [];
-        for (const t of tokenResult.rows) {
-          if (t.nickname && !tokenByNickname[t.nickname]) {
-            tokenByNickname[t.nickname] = t.access_token;
-          }
-          allTokens.push(t);
-        }
-
-        const BATCH_SIZE = 20;
-
-        const fetchThumbBatch = async (batch, headers) => {
-          const url = `https://api.mercadolibre.com/items?ids=${batch.join(',')}&attributes=id,thumbnail,secure_thumbnail`;
-          const res = await fetch(url, { headers });
-          if (!res.ok) return 0;
-          const data = await res.json();
-          let found = 0;
-          for (const entry of data) {
-            if (entry.code === 200 && entry.body) {
-              const thumb = entry.body.secure_thumbnail || entry.body.thumbnail;
-              if (thumb) {
-                thumbMap[String(entry.body.id).toUpperCase()] = thumb;
-                found++;
-              }
-            }
-          }
-          return found;
-        };
-
-        for (const acctName of accountNames) {
-          const itemIds = Array.from(byAccount[acctName]);
-          const ownToken = tokenByNickname[acctName];
-
-          for (let i = 0; i < itemIds.length; i += BATCH_SIZE) {
-            const batch = itemIds.slice(i, i + BATCH_SIZE);
-            const pending = batch.filter(id => !thumbMap[id]);
-            if (pending.length === 0) continue;
-
-            let tokenToUse = ownToken || (allTokens.length > 0 ? allTokens[0].access_token : null);
-            if (tokenToUse) {
-              try { await fetchThumbBatch(pending, { 'Authorization': `Bearer ${tokenToUse}` }); } catch (e) { }
-            }
-
-            const stillMissing = pending.filter(id => !thumbMap[id]);
-            for (const missing of stillMissing) {
-              thumbMap[missing] = 'not_found';
-            }
-
-            if (i + BATCH_SIZE < itemIds.length) {
-              await sleep(200);
-            }
-          }
-        }
-
-        const idsToCache = [];
-        let injected = 0;
-        for (const row of rows) {
-          // O cache grava em public.sales (id BIGINT); manter a guarda de
-          // marketplace evita tentar converter um order_sn da Shopee.
-          if (row.marketplace === 'ML' && !row.product_thumbnail && row.ml_item_id) {
-            const key = String(row.ml_item_id).toUpperCase();
-            if (thumbMap[key]) {
-              row.product_thumbnail = thumbMap[key] === 'not_found' ? null : thumbMap[key];
-              idsToCache.push({ id: row.id, sku: row.sku, uid: row.uid, thumb: thumbMap[key] });
-              if (thumbMap[key] !== 'not_found') injected++;
-            }
-          }
-        }
-
-        if (idsToCache.length > 0) {
-          setImmediate(async () => {
-            try {
-              for (const item of idsToCache) {
-                await db.query(
-                  `UPDATE public.sales
-                     SET raw_api_data = jsonb_set(
-                       COALESCE(raw_api_data, '{}')::jsonb,
-                       '{order_items,0,item,thumbnail}',
-                       $1::jsonb
-                     )
-                   WHERE id = $2 AND sku = $3 AND uid = $4`,
-                  [JSON.stringify(item.thumb), item.id, item.sku, uid]
-                );
-              }
-            } catch (cacheErr) {}
-          });
-        }
-      }
-    } catch (enrichErr) {}
-    // ========== END ENRICHMENT ==========
-
+    // Responde IMEDIATAMENTE com o que veio do banco. O enriquecimento de
+    // thumbnails do ML virou tarefa de fundo (ver warmMlThumbnailCache):
+    // fazê-lo aqui, antes da resposta, custava segundos por página.
     res.json({
       data: dataResult.rows,
       total,
@@ -1414,6 +1284,8 @@ router.get('/my-sales', authenticateToken, async (req, res) => {
       limit,
       totalPages: Math.ceil(total / limit) || 1
     });
+
+    setImmediate(() => warmMlThumbnailCache(dataResult.rows, uid));
   } catch (error) {
     console.error("Erro interno ao buscar minhas vendas:", error);
     res.status(500).json({ error: 'Erro interno ao buscar vendas.' });
