@@ -37,4 +37,19 @@ const requireMaster = (req, res, next) => {
     next();
 };
 
-module.exports = { authenticateToken, requireMaster };
+/**
+ * Middleware para rotas de autoatendimento: o próprio usuário pode acessar
+ * seus dados (uid da rota == uid do token) OU um master pode acessar
+ * qualquer usuário. Usado em recursos como status de venda e contratos, que
+ * o cliente comum precisa ver sobre si mesmo, mas não sobre terceiros.
+ * Deve ser usado *após* o middleware authenticateToken. Requer que a rota
+ * tenha um parâmetro `:uid`.
+ */
+const requireOwnerOrMaster = (req, res, next) => {
+    if (req.user.role === 'master' || req.user.uid === req.params.uid) {
+        return next();
+    }
+    return res.status(403).json({ error: 'Acesso negado. Você só pode acessar seus próprios dados.' });
+};
+
+module.exports = { authenticateToken, requireMaster, requireOwnerOrMaster };

@@ -1,7 +1,7 @@
 // backend/routes/users.js
 const express = require('express');
 const db = require('../utils/postgres');
-const { authenticateToken, requireMaster } = require('../utils/authMiddleware');
+const { authenticateToken, requireMaster, requireOwnerOrMaster } = require('../utils/authMiddleware');
 
 const router = express.Router();
 
@@ -166,9 +166,11 @@ router.delete('/:uid', authenticateToken, requireMaster, async (req, res) => {
 /**
  * @route   GET /api/users/statuses/:uid
  * @desc    Busca os status de venda personalizados de um usuário.
- * @access  Private (Master)
+ * @access  Private (o próprio usuário ou Master) — a Tabela de Vendas
+ *          chama esta rota com o uid do usuário logado para montar o
+ *          seletor de status de expedição.
  */
-router.get('/statuses/:uid', authenticateToken, requireMaster, async (req, res) => {
+router.get('/statuses/:uid', authenticateToken, requireOwnerOrMaster, async (req, res) => {
     const { uid } = req.params;
     try {
         const { rows } = await db.query("SELECT statuses FROM public.user_statuses WHERE user_id = $1", [uid]);
@@ -215,9 +217,11 @@ router.put('/statuses/:uid', authenticateToken, requireMaster, async (req, res) 
 /**
  * @route   GET /api/users/contracts/:uid
  * @desc    Busca todos os serviços contratados por um usuário.
- * @access  Private (Master)
+ * @access  Private (o próprio usuário ou Master) — o Dashboard e o
+ *          Armazenamento chamam esta rota com o uid do usuário logado para
+ *          calcular o volume contratado dele.
  */
-router.get('/contracts/:uid', authenticateToken, requireMaster, async (req, res) => {
+router.get('/contracts/:uid', authenticateToken, requireOwnerOrMaster, async (req, res) => {
     const { uid } = req.params;
     try {
         const query = `
