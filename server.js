@@ -4,6 +4,7 @@ require('dotenv').config();
 
 const express = require('express');
 const cors = require('cors');
+const compression = require('compression');
 
 const mainRouter = require('./router');
 const { initializeDatabase } = require('./utils/init-db');
@@ -12,6 +13,12 @@ const app = express();
 
 const PORT = process.env.PORT || 3001;
 const BODY_LIMIT = process.env.BODY_LIMIT || '10mb';
+
+// Compressão gzip das respostas. As listagens de venda retornam JSON grande
+// (dezenas de campos por linha) e sem isso o payload ia inteiro, sem
+// compactação — JSON costuma reduzir várias vezes de tamanho, então este é um
+// dos ganhos mais baratos de tempo de carregamento.
+app.use(compression());
 
 // CORS - Configuração Robusta
 app.use(cors({

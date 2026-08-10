@@ -463,6 +463,24 @@ async function syncDatabaseSchema() {
             FROM public.shopee_sales sp;
         `);
 
+        // ------------------------------------------------------------------
+        // Índice FUNCIONAL em public.skus.
+        //
+        // As telas de venda resolvem "SKU mapeado?" e a descrição interna com
+        // subconsultas por linha do tipo:
+        //   WHERE sk.user_id = $1 AND UPPER(TRIM(sk.sku)) = UPPER(TRIM(s.sku))
+        //
+        // Um índice comum em (sku) NÃO serve para uma comparação sobre
+        // UPPER(TRIM(sku)): o Postgres precisa do índice na MESMA expressão.
+        // Sem ele, cada linha da página fazia varredura completa de `skus`
+        // duas vezes (50 linhas = 100 varreduras por request), que era uma
+        // das causas da lentidão das telas de venda.
+        // ------------------------------------------------------------------
+        console.log('   -> Verificando índice funcional em public.skus...');
+        await client.query(
+            'CREATE INDEX IF NOT EXISTS idx_skus_user_upper_sku ON public.skus (user_id, UPPER(TRIM(sku)));'
+        );
+
         console.log('   -> Verificando índices de performance em public.shopee_sales...');
         await client.query('CREATE INDEX IF NOT EXISTS idx_shopee_sales_uid ON public.shopee_sales(uid);');
         await client.query('CREATE INDEX IF NOT EXISTS idx_shopee_sales_shop_id ON public.shopee_sales(shop_id);');

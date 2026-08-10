@@ -1095,6 +1095,42 @@ router.get('/all', authenticateToken, requireMaster, async (req, res) => {
   }
 });
 
+/**
+ * Payload bruto e completo de UMA venda, sob demanda.
+ *
+ * A listagem envia um raw_api_data enxuto por performance; quem precisa do
+ * JSON íntegro (modal "Ver JSON" do master) busca aqui, uma venda por vez.
+ */
+router.get('/raw/:marketplace/:id/:sku', authenticateToken, async (req, res) => {
+  const { marketplace, id, sku } = req.params;
+  const { uid, role } = req.user;
+  const isShopee = String(marketplace).toLowerCase() === 'shopee';
+
+  try {
+    const table = isShopee ? 'public.shopee_sales' : 'public.sales';
+    const idColumn = isShopee ? 'order_sn' : 'id';
+
+    // Usuário comum só vê o próprio pedido; master vê de qualquer um.
+    const conditions = [`${idColumn}::text = $1`, 'sku = $2'];
+    const params = [id, sku];
+    if (role !== 'master') {
+      conditions.push('uid = $3');
+      params.push(uid);
+    }
+
+    const { rows } = await db.query(
+      `SELECT raw_api_data FROM ${table} WHERE ${conditions.join(' AND ')} LIMIT 1`,
+      params
+    );
+    if (rows.length === 0) return res.status(404).json({ error: 'Venda não encontrada.' });
+
+    res.json({ raw_api_data: rows[0].raw_api_data });
+  } catch (error) {
+    console.error('Erro ao buscar payload bruto da venda:', error);
+    res.status(500).json({ error: 'Erro interno ao buscar dados da venda.' });
+  }
+});
+
 router.get('/user/:uid', authenticateToken, requireMaster, async (req, res) => {
   const { uid } = req.params;
   if (!uid) return res.status(400).json({ error: 'O UID do usuário é obrigatório.' });
@@ -1237,7 +1273,28 @@ router.get('/my-sales', authenticateToken, async (req, res) => {
         s.product_title, s.quantity, s.shipping_mode,
         s.shipping_deadline AS shipping_limit_date,
         s.shipping_status, s.updated_at, s.processed_at,
-        s.raw_api_data as raw_api_data,
+        -- raw_api_data ENXUTO: o payload completo do pedido chega a dezenas de
+        -- KB (shipping + sla + itens), e 50 linhas viravam megabytes para
+        -- trafegar e parsear no navegador a cada abertura da tela. Aqui vão
+        -- apenas os caminhos que a interface realmente lê (status, prazo,
+        -- envio, vendedor, comprador e tags), preservando o formato aninhado
+        -- para não exigir mudança no frontend. O payload íntegro continua no
+        -- banco e é buscado sob demanda em GET /sales/raw/:marketplace/:id/:sku.
+        jsonb_build_object(
+          'status', s.order_status,
+          'tags', COALESCE(s.raw_api_data->'tags', '[]'::jsonb),
+          'sla_data', jsonb_build_object('expected_date', s.shipping_deadline),
+          'shipping', jsonb_build_object(
+            'id', s.shipping_id,
+            'logistic_type', s.raw_api_data->'shipping'->>'logistic_type'
+          ),
+          'seller', jsonb_build_object('id', s.account_id),
+          'buyer', jsonb_build_object(
+            'first_name', s.buyer_name,
+            'last_name', NULL,
+            'nickname', s.buyer_nickname
+          )
+        ) AS raw_api_data,
         s.order_status as sale_status,
         s.shipping_id,
         s.shipping_deadline as sla_expected_date,
