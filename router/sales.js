@@ -1,7 +1,7 @@
 // routes/sales.js
 const express = require('express');
 const db = require('../utils/postgres');
-const { authenticateToken, requireMaster } = require('../utils/authMiddleware');
+const { authenticateToken, requireMaster, requireOwnerOrMaster } = require('../utils/authMiddleware');
 const fetch = require('node-fetch');
 const { mlFetch } = require('../utils/mlClient');
 
@@ -1287,19 +1287,41 @@ router.get('/raw/:marketplace/:id/:sku', authenticateToken, async (req, res) => 
   }
 });
 
-router.get('/user/:uid', authenticateToken, requireMaster, async (req, res) => {
+/**
+ * Últimas vendas de um usuário.
+ *
+ * Era master-only, mas a tela /armazenamento é de cliente comum e chama esta
+ * rota com o próprio uid — todo usuário não-master levava 403 ali. Mesmo caso
+ * de /users/statuses/:uid e /users/contracts/:uid: o dono vê os próprios
+ * dados, o master vê de qualquer um.
+ *
+ * Passou a ler de public.unified_sales para que as vendas Shopee também
+ * apareçam. Os apelidos de coluna mantêm o contrato antigo (`channel` e
+ * `shipping_limit_date`) para não mexer em quem já consome.
+ */
+router.get('/user/:uid', authenticateToken, requireOwnerOrMaster, async (req, res) => {
   const { uid } = req.params;
   if (!uid) return res.status(400).json({ error: 'O UID do usuário é obrigatório.' });
   try {
     const query = `
-      SELECT id, sku, uid, seller_id, channel, account_nickname, sale_date,
-        product_title, quantity, shipping_mode, shipping_limit_date,
-        packages, shipping_status, raw_api_data, updated_at, processed_at
-      FROM public.sales WHERE uid = $1 ORDER BY sale_date DESC LIMIT 250;
+      SELECT s.id, s.sku, s.uid,
+             s.account_id            AS seller_id,
+             s.marketplace,
+             s.marketplace           AS channel,
+             s.account_nickname, s.sale_date, s.product_title, s.quantity,
+             s.shipping_mode,
+             s.shipping_deadline     AS shipping_limit_date,
+             s.shipping_status, s.order_status, s.product_thumbnail,
+             s.raw_api_data, s.updated_at, s.processed_at
+      FROM public.unified_sales s
+      WHERE s.uid = $1
+      ORDER BY s.sale_date DESC
+      LIMIT 250;
     `;
     const { rows } = await db.query(query, [uid]);
     res.json(rows);
   } catch (error) {
+    console.error('Erro ao buscar vendas do usuário:', error);
     res.status(500).json({ error: 'Erro interno ao buscar vendas.' });
   }
 });
