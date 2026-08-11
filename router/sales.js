@@ -1096,6 +1096,162 @@ router.get('/all', authenticateToken, requireMaster, async (req, res) => {
 });
 
 /**
+ * Métricas agregadas do Dashboard.
+ *
+ * Antes o Dashboard pedia /my-sales?page=1&limit=50 e calculava tudo no
+ * navegador sobre essas 50 linhas: com milhares de vendas, os números
+ * exibidos estavam simplesmente errados (mostravam no máximo 50). Aqui a
+ * agregação é feita no banco, sobre TODO o período, e volta pronta.
+ *
+ * Filtros: período (from/to), marketplace e conta.
+ */
+router.get('/dashboard-stats', authenticateToken, async (req, res) => {
+  const { uid } = req.user;
+  const from = (req.query.from || '').trim();
+  const to = (req.query.to || '').trim();
+  const marketplace = (req.query.marketplace || '').trim();
+  const account = (req.query.account || '').trim();
+  const shippingStatus = (req.query.shippingStatus || '').trim();
+  const shippingMode = (req.query.shippingMode || '').trim();
+
+  const asList = (value) => value.split(',').map((v) => v.trim()).filter(Boolean);
+
+  try {
+    const conditions = ['s.uid = $1'];
+    const params = [uid];
+    let p = 2;
+
+    if (from) { conditions.push(`s.sale_date >= $${p}`); params.push(`${from}T00:00:00-03:00`); p++; }
+    if (to) { conditions.push(`s.sale_date <= $${p}`); params.push(`${to}T23:59:59.999-03:00`); p++; }
+    if (marketplace) {
+      conditions.push(`s.marketplace = ANY($${p})`); params.push(asList(marketplace)); p++;
+    }
+    if (account) {
+      conditions.push(`s.account_id = ANY($${p})`); params.push(asList(account)); p++;
+    }
+    // Os rótulos vêm das próprias agregações abaixo, então a comparação é
+    // exata contra a mesma expressão usada no GROUP BY.
+    if (shippingStatus) {
+      conditions.push(`COALESCE(NULLIF(s.shipping_status, ''), 'Pendente') = ANY($${p})`);
+      params.push(asList(shippingStatus)); p++;
+    }
+    if (shippingMode) {
+      conditions.push(`COALESCE(NULLIF(s.shipping_mode, ''), 'Outros') = ANY($${p})`);
+      params.push(asList(shippingMode)); p++;
+    }
+    const where = `WHERE ${conditions.join(' AND ')}`;
+
+    // Mesmo recorte, deslocado para o período imediatamente anterior de igual
+    // duração. Serve para os cards mostrarem a variação, em vez de um número
+    // solto sem referência.
+    let previousWhere = null;
+    const previousParams = [];
+    if (from && to) {
+      const start = new Date(`${from}T00:00:00Z`);
+      const end = new Date(`${to}T00:00:00Z`);
+      const days = Math.max(1, Math.round((end - start) / 86400000) + 1);
+      const prevEnd = new Date(start); prevEnd.setUTCDate(prevEnd.getUTCDate() - 1);
+      const prevStart = new Date(prevEnd); prevStart.setUTCDate(prevStart.getUTCDate() - (days - 1));
+      const iso = (d) => d.toISOString().slice(0, 10);
+
+      // Reaproveita as mesmas condições, trocando só os limites de data.
+      let q = 2;
+      const prevConditions = ['s.uid = $1'];
+      previousParams.push(uid);
+      prevConditions.push(`s.sale_date >= $${q}`); previousParams.push(`${iso(prevStart)}T00:00:00-03:00`); q++;
+      prevConditions.push(`s.sale_date <= $${q}`); previousParams.push(`${iso(prevEnd)}T23:59:59.999-03:00`); q++;
+      if (marketplace) { prevConditions.push(`s.marketplace = ANY($${q})`); previousParams.push(asList(marketplace)); q++; }
+      if (account) { prevConditions.push(`s.account_id = ANY($${q})`); previousParams.push(asList(account)); q++; }
+      if (shippingStatus) {
+        prevConditions.push(`COALESCE(NULLIF(s.shipping_status, ''), 'Pendente') = ANY($${q})`);
+        previousParams.push(asList(shippingStatus)); q++;
+      }
+      if (shippingMode) {
+        prevConditions.push(`COALESCE(NULLIF(s.shipping_mode, ''), 'Outros') = ANY($${q})`);
+        previousParams.push(asList(shippingMode)); q++;
+      }
+      previousWhere = `WHERE ${prevConditions.join(' AND ')}`;
+    }
+
+    // "A despachar" segue a mesma regra da tela de separação: o que ainda não
+    // foi enviado/entregue/cancelado.
+    const pendingExpr = `COALESCE(s.order_status, '') NOT IN ('shipped', 'delivered', 'not_delivered', 'cancelled', 'canceled')
+                         AND COALESCE(s.shipping_status, '') NOT IN ('shipped', 'delivered')`;
+
+    const [totals, byStatus, byDay, byMarketplace, byShippingMode, topSkus, previous] = await Promise.all([
+      db.query(
+        `SELECT
+           COUNT(*)::int AS sales,
+           COALESCE(SUM(s.quantity), 0)::int AS units,
+           COUNT(*) FILTER (WHERE ${pendingExpr})::int AS pending,
+           COUNT(*) FILTER (WHERE s.processed_at IS NOT NULL)::int AS processed,
+           COUNT(*) FILTER (WHERE COALESCE(s.order_status,'') IN ('cancelled','canceled'))::int AS cancelled,
+           COUNT(DISTINCT s.sku)::int AS distinct_skus
+         FROM public.unified_sales s ${where}`,
+        params
+      ),
+      db.query(
+        `SELECT COALESCE(NULLIF(s.shipping_status, ''), 'Pendente') AS label, COUNT(*)::int AS value
+         FROM public.unified_sales s ${where}
+         GROUP BY 1 ORDER BY value DESC LIMIT 9`,
+        params
+      ),
+      db.query(
+        // Dia no fuso de Brasília, para casar com o que o usuário vê na tela.
+        `SELECT (s.sale_date AT TIME ZONE 'America/Sao_Paulo')::date AS day, COUNT(*)::int AS value
+         FROM public.unified_sales s ${where}
+         GROUP BY 1 ORDER BY 1 ASC`,
+        params
+      ),
+      db.query(
+        `SELECT s.marketplace, COUNT(*)::int AS value
+         FROM public.unified_sales s ${where}
+         GROUP BY 1 ORDER BY value DESC`,
+        params
+      ),
+      db.query(
+        `SELECT COALESCE(NULLIF(s.shipping_mode, ''), 'Outros') AS mode, COUNT(*)::int AS value
+         FROM public.unified_sales s ${where}
+         GROUP BY 1 ORDER BY value DESC LIMIT 8`,
+        params
+      ),
+      db.query(
+        `SELECT s.sku,
+                (array_agg(s.product_title ORDER BY s.sale_date DESC))[1] AS title,
+                COALESCE(SUM(s.quantity), 0)::int AS units,
+                COUNT(*)::int AS orders
+         FROM public.unified_sales s ${where}
+         GROUP BY s.sku ORDER BY units DESC LIMIT 8`,
+        params
+      ),
+      previousWhere
+        ? db.query(
+            `SELECT COUNT(*)::int AS sales, COALESCE(SUM(s.quantity), 0)::int AS units
+             FROM public.unified_sales s ${previousWhere}`,
+            previousParams
+          )
+        : Promise.resolve({ rows: [] }),
+    ]);
+
+    res.json({
+      totals: totals.rows[0] || { sales: 0, units: 0, pending: 0, processed: 0, cancelled: 0, distinct_skus: 0 },
+      previousTotals: previous.rows[0] || null,
+      byStatus: byStatus.rows,
+      byDay: byDay.rows.map((r) => ({
+        day: r.day instanceof Date ? r.day.toISOString().slice(0, 10) : String(r.day).slice(0, 10),
+        value: r.value,
+      })),
+      byMarketplace: byMarketplace.rows,
+      byShippingMode: byShippingMode.rows,
+      topSkus: topSkus.rows,
+    });
+  } catch (error) {
+    console.error('Erro ao montar métricas do dashboard:', error);
+    res.status(500).json({ error: 'Erro interno ao carregar métricas.' });
+  }
+});
+
+/**
  * Payload bruto e completo de UMA venda, sob demanda.
  *
  * A listagem envia um raw_api_data enxuto por performance; quem precisa do
@@ -1176,9 +1332,14 @@ router.get('/my-sales', authenticateToken, async (req, res) => {
     const params = [uid];
     let paramIdx = 2;
 
+    // Os filtros de seleção múltipla chegam como lista separada por vírgula.
+    // Uma lista com um único item funciona igual ao filtro simples anterior,
+    // então o contrato antigo continua válido.
+    const asList = (value) => value.split(',').map((v) => v.trim()).filter(Boolean);
+
     if (marketplace) {
-      conditions.push(`s.marketplace = $${paramIdx}`);
-      params.push(marketplace);
+      conditions.push(`s.marketplace = ANY($${paramIdx})`);
+      params.push(asList(marketplace));
       paramIdx++;
     }
     if (search) {
@@ -1192,9 +1353,26 @@ router.get('/my-sales', authenticateToken, async (req, res) => {
       paramIdx++;
     }
     if (shippingStatus) {
-      conditions.push(`s.shipping_status = $${paramIdx}`);
-      params.push(shippingStatus);
-      paramIdx++;
+      // Comparação em minúsculas porque a tela monta as opções a partir de duas
+      // fontes (status configurados pelo usuário e valores vistos nas vendas),
+      // que divergem na caixa — "Pendente" x "pendente" precisa casar igual.
+      const wanted = asList(shippingStatus).map((v) => v.toLowerCase());
+
+      // "Cancelado" não é um status de expedição: vive em order_status. Sem esse
+      // desvio, escolher Cancelado no filtro devolvia lista vazia.
+      const wantsCancelled = wanted.includes('cancelled');
+      const shippingWanted = wanted.filter((v) => v !== 'cancelled');
+
+      const parts = [];
+      if (shippingWanted.length) {
+        parts.push(`LOWER(COALESCE(NULLIF(s.shipping_status, ''), 'Pendente')) = ANY($${paramIdx})`);
+        params.push(shippingWanted);
+        paramIdx++;
+      }
+      if (wantsCancelled) {
+        parts.push(`LOWER(COALESCE(s.order_status, '')) = 'cancelled'`);
+      }
+      if (parts.length) conditions.push(`(${parts.join(' OR ')})`);
     }
     if (saleStatus) {
       conditions.push(`s.order_status = $${paramIdx}`);
@@ -1213,9 +1391,10 @@ router.get('/my-sales', authenticateToken, async (req, res) => {
       paramIdx++;
     }
     if (account) {
-      conditions.push(`(s.account_id = $${paramIdx} OR s.account_nickname ILIKE $${paramIdx + 1})`);
-      params.push(account, `%${account}%`);
-      paramIdx += 2;
+      // Casa por identificador da conta (seller_id/shop_id) ou pelo apelido.
+      conditions.push(`(s.account_id = ANY($${paramIdx}) OR s.account_nickname = ANY($${paramIdx}))`);
+      params.push(asList(account));
+      paramIdx++;
     }
     if (buyer) {
       conditions.push(`(s.buyer_name ILIKE $${paramIdx} OR s.buyer_nickname ILIKE $${paramIdx})`);
@@ -1223,16 +1402,9 @@ router.get('/my-sales', authenticateToken, async (req, res) => {
       paramIdx++;
     }
     if (shippingMode) {
-      const modes = shippingMode.split(',').map(m => m.trim()).filter(Boolean);
-      if (modes.length === 1) {
-        conditions.push(`s.shipping_mode = $${paramIdx}`);
-        params.push(modes[0]);
-        paramIdx++;
-      } else if (modes.length > 1) {
-        conditions.push(`s.shipping_mode = ANY($${paramIdx})`);
-        params.push(modes);
-        paramIdx++;
-      }
+      conditions.push(`s.shipping_mode = ANY($${paramIdx})`);
+      params.push(asList(shippingMode));
+      paramIdx++;
     }
     if (shippingLimitStart) {
       conditions.push(`s.shipping_deadline >= $${paramIdx}`);
