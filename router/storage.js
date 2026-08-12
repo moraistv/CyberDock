@@ -26,6 +26,14 @@ const requireMaster = (req, res, next) => {
   next();
 };
 
+const requireOwnerOrMaster = (req, res, next) => {
+  const targetUid = req.params.userId || req.params.uid || req.body?.userId;
+  if (req.user.role !== 'master' && req.user.uid !== targetUid) {
+    return res.status(403).json({ error: 'Acesso negado.' });
+  }
+  next();
+};
+
 // --- ROTAS PARA TIPOS DE PACOTE (PACKAGE TYPES) ---
 
 // GET /api/storage/package-types - Listar todos os tipos de pacote
@@ -99,7 +107,7 @@ router.delete('/package-types/:id', authenticateToken, requireMaster, async (req
 });
 
 // --- ROTA DE CÁLCULO DE FATURAMENTO DE ARMAZENAMENTO ---
-router.get('/user/:userId/billing-summary', authenticateToken, requireMaster, async (req, res) => {
+router.get('/user/:userId/billing-summary', authenticateToken, requireOwnerOrMaster, async (req, res) => {
   const { userId } = req.params;
   try {
     const masterPricesQuery = `SELECT type, price FROM public.services WHERE type IN ('base_storage', 'additional_storage');`;
@@ -787,17 +795,43 @@ router.get('/user/:userId/movements', authenticateToken, async (req, res) => {
     return res.status(403).json({ error: 'Acesso negado.' });
   }
   try {
-    const query = `
-      SELECT 
-        sm.id, s.sku, sm.movement_type, sm.quantity_change, sm.reason, 
-        sm.related_sale_id, sm.created_at
+    const wantsPagination = req.query.page !== undefined || req.query.limit !== undefined;
+    const page = Math.max(1, parseInt(req.query.page, 10) || 1);
+    const limit = Math.min(100, Math.max(1, parseInt(req.query.limit, 10) || 25));
+    const offset = (page - 1) * limit;
+    const baseFrom = `
       FROM public.stock_movements sm
       JOIN public.skus s ON sm.sku_id = s.id
-      WHERE sm.user_id = $1
-      ORDER BY sm.created_at DESC
-    `;
-    const { rows } = await db.query(query, [userId]);
-    res.json(rows);
+      WHERE sm.user_id = $1`;
+
+    if (!wantsPagination) {
+      const { rows } = await db.query(`
+        SELECT sm.id, s.sku, sm.movement_type, sm.quantity_change, sm.reason,
+               sm.related_sale_id, sm.created_at
+        ${baseFrom}
+        ORDER BY sm.created_at DESC
+      `, [userId]);
+      return res.json(rows);
+    }
+
+    const [countResult, dataResult] = await Promise.all([
+      db.query(`SELECT COUNT(*)::int AS total ${baseFrom}`, [userId]),
+      db.query(`
+        SELECT sm.id, s.sku, sm.movement_type, sm.quantity_change, sm.reason,
+               sm.related_sale_id, sm.created_at
+        ${baseFrom}
+        ORDER BY sm.created_at DESC
+        LIMIT $2 OFFSET $3
+      `, [userId, limit, offset]),
+    ]);
+    const total = countResult.rows[0]?.total || 0;
+    res.json({
+      data: dataResult.rows,
+      total,
+      page,
+      limit,
+      totalPages: Math.ceil(total / limit) || 1,
+    });
   } catch (error) {
     console.error('Erro ao buscar todas as movimentações do usuário:', error);
     res.status(500).json({ error: 'Erro interno ao buscar movimentações.' });

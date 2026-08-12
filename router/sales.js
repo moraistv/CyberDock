@@ -1288,6 +1288,31 @@ router.get('/raw/:marketplace/:id/:sku', authenticateToken, async (req, res) => 
 });
 
 /**
+ * Contadores leves usados pelo painel de armazenamento. Evita transferir até
+ * 250 vendas (incluindo JSON) apenas para calcular um único número na tela.
+ */
+router.get('/user/:uid/stats', authenticateToken, requireOwnerOrMaster, async (req, res) => {
+  const { uid } = req.params;
+  try {
+    const { rows } = await db.query(`
+      SELECT
+        COUNT(*)::int AS total_sales,
+        COUNT(*) FILTER (
+          WHERE LOWER(COALESCE(shipping_status, '')) IN
+            ('custom_06_despachado', 'expedited', 'despachado', 'shipped')
+        )::int AS expedited_count,
+        COUNT(*) FILTER (WHERE processed_at IS NOT NULL)::int AS processed_count
+      FROM public.unified_sales
+      WHERE uid = $1
+    `, [uid]);
+    res.json(rows[0] || { total_sales: 0, expedited_count: 0, processed_count: 0 });
+  } catch (error) {
+    console.error('Erro ao buscar contadores de vendas do usuário:', error);
+    res.status(500).json({ error: 'Erro interno ao buscar contadores de vendas.' });
+  }
+});
+
+/**
  * Últimas vendas de um usuário.
  *
  * Era master-only, mas a tela /armazenamento é de cliente comum e chama esta
@@ -1451,12 +1476,9 @@ router.get('/my-sales', authenticateToken, async (req, res) => {
 
     const whereClause = 'WHERE ' + conditions.join(' AND ');
 
-    // Count total
+    // Count e página usam os mesmos filtros e são independentes; executá-los
+    // juntos elimina uma ida sequencial ao banco em toda troca de filtro.
     const countQuery = `SELECT COUNT(*) as total FROM public.unified_sales s ${whereClause}`;
-    const countResult = await db.query(countQuery, params);
-    const total = parseInt(countResult.rows[0].total);
-
-    // Fetch page. Os aliases mantêm os nomes que o frontend já consome
     // (seller_id, sale_status, shipping_limit_date, ml_item_id) para não
     // quebrar a tela existente ao trocar a origem para a view.
     const dataQuery = `
@@ -1523,7 +1545,11 @@ router.get('/my-sales', authenticateToken, async (req, res) => {
       LIMIT $${paramIdx} OFFSET $${paramIdx + 1};
     `;
 
-    const dataResult = await db.query(dataQuery, [...params, limit, offset]);
+    const [countResult, dataResult] = await Promise.all([
+      db.query(countQuery, params),
+      db.query(dataQuery, [...params, limit, offset]),
+    ]);
+    const total = parseInt(countResult.rows[0]?.total || '0', 10);
 
     // Responde IMEDIATAMENTE com o que veio do banco. O enriquecimento de
     // thumbnails do ML virou tarefa de fundo (ver warmMlThumbnailCache):
