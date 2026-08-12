@@ -39,6 +39,61 @@ const UPSERT_BATCH_SIZE = 300;
 
 const MAX_PROCESS_BATCH = 500;
 
+/* ----------------------- Cache curto do total de vendas -------------------
+ * O COUNT(*) da view unificada varre as duas tabelas de origem e era refeito
+ * em TODA requisição da tabela — inclusive ao trocar de página, quando o total
+ * não muda. Com TTL curto, paginar e reabrir a tela deixa de pagar esse custo
+ * e o número volta a se atualizar poucos segundos após uma sincronização.
+ */
+const salesCountCache = new Map();
+const salesCountInFlight = new Map();
+const SALES_COUNT_TTL_MS = 20000;
+const SALES_COUNT_CACHE_MAX = 500;
+
+function getCachedSalesCount(key) {
+  const hit = salesCountCache.get(key);
+  if (!hit) return null;
+  if (Date.now() - hit.at > SALES_COUNT_TTL_MS) {
+    salesCountCache.delete(key);
+    return null;
+  }
+  return hit.total;
+}
+
+function setCachedSalesCount(key, total) {
+  // O Map preserva ordem de inserção, então a primeira chave é a mais antiga.
+  if (salesCountCache.size >= SALES_COUNT_CACHE_MAX) {
+    const oldest = salesCountCache.keys().next().value;
+    if (oldest !== undefined) salesCountCache.delete(oldest);
+  }
+  salesCountCache.set(key, { total, at: Date.now() });
+}
+
+/**
+ * Executa no máximo um COUNT por combinação de filtros. A listagem não espera
+ * esta Promise: ela entrega a página assim que o LIMIT termina e a contagem é
+ * resolvida em segundo plano. Uma chamada countOnly pode aguardar a mesma
+ * Promise sem disparar outra varredura concorrente.
+ */
+function loadSalesCount(key, query, params) {
+  const cached = getCachedSalesCount(key);
+  if (cached !== null) return Promise.resolve(cached);
+
+  const running = salesCountInFlight.get(key);
+  if (running) return running;
+
+  const promise = db.query(query, params)
+    .then((result) => {
+      const total = parseInt(result.rows[0]?.total || '0', 10);
+      setCachedSalesCount(key, total);
+      return total;
+    })
+    .finally(() => salesCountInFlight.delete(key));
+
+  salesCountInFlight.set(key, promise);
+  return promise;
+}
+
 const sendEvent = (clientId, data) => {
   if (clients[clientId]) {
     clients[clientId].res.write(`data: ${JSON.stringify(data)}\n\n`);
@@ -310,7 +365,16 @@ function buildMultiInsertQuery_DoUpdate(rows) {
  * @param {Array} rows Linhas já retornadas ao cliente (não são mutadas).
  * @param {string|null} uid Quando informado, restringe o UPDATE a esse dono.
  */
+// Rolar a tabela dispara uma requisição por página, e cada uma agendava um
+// aquecimento em background. Vários deles ao mesmo tempo competiam pelas
+// conexões do pool com a própria consulta da tela. Um aquecimento por dono de
+// cada vez é suficiente, já que o resultado é gravado no banco.
+const warmingThumbnails = new Set();
+
 async function warmMlThumbnailCache(rows, uid = null) {
+  const warmKey = uid || '__all__';
+  if (warmingThumbnails.has(warmKey)) return;
+  warmingThumbnails.add(warmKey);
   try {
     // `marketplace` só existe nas linhas vindas da view unificada. Consultas
     // diretas em public.sales (ex.: /all) não têm o campo e são sempre ML.
@@ -393,6 +457,8 @@ async function warmMlThumbnailCache(rows, uid = null) {
     }
   } catch (err) {
     console.warn('[THUMB] Falha ao aquecer cache de thumbnails:', err.message);
+  } finally {
+    warmingThumbnails.delete(warmKey);
   }
 }
 
@@ -1105,48 +1171,196 @@ router.get('/all', authenticateToken, requireMaster, async (req, res) => {
  *
  * Filtros: período (from/to), marketplace e conta.
  */
+
+/* ------------------- Filtros canônicos da view unificada -------------------
+ * As expressões abaixo são usadas ao MESMO tempo no filtro, na agregação e na
+ * listagem de opções. Se filtro e rótulo divergirem, o usuário clica em algo
+ * que existe na tela e recebe lista vazia — foi o que acontecia com o rótulo
+ * genérico "Outros".
+ */
+const U_ACCOUNT_KEY = `(s.marketplace || ':' || COALESCE(s.account_id, ''))`;
+const U_SHIPPING_STATUS = `COALESCE(NULLIF(s.shipping_status, ''), 'Pendente')`;
+// Quando o ML não traz shipping_mode, a modalidade real está no logistic_type.
+// Sem isso, quase todo pedido caía num "Outros" que não dizia nada.
+const U_SHIPPING_MODE = `COALESCE(
+  NULLIF(s.shipping_mode, ''),
+  CASE WHEN s.marketplace = 'ML' THEN
+    CASE LOWER(COALESCE(s.raw_api_data->'shipping'->>'logistic_type', ''))
+      WHEN 'fulfillment'   THEN 'FULL'
+      WHEN 'self_service'  THEN 'FLEX'
+      WHEN 'cross_docking' THEN 'Coleta'
+      WHEN 'drop_off'      THEN 'Agência'
+      WHEN 'xd_drop_off'   THEN 'Agência'
+      ELSE NULL
+    END
+  END,
+  CASE WHEN s.marketplace = 'Shopee' THEN 'Shopee' END,
+  'Sem modalidade'
+)`;
+const U_OPERATIONAL_STATUS = `LOWER(COALESCE(
+  CASE WHEN s.marketplace = 'ML' THEN s.raw_api_data->'shipping'->>'status' END,
+  s.order_status,
+  s.shipping_status,
+  ''
+))`;
+const U_CANCELLED = `(${U_OPERATIONAL_STATUS} IN ('cancelled', 'canceled', 'in_cancel')
+   OR LOWER(COALESCE(s.order_status, '')) IN ('cancelled', 'canceled', 'in_cancel'))`;
+const U_PENDING = `(s.shipping_mode IS DISTINCT FROM 'FULL'
+   AND NOT ${U_CANCELLED}
+   AND ${U_OPERATIONAL_STATUS} NOT IN ('shipped', 'delivered', 'completed', 'not_delivered'))`;
+const U_SKU_MAPPED = `EXISTS (
+  SELECT 1 FROM public.skus sk
+   WHERE sk.user_id = s.uid
+     AND UPPER(TRIM(sk.sku)) = UPPER(TRIM(s.sku))
+     AND sk.ativo = TRUE
+)`;
+
+const asFilterList = (value) =>
+  String(value || '').split(',').map((v) => v.trim()).filter(Boolean);
+
+/**
+ * Monta o WHERE da view unificada a partir da query string.
+ *
+ * `skip` permite excluir um filtro específico: é isso que torna as opções
+ * dependentes entre si (cross-filtering). Ao listar as modalidades de envio,
+ * por exemplo, aplicamos conta e canal mas ignoramos a própria modalidade —
+ * assim escolher só contas Shopee faz as modalidades do ML desaparecerem.
+ *
+ * @param {object} query req.query
+ * @param {string} uid dono das vendas
+ * @param {{ skip?: string[], startIndex?: number, dateRange?: {from: string, to: string} }} options
+ */
+function buildUnifiedFilters(query, uid, options = {}) {
+  const { skip = [], startIndex = 1, dateRange = null } = options;
+  const uses = (name) => !skip.includes(name);
+
+  const conditions = [`s.uid = $${startIndex}`];
+  const params = [uid];
+  let p = startIndex + 1;
+
+  const from = dateRange ? dateRange.from : (query.from || '').trim();
+  const to = dateRange ? dateRange.to : (query.to || '').trim();
+
+  if (uses('period') && from) {
+    conditions.push(`s.sale_date >= $${p}`); params.push(`${from}T00:00:00-03:00`); p++;
+  }
+  if (uses('period') && to) {
+    conditions.push(`s.sale_date <= $${p}`); params.push(`${to}T23:59:59.999-03:00`); p++;
+  }
+
+  const marketplace = (query.marketplace || '').trim();
+  if (uses('marketplace') && marketplace) {
+    conditions.push(`s.marketplace = ANY($${p})`); params.push(asFilterList(marketplace)); p++;
+  }
+
+  const account = (query.account || '').trim();
+  if (uses('account') && account) {
+    // Aceita a chave nova com canal (ML:123 / Shopee:456) e também os formatos
+    // antigos (só o id ou o apelido), para não invalidar links salvos.
+    conditions.push(`(${U_ACCOUNT_KEY} = ANY($${p}) OR s.account_id = ANY($${p}) OR s.account_nickname = ANY($${p}))`);
+    params.push(asFilterList(account)); p++;
+  }
+
+  const shippingStatus = (query.shippingStatus || '').trim();
+  if (uses('shippingStatus') && shippingStatus) {
+    conditions.push(`${U_SHIPPING_STATUS} = ANY($${p})`); params.push(asFilterList(shippingStatus)); p++;
+  }
+
+  const shippingMode = (query.shippingMode || '').trim();
+  if (uses('shippingMode') && shippingMode) {
+    conditions.push(`${U_SHIPPING_MODE} = ANY($${p})`); params.push(asFilterList(shippingMode)); p++;
+  }
+
+  const saleStatus = (query.saleStatus || '').trim();
+  if (uses('saleStatus') && saleStatus) {
+    conditions.push(`LOWER(COALESCE(s.order_status, '')) = ANY($${p})`);
+    params.push(asFilterList(saleStatus).map((v) => v.toLowerCase())); p++;
+  }
+
+  const processed = (query.processed || '').trim();
+  if (uses('processed') && processed === 'yes') conditions.push('s.processed_at IS NOT NULL');
+  if (uses('processed') && processed === 'no') conditions.push('s.processed_at IS NULL');
+
+  const skuMapped = (query.skuMapped || '').trim();
+  if (uses('skuMapped') && skuMapped === 'yes') conditions.push(U_SKU_MAPPED);
+  if (uses('skuMapped') && skuMapped === 'no') conditions.push(`NOT ${U_SKU_MAPPED}`);
+
+  const queue = (query.queue || '').trim();
+  if (uses('queue') && queue === 'pending') conditions.push(U_PENDING);
+  if (uses('queue') && queue === 'cancelled') conditions.push(U_CANCELLED);
+  if (uses('queue') && queue === 'valid') conditions.push(`NOT ${U_CANCELLED}`);
+
+  return { where: `WHERE ${conditions.join(' AND ')}`, params, nextIndex: p };
+}
+
+/**
+ * Opções disponíveis para cada filtro, já considerando os outros filtros
+ * ativos. Cada faceta ignora apenas o próprio campo, de modo que o usuário
+ * nunca veja uma combinação que resultaria em lista vazia.
+ */
+router.get('/filter-facets', authenticateToken, async (req, res) => {
+  const { uid } = req.user;
+  try {
+    const facet = (skipName, keyExpr, extraSelect = '') => {
+      const { where, params } = buildUnifiedFilters(req.query, uid, { skip: [skipName] });
+      return db.query(
+        `SELECT ${keyExpr} AS value${extraSelect},
+                COUNT(DISTINCT (s.marketplace, COALESCE(s.account_id, ''), s.id))::int AS count
+           FROM public.unified_sales s
+           ${where}
+          GROUP BY 1${extraSelect ? ', 2' : ''}
+          ORDER BY count DESC
+          LIMIT 60`,
+        params
+      );
+    };
+
+    const [marketplaces, accounts, statuses, modes, saleStatuses] = await Promise.all([
+      facet('marketplace', 's.marketplace'),
+      facet('account', U_ACCOUNT_KEY, `, COALESCE(NULLIF(s.account_nickname, ''), s.account_id) AS label`),
+      facet('shippingStatus', U_SHIPPING_STATUS),
+      facet('shippingMode', U_SHIPPING_MODE),
+      facet('saleStatus', `LOWER(COALESCE(NULLIF(s.order_status, ''), 'sem_status'))`),
+    ]);
+
+    const MK_LABEL = { ML: 'Mercado Livre', Shopee: 'Shopee' };
+    res.json({
+      marketplaces: marketplaces.rows.map((r) => ({
+        value: r.value, label: MK_LABEL[r.value] || r.value, count: r.count,
+      })),
+      accounts: accounts.rows.map((r) => ({
+        value: r.value,
+        label: r.label || r.value,
+        marketplace: String(r.value || '').split(':')[0],
+        count: r.count,
+      })),
+      shippingStatuses: statuses.rows.map((r) => ({ value: r.value, label: r.value, count: r.count })),
+      shippingModes: modes.rows.map((r) => ({ value: r.value, label: r.value, count: r.count })),
+      saleStatuses: saleStatuses.rows.map((r) => ({ value: r.value, label: r.value, count: r.count })),
+    });
+  } catch (error) {
+    console.error('Erro ao montar opções de filtro:', error);
+    res.status(500).json({ error: 'Erro interno ao carregar opções de filtro.' });
+  }
+});
+
 router.get('/dashboard-stats', authenticateToken, async (req, res) => {
   const { uid } = req.user;
   const from = (req.query.from || '').trim();
   const to = (req.query.to || '').trim();
-  const marketplace = (req.query.marketplace || '').trim();
-  const account = (req.query.account || '').trim();
-  const shippingStatus = (req.query.shippingStatus || '').trim();
-  const shippingMode = (req.query.shippingMode || '').trim();
-
-  const asList = (value) => value.split(',').map((v) => v.trim()).filter(Boolean);
 
   try {
-    const conditions = ['s.uid = $1'];
-    const params = [uid];
-    let p = 2;
-
-    if (from) { conditions.push(`s.sale_date >= $${p}`); params.push(`${from}T00:00:00-03:00`); p++; }
-    if (to) { conditions.push(`s.sale_date <= $${p}`); params.push(`${to}T23:59:59.999-03:00`); p++; }
-    if (marketplace) {
-      conditions.push(`s.marketplace = ANY($${p})`); params.push(asList(marketplace)); p++;
-    }
-    if (account) {
-      conditions.push(`((s.marketplace || ':' || s.account_id) = ANY($${p}) OR s.account_id = ANY($${p}))`);
-      params.push(asList(account)); p++;
-    }
-    // Os rótulos vêm das próprias agregações abaixo, então a comparação é
-    // exata contra a mesma expressão usada no GROUP BY.
-    if (shippingStatus) {
-      conditions.push(`COALESCE(NULLIF(s.shipping_status, ''), 'Pendente') = ANY($${p})`);
-      params.push(asList(shippingStatus)); p++;
-    }
-    if (shippingMode) {
-      conditions.push(`COALESCE(NULLIF(s.shipping_mode, ''), 'Outros') = ANY($${p})`);
-      params.push(asList(shippingMode)); p++;
-    }
-    const where = `WHERE ${conditions.join(' AND ')}`;
+    // Mesmo construtor usado por /filter-facets: garante que o número do card
+    // e a opção clicada no filtro venham exatamente da mesma regra.
+    const current = buildUnifiedFilters(req.query, uid);
+    const where = current.where;
+    const params = current.params;
 
     // Mesmo recorte, deslocado para o período imediatamente anterior de igual
     // duração. Serve para os cards mostrarem a variação, em vez de um número
     // solto sem referência.
     let previousWhere = null;
-    const previousParams = [];
+    let previousParams = [];
     if (from && to) {
       const start = new Date(`${from}T00:00:00Z`);
       const end = new Date(`${to}T00:00:00Z`);
@@ -1155,46 +1369,22 @@ router.get('/dashboard-stats', authenticateToken, async (req, res) => {
       const prevStart = new Date(prevEnd); prevStart.setUTCDate(prevStart.getUTCDate() - (days - 1));
       const iso = (d) => d.toISOString().slice(0, 10);
 
-      // Reaproveita as mesmas condições, trocando só os limites de data.
-      let q = 2;
-      const prevConditions = ['s.uid = $1'];
-      previousParams.push(uid);
-      prevConditions.push(`s.sale_date >= $${q}`); previousParams.push(`${iso(prevStart)}T00:00:00-03:00`); q++;
-      prevConditions.push(`s.sale_date <= $${q}`); previousParams.push(`${iso(prevEnd)}T23:59:59.999-03:00`); q++;
-      if (marketplace) { prevConditions.push(`s.marketplace = ANY($${q})`); previousParams.push(asList(marketplace)); q++; }
-      if (account) {
-        prevConditions.push(`((s.marketplace || ':' || s.account_id) = ANY($${q}) OR s.account_id = ANY($${q}))`);
-        previousParams.push(asList(account)); q++;
-      }
-      if (shippingStatus) {
-        prevConditions.push(`COALESCE(NULLIF(s.shipping_status, ''), 'Pendente') = ANY($${q})`);
-        previousParams.push(asList(shippingStatus)); q++;
-      }
-      if (shippingMode) {
-        prevConditions.push(`COALESCE(NULLIF(s.shipping_mode, ''), 'Outros') = ANY($${q})`);
-        previousParams.push(asList(shippingMode)); q++;
-      }
-      previousWhere = `WHERE ${prevConditions.join(' AND ')}`;
+      // Mesmos filtros, apenas deslocando a janela de datas.
+      const previousFilters = buildUnifiedFilters(req.query, uid, {
+        dateRange: { from: iso(prevStart), to: iso(prevEnd) },
+      });
+      previousWhere = previousFilters.where;
+      previousParams = previousFilters.params;
     }
 
     // A view possui uma linha por SKU do pedido. Todos os indicadores de
     // pedidos precisam deduplicar por canal + conta + ID para não inflar os
     // números quando uma compra contém mais de um produto.
     const orderKey = `(s.marketplace, COALESCE(s.account_id, ''), s.id)`;
-    const operationalStatus = `LOWER(COALESCE(
-      CASE WHEN s.marketplace = 'ML' THEN s.raw_api_data->'shipping'->>'status' END,
-      s.order_status,
-      s.shipping_status,
-      ''
-    ))`;
-    const cancelledExpr = `${operationalStatus} IN ('cancelled', 'canceled', 'in_cancel')
-                           OR LOWER(COALESCE(s.order_status, '')) IN ('cancelled', 'canceled', 'in_cancel')`;
-    // Mesma intenção operacional da separação: FULL e pedidos já enviados,
-    // entregues ou cancelados não entram em "a despachar".
-    const pendingExpr = `s.shipping_mode IS DISTINCT FROM 'FULL'
-                         AND NOT (${cancelledExpr})
-                         AND ${operationalStatus} NOT IN
-                           ('shipped', 'delivered', 'completed', 'not_delivered')`;
+    // Cancelamento e fila de despacho vêm das expressões canônicas, as mesmas
+    // que o filtro `queue` aplica — card e filtro nunca divergem.
+    const cancelledExpr = U_CANCELLED;
+    const pendingExpr = U_PENDING;
 
     const [totals, byStatus, byDay, byMarketplace, byShippingMode, topSkus, previous] = await Promise.all([
       db.query(
@@ -1215,7 +1405,7 @@ router.get('/dashboard-stats', authenticateToken, async (req, res) => {
         params
       ),
       db.query(
-        `SELECT COALESCE(NULLIF(s.shipping_status, ''), 'Pendente') AS label,
+        `SELECT ${U_SHIPPING_STATUS} AS label,
                 COUNT(DISTINCT ${orderKey})::int AS value
          FROM public.unified_sales s ${where}
          GROUP BY 1 ORDER BY value DESC LIMIT 9`,
@@ -1236,7 +1426,7 @@ router.get('/dashboard-stats', authenticateToken, async (req, res) => {
         params
       ),
       db.query(
-        `SELECT COALESCE(NULLIF(s.shipping_mode, ''), 'Outros') AS mode,
+        `SELECT ${U_SHIPPING_MODE} AS mode,
                 COUNT(DISTINCT ${orderKey})::int AS value
          FROM public.unified_sales s ${where}
          GROUP BY 1 ORDER BY value DESC LIMIT 8`,
@@ -1488,7 +1678,9 @@ router.get('/my-sales', authenticateToken, async (req, res) => {
       paramIdx++;
     }
     if (shippingMode) {
-      conditions.push(`s.shipping_mode = ANY($${paramIdx})`);
+      // Mesma expressão das opções de filtro: sem isso, um chip legítimo como
+      // "Agência" (derivado do logistic_type do ML) não casaria com nada.
+      conditions.push(`${U_SHIPPING_MODE} = ANY($${paramIdx})`);
       params.push(asList(shippingMode));
       paramIdx++;
     }
@@ -1513,14 +1705,33 @@ router.get('/my-sales', authenticateToken, async (req, res) => {
       conditions.push(`s.processed_at IS NULL`);
     }
 
+    // Combinações operacionais adicionais, com a MESMA regra usada nos cards do
+    // dashboard: fila de despacho, cancelados e SKU ainda sem cadastro.
+    const queue = (req.query.queue || '').trim();
+    if (queue === 'pending') conditions.push(U_PENDING);
+    else if (queue === 'cancelled') conditions.push(U_CANCELLED);
+    else if (queue === 'valid') conditions.push(`NOT ${U_CANCELLED}`);
+
+    const skuMapped = (req.query.skuMapped || '').trim();
+    if (skuMapped === 'yes') conditions.push(U_SKU_MAPPED);
+    else if (skuMapped === 'no') conditions.push(`NOT ${U_SKU_MAPPED}`);
+
     const whereClause = 'WHERE ' + conditions.join(' AND ');
 
     // Count e página usam os mesmos filtros e são independentes; executá-los
     // juntos elimina uma ida sequencial ao banco em toda troca de filtro.
     const countQuery = `SELECT COUNT(*) as total FROM public.unified_sales s ${whereClause}`;
-    // (seller_id, sale_status, shipping_limit_date, ml_item_id) para não
-    // quebrar a tela existente ao trocar a origem para a view.
+    // Primeiro recorta somente a página pedida. O MATERIALIZED é intencional:
+    // garante que lookup de SKU, expansão de JSON e montagem do payload sejam
+    // executados para no máximo limit + 1 linhas, nunca para todo o histórico.
     const dataQuery = `
+      WITH page_rows AS MATERIALIZED (
+        SELECT s.*
+          FROM public.unified_sales s
+          ${whereClause}
+         ORDER BY s.sale_date DESC, s.marketplace, s.id, s.sku
+         LIMIT $${paramIdx} OFFSET $${paramIdx + 1}
+      )
       SELECT s.id, s.sku, s.uid, s.marketplace,
         s.marketplace AS channel,
         s.account_id AS seller_id,
@@ -1529,12 +1740,7 @@ router.get('/my-sales', authenticateToken, async (req, res) => {
         s.shipping_deadline AS shipping_limit_date,
         s.shipping_status, s.updated_at, s.processed_at,
         -- raw_api_data ENXUTO: o payload completo do pedido chega a dezenas de
-        -- KB (shipping + sla + itens), e 50 linhas viravam megabytes para
-        -- trafegar e parsear no navegador a cada abertura da tela. Aqui vão
-        -- apenas os caminhos que a interface realmente lê (status, prazo,
-        -- envio, vendedor, comprador e tags), preservando o formato aninhado
-        -- para não exigir mudança no frontend. O payload íntegro continua no
-        -- banco e é buscado sob demanda em GET /sales/raw/:marketplace/:id/:sku.
+        -- KB. Apenas os caminhos efetivamente usados pela tela seguem aqui.
         jsonb_build_object(
           'status', s.order_status,
           'tags', COALESCE(s.raw_api_data->'tags', '[]'::jsonb),
@@ -1559,16 +1765,8 @@ router.get('/my-sales', authenticateToken, async (req, res) => {
         s.buyer_name as buyer_first_name,
         NULL::text as buyer_last_name,
         s.buyer_nickname,
-        EXISTS (SELECT 1 FROM public.skus sk WHERE sk.user_id = $1 AND UPPER(TRIM(sk.sku)) = UPPER(TRIM(s.sku)) AND sk.ativo = true) as is_sku_mapped,
-        -- Descrição interna cadastrada no Armazenamento (prioridade 1 na exibição)
-        (SELECT sk.descricao FROM public.skus sk
-          WHERE sk.user_id = $1
-            AND UPPER(TRIM(sk.sku)) = UPPER(TRIM(s.sku))
-            AND sk.descricao IS NOT NULL AND TRIM(sk.descricao) <> ''
-          ORDER BY sk.ativo DESC
-          LIMIT 1) AS sku_descricao,
-        -- Variação escolhida na venda (cor, tamanho...). Só o ML publica
-        -- variation_attributes; na Shopee a variação vem no nome do modelo.
+        COALESCE(skm.mapped, false) AS is_sku_mapped,
+        skm.descricao AS sku_descricao,
         CASE WHEN s.marketplace = 'ML' THEN COALESCE(
           (SELECT oi->'item'->'variation_attributes'
              FROM jsonb_array_elements(COALESCE(s.raw_api_data->'order_items', '[]'::jsonb)) oi
@@ -1578,30 +1776,69 @@ router.get('/my-sales', authenticateToken, async (req, res) => {
              FROM jsonb_array_elements(COALESCE(s.raw_api_data->'order_items', '[]'::jsonb)) oi
             LIMIT 1)
         ) END AS variation_attributes
-      FROM public.unified_sales s
-      ${whereClause}
-      ORDER BY s.sale_date DESC
-      LIMIT $${paramIdx} OFFSET $${paramIdx + 1};
+      FROM page_rows s
+      LEFT JOIN LATERAL (
+        SELECT
+          bool_or(sk.ativo) AS mapped,
+          (array_agg(sk.descricao ORDER BY sk.ativo DESC)
+             FILTER (WHERE sk.descricao IS NOT NULL AND TRIM(sk.descricao) <> ''))[1] AS descricao
+        FROM public.skus sk
+        WHERE sk.user_id = $1
+          AND UPPER(TRIM(sk.sku)) = UPPER(TRIM(s.sku))
+      ) skm ON TRUE
+      ORDER BY s.sale_date DESC, s.marketplace, s.id, s.sku;
     `;
 
-    const [countResult, dataResult] = await Promise.all([
-      db.query(countQuery, params),
-      db.query(dataQuery, [...params, limit, offset]),
-    ]);
-    const total = parseInt(countResult.rows[0]?.total || '0', 10);
+    // A página rápida nunca aguarda o COUNT do histórico. `countOnly=1` é
+    // chamado em segundo plano pelo frontend e compartilha a mesma Promise de
+    // contagem, evitando varreduras duplicadas.
+    const countKey = `${uid}|${whereClause}|${JSON.stringify(params)}`;
+    const cachedTotal = getCachedSalesCount(countKey);
 
-    // Responde IMEDIATAMENTE com o que veio do banco. O enriquecimento de
-    // thumbnails do ML virou tarefa de fundo (ver warmMlThumbnailCache):
-    // fazê-lo aqui, antes da resposta, custava segundos por página.
+    if (req.query.countOnly === '1') {
+      const total = cachedTotal === null
+        ? await loadSalesCount(countKey, countQuery, params)
+        : cachedTotal;
+      return res.json({ total, totalPages: Math.ceil(total / limit) || 1 });
+    }
+
+    // Busca uma linha extra para descobrir se existe próxima página sem COUNT.
+    const dataResult = await db.query(dataQuery, [...params, limit + 1, offset]);
+    const hasNext = dataResult.rows.length > limit;
+    const rows = hasNext ? dataResult.rows.slice(0, limit) : dataResult.rows;
+
+    let total = cachedTotal;
+    let totalExact = cachedTotal !== null;
+
+    // Se não veio a linha extra, esta é a última página e o total já é exato.
+    if (total === null && !hasNext) {
+      total = offset + rows.length;
+      totalExact = true;
+      setCachedSalesCount(countKey, total);
+    }
+
+    // Enquanto a contagem exata aquece, devolve um limite inferior suficiente
+    // para a UI habilitar "Próximo" e renderizar os dados imediatamente.
+    if (total === null) total = offset + rows.length + 1;
+
     res.json({
-      data: dataResult.rows,
+      data: rows,
       total,
+      totalExact,
+      hasNext,
       page,
       limit,
-      totalPages: Math.ceil(total / limit) || 1
+      totalPages: totalExact ? (Math.ceil(total / limit) || 1) : page + 1,
     });
 
-    setImmediate(() => warmMlThumbnailCache(dataResult.rows, uid));
+    if (!totalExact) {
+      setImmediate(() => {
+        loadSalesCount(countKey, countQuery, params).catch((error) => {
+          console.error('Erro ao aquecer total de vendas:', error);
+        });
+      });
+    }
+    setImmediate(() => warmMlThumbnailCache(rows, uid));
   } catch (error) {
     console.error("Erro interno ao buscar minhas vendas:", error);
     res.status(500).json({ error: 'Erro interno ao buscar vendas.' });
