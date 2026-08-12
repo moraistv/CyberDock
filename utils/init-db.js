@@ -67,7 +67,8 @@ const schema = {
             shipping_status VARCHAR(100) DEFAULT 'Pendente',
             raw_api_data JSONB,
             updated_at TIMESTAMP WITH TIME ZONE,
-            processed_at TIMESTAMP WITH TIME ZONE
+            processed_at TIMESTAMP WITH TIME ZONE,
+            UNIQUE (id, sku, uid)
         );`,
     system_settings: `
         CREATE TABLE public.system_settings (
@@ -141,6 +142,7 @@ const schema = {
             quantity_change INTEGER NOT NULL,
             reason TEXT,
             related_sale_id BIGINT,
+            external_sale_id VARCHAR(100),
             package_type_id INTEGER REFERENCES public.package_types(id),
             package_type_context TEXT,
             created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
@@ -317,6 +319,15 @@ async function syncDatabaseSchema() {
                         console.log(`   -> Adicionando coluna 'package_type_context' à tabela: public.stock_movements`);
                         await client.query('ALTER TABLE public.stock_movements ADD COLUMN package_type_context TEXT;');
                     }
+
+                    // Pedidos Shopee são alfanuméricos e não cabem em
+                    // related_sale_id (BIGINT). Este vínculo mantém o ID
+                    // externo pesquisável sem alterar o contrato legado do ML.
+                    const externalSaleIdColRes = await client.query(`SELECT 1 FROM information_schema.columns WHERE table_schema = 'public' AND table_name = 'stock_movements' AND column_name = 'external_sale_id'`);
+                    if (externalSaleIdColRes.rowCount === 0) {
+                        console.log(`   -> Adicionando coluna 'external_sale_id' à tabela: public.stock_movements`);
+                        await client.query('ALTER TABLE public.stock_movements ADD COLUMN external_sale_id VARCHAR(100);');
+                    }
                 }
             }
         }
@@ -348,12 +359,20 @@ async function syncDatabaseSchema() {
                      COALESCE(raw_api_data->>'status','') || '|' ||
                      COALESCE(raw_api_data->'shipping'->>'status','') || '|' ||
                      COALESCE(raw_api_data->'shipping'->>'substatus','') || '|' ||
-                     COALESCE((SELECT string_agg(t, ',' ORDER BY t)
-                                 FROM jsonb_array_elements_text(raw_api_data->'tags') t), '')
+                     COALESCE(
+                       CASE
+                         WHEN jsonb_typeof(raw_api_data->'tags') = 'array'
+                         THEN (SELECT string_agg(t, ',' ORDER BY t)
+                                 FROM jsonb_array_elements_text(raw_api_data->'tags') t)
+                         ELSE ''
+                       END,
+                       ''
+                     )
              WHERE sync_signature IS NULL
                AND raw_api_data IS NOT NULL;
         `);
 
+        await client.query('CREATE UNIQUE INDEX IF NOT EXISTS idx_sales_id_sku_uid_unique ON public.sales(id, sku, uid);');
         await client.query('CREATE INDEX IF NOT EXISTS idx_sales_seller_id ON public.sales(seller_id);');
         await client.query('CREATE INDEX IF NOT EXISTS idx_sales_sale_date ON public.sales(sale_date DESC);');
         await client.query(`CREATE INDEX IF NOT EXISTS idx_sales_status ON public.sales((raw_api_data->>'status'));`);
@@ -449,14 +468,26 @@ async function syncDatabaseSchema() {
                 sp.updated_at,
                 sp.order_status,
                 NULL::text                              AS shipping_id,
-                sp.raw_api_data->'item_list'->0->'image_info'->>'image_url' AS product_thumbnail,
+                COALESCE(
+                    sp.raw_api_data->'synced_item',
+                    sp.raw_api_data->'item_list'->0
+                )->'image_info'->>'image_url'              AS product_thumbnail,
                 CASE
-                    WHEN sp.raw_api_data->'item_list'->0->>'item_id' IS NOT NULL
+                    WHEN COALESCE(
+                        sp.raw_api_data->'synced_item',
+                        sp.raw_api_data->'item_list'->0
+                    )->>'item_id' IS NOT NULL
                     THEN 'https://shopee.com.br/product/' || sp.shop_id::text || '/' ||
-                         (sp.raw_api_data->'item_list'->0->>'item_id')
+                         (COALESCE(
+                            sp.raw_api_data->'synced_item',
+                            sp.raw_api_data->'item_list'->0
+                         )->>'item_id')
                     ELSE NULL
                 END                                     AS product_permalink,
-                sp.raw_api_data->'item_list'->0->>'item_id'             AS item_id,
+                COALESCE(
+                    sp.raw_api_data->'synced_item',
+                    sp.raw_api_data->'item_list'->0
+                )->>'item_id'                           AS item_id,
                 sp.recipient_name                       AS buyer_name,
                 sp.buyer_username                       AS buyer_nickname,
                 sp.raw_api_data                         AS raw_api_data

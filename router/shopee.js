@@ -261,7 +261,7 @@ async function withTokenRetry(account, op, partnerId, partnerKey) {
 const MAX_WINDOW_DAYS = 15;
 
 /** Busca + enriquece pedidos de uma janela (list -> detail -> escrow). */
-async function fetchWindowOrders(account, from, to, partnerId, partnerKey) {
+async function fetchWindowOrders(account, from, to, partnerId, partnerKey, timeRangeField = 'create_time') {
   const orderSnList = [];
   let cursor;
   do {
@@ -275,6 +275,7 @@ async function fetchWindowOrders(account, from, to, partnerId, partnerKey) {
           shopId: account.shopId,
           createTimeFrom: epochSeconds(from),
           createTimeTo: epochSeconds(to),
+          timeRangeField,
           pageSize: 100,
           cursor,
         }),
@@ -329,14 +330,14 @@ async function fetchWindowOrders(account, from, to, partnerId, partnerKey) {
 }
 
 /** Percorre janelas de tempo desde `since` até agora. */
-async function fetchOrdersSince(account, since, partnerId, partnerKey, onProgress) {
+async function fetchOrdersSince(account, since, partnerId, partnerKey, onProgress, timeRangeField = 'create_time') {
   const all = [];
   const MAX_ORDERS_PER_SHOP = 10000;
   const now = new Date();
   let windowStart = since;
   while (windowStart < now && all.length < MAX_ORDERS_PER_SHOP) {
     const windowEnd = new Date(Math.min(windowStart.getTime() + MAX_WINDOW_DAYS * 86400000, now.getTime()));
-    const orders = await fetchWindowOrders(account, windowStart, windowEnd, partnerId, partnerKey);
+    const orders = await fetchWindowOrders(account, windowStart, windowEnd, partnerId, partnerKey, timeRangeField);
     all.push(...orders);
     if (onProgress) onProgress(all.length);
     windowStart = new Date(windowEnd.getTime() + 1);
@@ -349,48 +350,82 @@ function roundCurrency(value) {
   return Object.is(rounded, -0) ? 0 : rounded;
 }
 
-/** SKU do primeiro item do pedido. */
-function firstSkuOfOrder(order) {
-  const itemList = Array.isArray(order.item_list) ? order.item_list : [];
-  const firstItem = itemList[0] || {};
-  const skuRaw = firstItem.item_sku || firstItem.model_sku || firstItem.variation_sku || null;
-  return skuRaw ? truncate(String(skuRaw), 255) : null;
+/** SKU normalizado de um item Shopee. */
+function skuOfItem(item, orderSn) {
+  const skuRaw = item?.item_sku || item?.model_sku || item?.variation_sku;
+  if (skuRaw) return truncate(String(skuRaw).trim(), 255);
+
+  // Pedidos sem SKU cadastrado ainda precisam de uma chave estável por item,
+  // sem colapsar todos os produtos do pedido na mesma linha.
+  const fallback = [item?.item_id, item?.model_id].filter(Boolean).join('-');
+  return truncate(fallback || String(orderSn), 255);
 }
 
-/** Custo (mais recente) de cada SKU, em lote, para o CMV — reaproveita public.skus. */
-async function fetchCostBySku(skus, uid) {
-  const map = new Map();
-  const unique = Array.from(new Set(skus.filter(Boolean)));
-  if (unique.length === 0) return map;
+function quantityOfItem(item) {
+  const value =
+    toFiniteNumber(item?.model_quantity_purchased) ??
+    toFiniteNumber(item?.quantity_purchased) ??
+    toFiniteNumber(item?.quantity) ??
+    1;
+  return Math.max(1, Math.trunc(value));
+}
 
-  const { rows } = await db.query(
-    `SELECT sku, quantidade FROM public.skus WHERE user_id = $1 AND UPPER(TRIM(sku)) = ANY($2::text[])`,
-    [uid, unique.map((s) => s.toUpperCase().trim())]
+function unitValueOfItem(item, fallback = 0) {
+  return (
+    toFiniteNumber(item?.model_discounted_price) ??
+    toFiniteNumber(item?.discounted_price) ??
+    toFiniteNumber(item?.model_original_price) ??
+    toFiniteNumber(item?.original_price) ??
+    toFiniteNumber(item?.price) ??
+    fallback
   );
-  for (const r of rows) map.set(r.sku.toUpperCase().trim(), { quantity: r.quantidade });
-  return map;
 }
 
-/** Mapeia um pedido enriquecido para uma linha de upsert em shopee_sales. */
-function orderToRow(order, account, nickname) {
+/**
+ * Mapeia um pedido para uma linha por SKU. A chave de shopee_sales já é
+ * (order_sn, sku, uid), então itens repetidos do mesmo SKU são agrupados.
+ * Valores financeiros do pedido são rateados proporcionalmente, preservando
+ * exatamente os totais na soma das linhas (o resíduo fica na última linha).
+ */
+function orderToRows(order, account, nickname) {
   const orderSn = String(order.order_sn);
   const dataVenda = toSaoPauloWallClock(toFiniteNumber(order.create_time) ?? 0);
-  const itemList = Array.isArray(order.item_list) ? order.item_list : [];
+  const itemList = Array.isArray(order.item_list) && order.item_list.length
+    ? order.item_list
+    : [{}];
   const fin = calculateShopeeFinancials(order);
+  const grouped = new Map();
 
-  const titulo = truncate(itemList[0]?.item_name, 500) || 'Pedido';
-  const firstItem = itemList[0] || {};
-  const sku = firstSkuOfOrder(order) || String(firstItem.item_id || orderSn);
+  for (const item of itemList) {
+    const sku = skuOfItem(item, orderSn);
+    const key = sku.toUpperCase().trim();
+    const quantity = quantityOfItem(item);
+    const unitValue = unitValueOfItem(item, fin.unitPrice || 0);
+    const current = grouped.get(key) || {
+      sku,
+      quantity: 0,
+      baseValue: 0,
+      title: truncate(item?.item_name || item?.model_name, 500) || 'Pedido',
+      item,
+    };
+    current.quantity += quantity;
+    current.baseValue += Math.max(0, unitValue * quantity);
+    grouped.set(key, current);
+  }
+
+  const groups = Array.from(grouped.values());
+  const totalBase = groups.reduce((sum, group) => sum + group.baseValue, 0);
+  const totalQuantity = groups.reduce((sum, group) => sum + group.quantity, 0) || 1;
+  const allocated = { totalAmount: 0, platformFee: 0, freight: 0, netRevenue: 0 };
+
   const recipient = rec(order.recipient_address);
   const comprador = truncate(order.buyer_username, 255) || 'Comprador';
   const recipientName = truncate(recipient.name, 255) || null;
   const shipByDateRaw = toFiniteNumber(order.ship_by_date);
   const shipByDate = shipByDateRaw && shipByDateRaw > 0 ? new Date(shipByDateRaw * 1000) : null;
-
   const pkg = rec((order.package_list || [])[0]);
   const trackingNumber = truncate(pkg.tracking_number, 255) || null;
   const shippingCarrier = truncate(pkg.shipping_carrier || order.shipping_carrier, 100) || null;
-
   const paymentDetailsExtended = {
     ...rec(order.escrow_details),
     financialRuleVersion: SHOPEE_FINANCIAL_RULE_VERSION,
@@ -404,28 +439,53 @@ function orderToRow(order, account, nickname) {
     ...pkg,
   };
 
-  return {
-    orderSn,
-    sku,
-    uid: account.uid,
-    shopId: account.shopId,
-    accountNickname: nickname,
-    saleDate: dataVenda,
-    productTitle: titulo,
-    quantity: fin.quantity || 1,
-    unitPrice: fin.unitPrice,
-    totalAmount: fin.effectiveProductSubtotal,
-    platformFee: fin.platformFee,
-    freight: fin.freight,
-    netRevenue: fin.netRevenue,
-    orderStatus: String(order.order_status || 'DESCONHECIDO'),
-    buyerUsername: comprador,
-    recipientName,
-    trackingNumber,
-    shippingCarrier,
-    shipByDate,
-    rawApiData: { ...order, paymentDetails: paymentDetailsExtended, shipmentDetails: shipmentDetailsExtended },
+  const allocate = (total, key, weight, isLast) => {
+    if (total === null || total === undefined) return null;
+    const value = isLast
+      ? roundCurrency(total - allocated[key])
+      : roundCurrency(total * weight);
+    allocated[key] = roundCurrency(allocated[key] + value);
+    return value;
   };
+
+  return groups.map((group, index) => {
+    const isLast = index === groups.length - 1;
+    const weight = totalBase > 0
+      ? group.baseValue / totalBase
+      : group.quantity / totalQuantity;
+    const totalAmount = allocate(fin.effectiveProductSubtotal, 'totalAmount', weight, isLast) || 0;
+    const platformFee = allocate(fin.platformFee, 'platformFee', weight, isLast);
+    const freight = allocate(fin.freight, 'freight', weight, isLast) || 0;
+    const netRevenue = allocate(fin.netRevenue, 'netRevenue', weight, isLast) || 0;
+
+    return {
+      orderSn,
+      sku: group.sku,
+      uid: account.uid,
+      shopId: account.shopId,
+      accountNickname: nickname,
+      saleDate: dataVenda,
+      productTitle: group.title,
+      quantity: group.quantity,
+      unitPrice: roundCurrency(totalAmount / group.quantity),
+      totalAmount,
+      platformFee,
+      freight,
+      netRevenue,
+      orderStatus: String(order.order_status || 'DESCONHECIDO'),
+      buyerUsername: comprador,
+      recipientName,
+      trackingNumber,
+      shippingCarrier,
+      shipByDate,
+      rawApiData: {
+        ...order,
+        synced_item: group.item,
+        paymentDetails: paymentDetailsExtended,
+        shipmentDetails: shipmentDetailsExtended,
+      },
+    };
+  });
 }
 
 const UPSERT_QUERY = `
@@ -436,18 +496,30 @@ const UPSERT_QUERY = `
     shipping_carrier, ship_by_date, raw_api_data, updated_at
   ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,NOW())
   ON CONFLICT (order_sn, sku, uid) DO UPDATE SET
+    account_nickname = EXCLUDED.account_nickname,
+    sale_date        = EXCLUDED.sale_date,
+    product_title    = CASE WHEN public.shopee_sales.processed_at IS NULL THEN EXCLUDED.product_title ELSE public.shopee_sales.product_title END,
+    quantity         = CASE WHEN public.shopee_sales.processed_at IS NULL THEN EXCLUDED.quantity ELSE public.shopee_sales.quantity END,
+    unit_price       = CASE WHEN public.shopee_sales.processed_at IS NULL THEN EXCLUDED.unit_price ELSE public.shopee_sales.unit_price END,
+    total_amount     = CASE WHEN public.shopee_sales.processed_at IS NULL THEN EXCLUDED.total_amount ELSE public.shopee_sales.total_amount END,
+    platform_fee     = CASE WHEN public.shopee_sales.processed_at IS NULL THEN EXCLUDED.platform_fee ELSE public.shopee_sales.platform_fee END,
+    freight          = CASE WHEN public.shopee_sales.processed_at IS NULL THEN EXCLUDED.freight ELSE public.shopee_sales.freight END,
+    net_revenue      = CASE WHEN public.shopee_sales.processed_at IS NULL THEN EXCLUDED.net_revenue ELSE public.shopee_sales.net_revenue END,
     order_status     = EXCLUDED.order_status,
-    tracking_number   = EXCLUDED.tracking_number,
-    shipping_carrier  = EXCLUDED.shipping_carrier,
-    ship_by_date      = EXCLUDED.ship_by_date,
-    raw_api_data      = EXCLUDED.raw_api_data,
-    updated_at        = NOW()
+    buyer_username   = EXCLUDED.buyer_username,
+    recipient_name   = EXCLUDED.recipient_name,
+    tracking_number  = EXCLUDED.tracking_number,
+    shipping_carrier = EXCLUDED.shipping_carrier,
+    ship_by_date     = EXCLUDED.ship_by_date,
+    raw_api_data     = EXCLUDED.raw_api_data,
+    updated_at       = NOW()
   WHERE public.shopee_sales.processed_at IS NULL
-     OR public.shopee_sales.order_status IS DISTINCT FROM EXCLUDED.order_status;
+     OR public.shopee_sales.order_status IS DISTINCT FROM EXCLUDED.order_status
+  RETURNING (xmax = 0) AS inserted;
 `;
 
 async function upsertRow(row) {
-  await db.query(UPSERT_QUERY, [
+  const result = await db.query(UPSERT_QUERY, [
     row.orderSn,
     row.sku,
     row.uid,
@@ -469,6 +541,54 @@ async function upsertRow(row) {
     row.shipByDate,
     JSON.stringify(row.rawApiData),
   ]);
+
+  if (result.rowCount === 0) return 'skipped';
+  return result.rows[0].inserted ? 'inserted' : 'updated';
+}
+
+/**
+ * Pedidos antigos que já baixaram estoque nunca recebem novas linhas de SKU.
+ * Atualizamos apenas metadados operacionais das linhas existentes e mantemos o
+ * item originalmente associado a cada linha no payload.
+ */
+async function updateProcessedOrder(orderSn, uid, row) {
+  const result = await db.query(
+    `UPDATE public.shopee_sales
+        SET account_nickname = $3,
+            order_status = $4,
+            buyer_username = $5,
+            recipient_name = $6,
+            tracking_number = $7,
+            shipping_carrier = $8,
+            ship_by_date = $9,
+            raw_api_data = jsonb_set(
+              $10::jsonb,
+              '{synced_item}',
+              COALESCE(
+                public.shopee_sales.raw_api_data->'synced_item',
+                public.shopee_sales.raw_api_data->'item_list'->0,
+                'null'::jsonb
+              ),
+              TRUE
+            ),
+            updated_at = NOW()
+      WHERE order_sn = $1
+        AND uid = $2
+        AND processed_at IS NOT NULL`,
+    [
+      orderSn,
+      uid,
+      row.accountNickname,
+      row.orderStatus,
+      row.buyerUsername,
+      row.recipientName,
+      row.trackingNumber,
+      row.shippingCarrier,
+      row.shipByDate,
+      JSON.stringify(row.rawApiData),
+    ]
+  );
+  return result.rowCount;
 }
 
 /* --------------------------- Sincronização (SSE) --------------------------- */
@@ -515,55 +635,126 @@ router.post('/sync-account', authenticateToken, async (req, res) => {
       account.refreshToken = refreshed.refresh_token;
     }
 
-    // Cursor incremental: última venda salva - 1 dia de margem.
+    // Primeira sincronização percorre pedidos por data de criação. As próximas
+    // usam update_time remoto a partir do instante da última gravação local,
+    // com 24h de sobreposição para absorver atrasos e diferenças de relógio.
     const lastRes = await db.query(
-      'SELECT MAX(sale_date) AS last_sale FROM public.shopee_sales WHERE uid = $1 AND shop_id = $2',
+      `SELECT
+         MAX(updated_at) AS last_sync,
+         MIN(sale_date) FILTER (
+           WHERE CASE
+                   WHEN jsonb_typeof(raw_api_data->'item_list') = 'array'
+                   THEN jsonb_array_length(raw_api_data->'item_list') > 1
+                   ELSE FALSE
+                 END
+             AND NOT (raw_api_data ? 'synced_item')
+         ) AS legacy_since
+       FROM public.shopee_sales
+       WHERE uid = $1 AND shop_id = $2`,
       [targetUid, shopId]
     );
-    const lastSale = lastRes.rows[0]?.last_sale ? new Date(lastRes.rows[0].last_sale) : null;
+    const lastSync = lastRes.rows[0]?.last_sync ? new Date(lastRes.rows[0].last_sync) : null;
+    const legacySince = lastRes.rows[0]?.legacy_since ? new Date(lastRes.rows[0].legacy_since) : null;
     let since;
-    if (force || !lastSale) {
-      since = new Date('2024-01-01T00:00:00.000Z');
-      sendEvent(clientId, { progress: 20, message: `[${nickname}] Sincronização completa iniciada...`, type: 'info' });
+    let timeRangeField;
+    if (force || !lastSync || legacySince) {
+      since = legacySince
+        ? new Date(legacySince.getTime() - 24 * 60 * 60 * 1000)
+        : new Date('2024-01-01T00:00:00.000Z');
+      timeRangeField = 'create_time';
+      const message = legacySince
+        ? `[${nickname}] Atualizando pedidos antigos com múltiplos itens...`
+        : `[${nickname}] Sincronização completa iniciada...`;
+      sendEvent(clientId, { progress: 20, message, type: 'info' });
     } else {
-      since = new Date(lastSale.getTime() - 24 * 60 * 60 * 1000);
-      sendEvent(clientId, { progress: 20, message: `[${nickname}] Buscando novidades desde a última sincronização...`, type: 'info' });
+      since = new Date(lastSync.getTime() - 24 * 60 * 60 * 1000);
+      timeRangeField = 'update_time';
+      sendEvent(clientId, { progress: 20, message: `[${nickname}] Buscando pedidos novos e atualizados...`, type: 'info' });
     }
 
     const orders = await fetchOrdersSince(account, since, partnerId, partnerKey, (count) => {
       sendEvent(clientId, { progress: Math.min(60, 20 + Math.floor(count / 10)), message: `[${nickname}] Lendo pedidos... ${count}`, type: 'info' });
-    });
+    }, timeRangeField);
 
     if (orders.length === 0) {
-      sendEvent(clientId, { progress: 100, message: `[${nickname}] Nenhum pedido novo encontrado.`, type: 'success', newSalesCount: 0 });
+      sendEvent(clientId, {
+        progress: 100,
+        message: `[${nickname}] Nenhum pedido novo encontrado.`,
+        type: 'success',
+        newSalesCount: 0,
+        updatedCount: 0,
+        skippedCount: 0,
+      });
       return;
     }
 
     sendEvent(clientId, { progress: 65, message: `[${nickname}] Calculando custos e salvando ${orders.length} pedido(s)...`, type: 'info' });
 
-    await fetchCostBySku(orders.map((o) => firstSkuOfOrder(o)).filter(Boolean), targetUid);
+    // Consulta única evita N+1 e, principalmente, impede que a nova expansão
+    // multi-item crie linhas não processadas em pedidos históricos cujo estoque
+    // já foi abatido quando existia apenas a primeira linha.
+    const orderSns = [...new Set(orders.map((order) => String(order.order_sn)).filter(Boolean))];
+    const processedResult = await db.query(
+      `SELECT DISTINCT order_sn
+         FROM public.shopee_sales
+        WHERE uid = $1
+          AND shop_id = $2
+          AND processed_at IS NOT NULL
+          AND order_sn = ANY($3::text[])`,
+      [targetUid, shopId, orderSns]
+    );
+    const historicallyProcessed = new Set(processedResult.rows.map((row) => String(row.order_sn)));
 
-    let saved = 0;
+    let insertedItems = 0;
+    let updatedItems = 0;
+    let skippedItems = 0;
+    let savedOrders = 0;
+
     for (let i = 0; i < orders.length; i++) {
       try {
-        const row = orderToRow(orders[i], account, nickname);
-        row.uid = targetUid;
-        await upsertRow(row);
-        saved += 1;
+        const rows = orderToRows(orders[i], account, nickname);
+        for (const row of rows) row.uid = targetUid;
+
+        if (historicallyProcessed.has(String(orders[i].order_sn))) {
+          // Nunca insere os SKUs recém-descobertos desse pedido. Só refresca
+          // status, rastreio e payload das linhas que já existem.
+          const affected = await updateProcessedOrder(String(orders[i].order_sn), targetUid, rows[0]);
+          updatedItems += affected;
+          skippedItems += Math.max(0, rows.length - affected);
+        } else {
+          for (const row of rows) {
+            const outcome = await upsertRow(row);
+            if (outcome === 'inserted') insertedItems += 1;
+            else if (outcome === 'updated') updatedItems += 1;
+            else skippedItems += 1;
+          }
+        }
+        savedOrders += 1;
       } catch (err) {
         console.warn(`[shopee-sync] erro ao salvar pedido ${orders[i]?.order_sn}:`, err.message);
+        skippedItems += 1;
       }
+
       if (i % 25 === 0 || i === orders.length - 1) {
         const pct = 65 + Math.floor(((i + 1) / orders.length) * 30);
-        sendEvent(clientId, { progress: Math.min(95, pct), message: `[${nickname}] Salvando... ${i + 1}/${orders.length}`, type: 'info' });
+        sendEvent(clientId, {
+          progress: Math.min(95, pct),
+          message: `[${nickname}] Salvando... ${i + 1}/${orders.length}`,
+          type: 'info',
+          newSalesCount: insertedItems,
+          updatedCount: updatedItems,
+          skippedCount: skippedItems,
+        });
       }
     }
 
     sendEvent(clientId, {
       progress: 100,
-      message: `[${nickname}] Sincronização concluída. ${saved} pedido(s) salvos.`,
+      message: `[${nickname}] Sincronização concluída. ${savedOrders} pedido(s), ${insertedItems} item(ns) novo(s) e ${updatedItems} atualizado(s).`,
       type: 'success',
-      newSalesCount: saved,
+      newSalesCount: insertedItems,
+      updatedCount: updatedItems,
+      skippedCount: skippedItems,
     });
   } catch (error) {
     console.error('[shopee-sync] erro:', error);
@@ -693,93 +884,168 @@ router.get('/my-sales', authenticateToken, async (req, res) => {
   }
 });
 
-/** Abatimento de estoque para pedidos Shopee — mesmo fluxo de /sales/process. */
+/** Abatimento de estoque para pedidos Shopee — mesmo fluxo seguro de /sales/process. */
 router.post('/process', authenticateToken, requireMaster, async (req, res) => {
   const { salesToProcess } = req.body;
+  const MAX_PROCESS_BATCH = 500;
+
   if (!Array.isArray(salesToProcess) || salesToProcess.length === 0) {
     return res.status(400).json({ error: 'Nenhuma venda para processar.' });
   }
+  if (salesToProcess.length > MAX_PROCESS_BATCH) {
+    return res.status(400).json({ error: `O lote excede o limite de ${MAX_PROCESS_BATCH} vendas.` });
+  }
 
-  const sanitized = salesToProcess.map((s) => ({
-    orderSn: s.orderSn || s.id,
-    sku: String(s.sku || '').trim(),
-    uid: s.uid,
-    quantity: Number(s.quantity || 0),
+  // Quantidade enviada pelo navegador é deliberadamente ignorada. A fonte
+  // autoritativa é a linha bloqueada em public.shopee_sales.
+  const sanitized = salesToProcess.map((sale) => ({
+    orderSn: String(sale.orderSn || sale.id || '').trim(),
+    sku: String(sale.sku || '').trim(),
+    uid: String(sale.uid || '').trim(),
   }));
 
   const results = { success: [], failed: [] };
   const client = await db.pool.connect();
 
   try {
-    for (const sale of sanitized) {
+    for (const requestedSale of sanitized) {
       try {
-        if (!sale.orderSn || !sale.sku || !sale.uid || !sale.quantity) {
-          throw new Error('Dados da venda incompletos (orderSn, sku, uid, quantity).');
+        if (!requestedSale.orderSn || !requestedSale.sku || !requestedSale.uid) {
+          throw new Error('Dados da venda incompletos (orderSn, sku e uid).');
         }
 
         await client.query('BEGIN');
 
-        const skuR = await client.query(
-          `SELECT id, quantidade, is_kit FROM public.skus
-            WHERE UPPER(TRIM(sku)) = UPPER(TRIM($1)) AND user_id = $2 FOR UPDATE;`,
+        // O lock da venda vem antes do estoque. Duas requisições concorrentes
+        // para o mesmo item ficam serializadas e só uma delas efetua a baixa.
+        const saleResult = await client.query(
+          `SELECT order_sn, sku, uid, quantity, processed_at
+             FROM public.shopee_sales
+            WHERE order_sn = $1
+              AND UPPER(TRIM(sku)) = UPPER(TRIM($2))
+              AND uid = $3
+            FOR UPDATE`,
+          [requestedSale.orderSn, requestedSale.sku, requestedSale.uid]
+        );
+        if (saleResult.rowCount === 0) throw new Error('Venda Shopee não encontrada.');
+        if (saleResult.rowCount > 1) throw new Error(`A venda possui SKU duplicado normalizado: '${requestedSale.sku}'.`);
+
+        const sale = saleResult.rows[0];
+        if (sale.processed_at) {
+          await client.query('COMMIT');
+          results.success.push({
+            orderSn: sale.order_sn,
+            sku: sale.sku,
+            alreadyProcessed: true,
+          });
+          continue;
+        }
+
+        const quantity = Number(sale.quantity);
+        if (!Number.isInteger(quantity) || quantity <= 0) {
+          throw new Error(`Quantidade inválida registrada para o SKU '${sale.sku}'.`);
+        }
+
+        const skuResult = await client.query(
+          `SELECT id, sku, quantidade, is_kit
+             FROM public.skus
+            WHERE UPPER(TRIM(sku)) = UPPER(TRIM($1))
+              AND user_id = $2
+              AND ativo = TRUE
+            ORDER BY id
+            LIMIT 2
+            FOR UPDATE`,
           [sale.sku, sale.uid]
         );
-        if (skuR.rowCount === 0) throw new Error(`SKU '${sale.sku}' não encontrado.`);
-        const stock = skuR.rows[0];
+        if (skuResult.rowCount === 0) throw new Error(`SKU ativo '${sale.sku}' não encontrado no armazenamento.`);
+        if (skuResult.rowCount > 1) throw new Error(`Há mais de um SKU ativo normalizado como '${sale.sku}'.`);
+        const stock = skuResult.rows[0];
 
         if (stock.is_kit) {
-          const kitComponents = await client.query(
-            'SELECT child_sku_id, quantity_per_kit FROM public.sku_kit_components WHERE kit_sku_id = $1',
+          const componentsResult = await client.query(
+            `SELECT kc.child_sku_id, kc.quantity_per_kit,
+                    child.sku, child.quantidade, child.ativo
+               FROM public.sku_kit_components kc
+               JOIN public.skus child ON child.id = kc.child_sku_id
+              WHERE kc.kit_sku_id = $1
+              ORDER BY child.id
+              FOR UPDATE OF child`,
             [stock.id]
           );
-          if (kitComponents.rows.length === 0) throw new Error(`Kit '${sale.sku}' não possui componentes configurados.`);
+          if (componentsResult.rowCount === 0) {
+            throw new Error(`Kit '${sale.sku}' não possui componentes configurados.`);
+          }
 
-          for (const component of kitComponents.rows) {
-            const childSku = await client.query('SELECT id, sku, quantidade FROM public.skus WHERE id = $1 FOR UPDATE', [component.child_sku_id]);
-            if (childSku.rows.length === 0) throw new Error(`SKU filho não encontrado para o kit '${sale.sku}'.`);
-            const required = component.quantity_per_kit * sale.quantity;
-            if (childSku.rows[0].quantidade < required) {
-              throw new Error(`Estoque insuficiente do SKU filho ${childSku.rows[0].sku}. Disponível: ${childSku.rows[0].quantidade}, Necessário: ${required}`);
+          for (const component of componentsResult.rows) {
+            if (!component.ativo) throw new Error(`SKU filho '${component.sku}' está inativo.`);
+            const required = Number(component.quantity_per_kit) * quantity;
+            if (Number(component.quantidade) < required) {
+              throw new Error(`Estoque insuficiente do SKU filho ${component.sku}. Disponível: ${component.quantidade}, necessário: ${required}.`);
             }
           }
-          for (const component of kitComponents.rows) {
-            const required = component.quantity_per_kit * sale.quantity;
-            await client.query('UPDATE public.skus SET quantidade = quantidade - $1, updated_at = NOW() WHERE id = $2;', [required, component.child_sku_id]);
+
+          for (const component of componentsResult.rows) {
+            const required = Number(component.quantity_per_kit) * quantity;
             await client.query(
-              `INSERT INTO public.stock_movements (sku_id, user_id, movement_type, quantity_change, reason, related_sale_id)
-               VALUES ($1, $2, 'saida', $3, $4, $5)`,
-              [component.child_sku_id, sale.uid, required, `Saída por Kit (Shopee): Venda em Lote - Pedido ${sale.orderSn}`, null]
+              'UPDATE public.skus SET quantidade = quantidade - $1, updated_at = NOW() WHERE id = $2',
+              [required, component.child_sku_id]
+            );
+            await client.query(
+              `INSERT INTO public.stock_movements
+                 (sku_id, user_id, movement_type, quantity_change, reason, related_sale_id, external_sale_id)
+               VALUES ($1, $2, 'saida', $3, $4, NULL, $5)`,
+              [component.child_sku_id, sale.uid, required, `Saída por Kit (Shopee) - Pedido ${sale.order_sn}`, sale.order_sn]
             );
           }
+
+          // O movimento do kit registra a quantidade comercial processada; o
+          // estoque físico é abatido exclusivamente dos componentes acima.
           await client.query(
-            `INSERT INTO public.stock_movements (sku_id, user_id, movement_type, quantity_change, reason, related_sale_id)
-             VALUES ($1, $2, 'saida', $3, $4, $5)`,
-            [stock.id, sale.uid, sale.quantity, `Saída por Venda Shopee em Lote - Pedido ${sale.orderSn}`, null]
+            `INSERT INTO public.stock_movements
+               (sku_id, user_id, movement_type, quantity_change, reason, related_sale_id, external_sale_id)
+             VALUES ($1, $2, 'saida', $3, $4, NULL, $5)`,
+            [stock.id, sale.uid, quantity, `Saída por Venda Shopee - Pedido ${sale.order_sn}`, sale.order_sn]
           );
         } else {
-          if (Number(stock.quantidade) < Number(sale.quantity)) throw new Error(`Estoque insuficiente para SKU '${sale.sku}'.`);
-          await client.query('UPDATE public.skus SET quantidade = quantidade - $1, updated_at = NOW() WHERE id = $2', [sale.quantity, stock.id]);
+          if (Number(stock.quantidade) < quantity) {
+            throw new Error(`Estoque insuficiente para SKU '${sale.sku}'. Disponível: ${stock.quantidade}, necessário: ${quantity}.`);
+          }
           await client.query(
-            `INSERT INTO public.stock_movements (sku_id, user_id, movement_type, quantity_change, reason, related_sale_id)
-             VALUES ($1, $2, 'saida', $3, $4, $5)`,
-            [stock.id, sale.uid, sale.quantity, `Saída por Venda Shopee em Lote - Pedido ${sale.orderSn}`, null]
+            'UPDATE public.skus SET quantidade = quantidade - $1, updated_at = NOW() WHERE id = $2',
+            [quantity, stock.id]
+          );
+          await client.query(
+            `INSERT INTO public.stock_movements
+               (sku_id, user_id, movement_type, quantity_change, reason, related_sale_id, external_sale_id)
+             VALUES ($1, $2, 'saida', $3, $4, NULL, $5)`,
+            [stock.id, sale.uid, quantity, `Saída por Venda Shopee - Pedido ${sale.order_sn}`, sale.order_sn]
           );
         }
 
-        const upd = await client.query(
-          `UPDATE public.shopee_sales SET processed_at = COALESCE(processed_at, NOW()), updated_at = NOW()
-            WHERE order_sn = $1 AND sku = $2 AND uid = $3 RETURNING order_sn;`,
-          [sale.orderSn, sale.sku, sale.uid]
+        const updateResult = await client.query(
+          `UPDATE public.shopee_sales
+              SET processed_at = NOW(), updated_at = NOW()
+            WHERE order_sn = $1
+              AND UPPER(TRIM(sku)) = UPPER(TRIM($2))
+              AND uid = $3
+              AND processed_at IS NULL
+          RETURNING order_sn, sku, processed_at`,
+          [sale.order_sn, sale.sku, sale.uid]
         );
-        if (upd.rowCount === 0) throw new Error('Venda não pode ser atualizada.');
+        if (updateResult.rowCount !== 1) throw new Error('Venda não pôde ser marcada como processada.');
 
         await client.query('COMMIT');
-        results.success.push({ orderSn: sale.orderSn, sku: sale.sku });
-      } catch (e) {
-        try { await client.query('ROLLBACK'); } catch { /* ignore */ }
-        results.failed.push({ orderSn: sale.orderSn, sku: sale.sku, reason: e.message });
+        results.success.push({ orderSn: sale.order_sn, sku: sale.sku, alreadyProcessed: false });
+      } catch (error) {
+        try { await client.query('ROLLBACK'); } catch { /* transação já encerrada */ }
+        results.failed.push({
+          orderSn: requestedSale.orderSn,
+          sku: requestedSale.sku,
+          reason: error.message,
+        });
       }
     }
+
     return res.json({ message: 'Processamento concluído.', ...results });
   } catch (error) {
     console.error('Erro crítico no processamento em lote (Shopee):', error);

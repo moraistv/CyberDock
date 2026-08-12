@@ -139,7 +139,7 @@ async function getShopeeOrderList(p) {
   url.searchParams.append('access_token', p.accessToken);
   url.searchParams.append('shop_id', p.shopId);
   url.searchParams.append('sign', sign);
-  url.searchParams.append('time_range_field', 'create_time');
+  url.searchParams.append('time_range_field', p.timeRangeField || 'create_time');
   url.searchParams.append('time_from', p.createTimeFrom.toString());
   url.searchParams.append('time_to', p.createTimeTo.toString());
   url.searchParams.append('page_size', p.pageSize.toString());

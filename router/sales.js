@@ -1127,7 +1127,8 @@ router.get('/dashboard-stats', authenticateToken, async (req, res) => {
       conditions.push(`s.marketplace = ANY($${p})`); params.push(asList(marketplace)); p++;
     }
     if (account) {
-      conditions.push(`s.account_id = ANY($${p})`); params.push(asList(account)); p++;
+      conditions.push(`((s.marketplace || ':' || s.account_id) = ANY($${p}) OR s.account_id = ANY($${p}))`);
+      params.push(asList(account)); p++;
     }
     // Os rótulos vêm das próprias agregações abaixo, então a comparação é
     // exata contra a mesma expressão usada no GROUP BY.
@@ -1161,7 +1162,10 @@ router.get('/dashboard-stats', authenticateToken, async (req, res) => {
       prevConditions.push(`s.sale_date >= $${q}`); previousParams.push(`${iso(prevStart)}T00:00:00-03:00`); q++;
       prevConditions.push(`s.sale_date <= $${q}`); previousParams.push(`${iso(prevEnd)}T23:59:59.999-03:00`); q++;
       if (marketplace) { prevConditions.push(`s.marketplace = ANY($${q})`); previousParams.push(asList(marketplace)); q++; }
-      if (account) { prevConditions.push(`s.account_id = ANY($${q})`); previousParams.push(asList(account)); q++; }
+      if (account) {
+        prevConditions.push(`((s.marketplace || ':' || s.account_id) = ANY($${q}) OR s.account_id = ANY($${q}))`);
+        previousParams.push(asList(account)); q++;
+      }
       if (shippingStatus) {
         prevConditions.push(`COALESCE(NULLIF(s.shipping_status, ''), 'Pendente') = ANY($${q})`);
         previousParams.push(asList(shippingStatus)); q++;
@@ -1173,44 +1177,67 @@ router.get('/dashboard-stats', authenticateToken, async (req, res) => {
       previousWhere = `WHERE ${prevConditions.join(' AND ')}`;
     }
 
-    // "A despachar" segue a mesma regra da tela de separação: o que ainda não
-    // foi enviado/entregue/cancelado.
-    const pendingExpr = `COALESCE(s.order_status, '') NOT IN ('shipped', 'delivered', 'not_delivered', 'cancelled', 'canceled')
-                         AND COALESCE(s.shipping_status, '') NOT IN ('shipped', 'delivered')`;
+    // A view possui uma linha por SKU do pedido. Todos os indicadores de
+    // pedidos precisam deduplicar por canal + conta + ID para não inflar os
+    // números quando uma compra contém mais de um produto.
+    const orderKey = `(s.marketplace, COALESCE(s.account_id, ''), s.id)`;
+    const operationalStatus = `LOWER(COALESCE(
+      CASE WHEN s.marketplace = 'ML' THEN s.raw_api_data->'shipping'->>'status' END,
+      s.order_status,
+      s.shipping_status,
+      ''
+    ))`;
+    const cancelledExpr = `${operationalStatus} IN ('cancelled', 'canceled', 'in_cancel')
+                           OR LOWER(COALESCE(s.order_status, '')) IN ('cancelled', 'canceled', 'in_cancel')`;
+    // Mesma intenção operacional da separação: FULL e pedidos já enviados,
+    // entregues ou cancelados não entram em "a despachar".
+    const pendingExpr = `s.shipping_mode IS DISTINCT FROM 'FULL'
+                         AND NOT (${cancelledExpr})
+                         AND ${operationalStatus} NOT IN
+                           ('shipped', 'delivered', 'completed', 'not_delivered')`;
 
     const [totals, byStatus, byDay, byMarketplace, byShippingMode, topSkus, previous] = await Promise.all([
       db.query(
         `SELECT
-           COUNT(*)::int AS sales,
+           COUNT(DISTINCT ${orderKey})::int AS orders,
+           COUNT(DISTINCT ${orderKey})::int AS sales,
            COALESCE(SUM(s.quantity), 0)::int AS units,
-           COUNT(*) FILTER (WHERE ${pendingExpr})::int AS pending,
-           COUNT(*) FILTER (WHERE s.processed_at IS NOT NULL)::int AS processed,
-           COUNT(*) FILTER (WHERE COALESCE(s.order_status,'') IN ('cancelled','canceled'))::int AS cancelled,
+           (COUNT(DISTINCT ${orderKey}) FILTER (WHERE ${pendingExpr}))::int AS pending_orders,
+           (COUNT(DISTINCT ${orderKey}) FILTER (WHERE ${pendingExpr}))::int AS pending,
+           (COUNT(DISTINCT ${orderKey}) FILTER (WHERE NOT (${cancelledExpr})))::int AS valid_orders,
+           (COUNT(DISTINCT ${orderKey}) FILTER (WHERE ${cancelledExpr}))::int AS cancelled_orders,
+           (COUNT(DISTINCT ${orderKey}) FILTER (WHERE ${cancelledExpr}))::int AS cancelled,
+           (COUNT(DISTINCT ${orderKey}) FILTER (WHERE s.processed_at IS NOT NULL))::int AS processed_orders,
+           (COUNT(DISTINCT ${orderKey}) FILTER (WHERE s.processed_at IS NOT NULL))::int AS processed,
+           COUNT(*) FILTER (WHERE s.processed_at IS NOT NULL)::int AS processed_lines,
            COUNT(DISTINCT s.sku)::int AS distinct_skus
          FROM public.unified_sales s ${where}`,
         params
       ),
       db.query(
-        `SELECT COALESCE(NULLIF(s.shipping_status, ''), 'Pendente') AS label, COUNT(*)::int AS value
+        `SELECT COALESCE(NULLIF(s.shipping_status, ''), 'Pendente') AS label,
+                COUNT(DISTINCT ${orderKey})::int AS value
          FROM public.unified_sales s ${where}
          GROUP BY 1 ORDER BY value DESC LIMIT 9`,
         params
       ),
       db.query(
         // Dia no fuso de Brasília, para casar com o que o usuário vê na tela.
-        `SELECT (s.sale_date AT TIME ZONE 'America/Sao_Paulo')::date AS day, COUNT(*)::int AS value
+        `SELECT (s.sale_date AT TIME ZONE 'America/Sao_Paulo')::date AS day,
+                COUNT(DISTINCT ${orderKey})::int AS value
          FROM public.unified_sales s ${where}
          GROUP BY 1 ORDER BY 1 ASC`,
         params
       ),
       db.query(
-        `SELECT s.marketplace, COUNT(*)::int AS value
+        `SELECT s.marketplace, COUNT(DISTINCT ${orderKey})::int AS value
          FROM public.unified_sales s ${where}
          GROUP BY 1 ORDER BY value DESC`,
         params
       ),
       db.query(
-        `SELECT COALESCE(NULLIF(s.shipping_mode, ''), 'Outros') AS mode, COUNT(*)::int AS value
+        `SELECT COALESCE(NULLIF(s.shipping_mode, ''), 'Outros') AS mode,
+                COUNT(DISTINCT ${orderKey})::int AS value
          FROM public.unified_sales s ${where}
          GROUP BY 1 ORDER BY value DESC LIMIT 8`,
         params
@@ -1219,14 +1246,16 @@ router.get('/dashboard-stats', authenticateToken, async (req, res) => {
         `SELECT s.sku,
                 (array_agg(s.product_title ORDER BY s.sale_date DESC))[1] AS title,
                 COALESCE(SUM(s.quantity), 0)::int AS units,
-                COUNT(*)::int AS orders
+                COUNT(DISTINCT ${orderKey})::int AS orders
          FROM public.unified_sales s ${where}
          GROUP BY s.sku ORDER BY units DESC LIMIT 8`,
         params
       ),
       previousWhere
         ? db.query(
-            `SELECT COUNT(*)::int AS sales, COALESCE(SUM(s.quantity), 0)::int AS units
+            `SELECT COUNT(DISTINCT ${orderKey})::int AS orders,
+                    COUNT(DISTINCT ${orderKey})::int AS sales,
+                    COALESCE(SUM(s.quantity), 0)::int AS units
              FROM public.unified_sales s ${previousWhere}`,
             previousParams
           )
@@ -1234,7 +1263,11 @@ router.get('/dashboard-stats', authenticateToken, async (req, res) => {
     ]);
 
     res.json({
-      totals: totals.rows[0] || { sales: 0, units: 0, pending: 0, processed: 0, cancelled: 0, distinct_skus: 0 },
+      totals: totals.rows[0] || {
+        orders: 0, sales: 0, units: 0, pending_orders: 0, pending: 0,
+        valid_orders: 0, cancelled_orders: 0, cancelled: 0,
+        processed_orders: 0, processed: 0, processed_lines: 0, distinct_skus: 0,
+      },
       previousTotals: previous.rows[0] || null,
       byStatus: byStatus.rows,
       byDay: byDay.rows.map((r) => ({
@@ -1438,8 +1471,14 @@ router.get('/my-sales', authenticateToken, async (req, res) => {
       paramIdx++;
     }
     if (account) {
-      // Casa por identificador da conta (seller_id/shop_id) ou pelo apelido.
-      conditions.push(`(s.account_id = ANY($${paramIdx}) OR s.account_nickname = ANY($${paramIdx}))`);
+      // Valores novos usam namespace (ML:123 / Shopee:123), impedindo que
+      // IDs numéricos iguais de canais diferentes se contaminem. O segundo
+      // termo preserva compatibilidade com links/filtros antigos sem prefixo.
+      conditions.push(`(
+        (s.marketplace || ':' || s.account_id) = ANY($${paramIdx})
+        OR s.account_id = ANY($${paramIdx})
+        OR s.account_nickname = ANY($${paramIdx})
+      )`);
       params.push(asList(account));
       paramIdx++;
     }
@@ -1810,11 +1849,10 @@ router.post('/process', authenticateToken, requireMaster, async (req, res) => {
     return res.status(400).json({ error: 'Nenhuma venda para processar.' });
   }
 
-  const sanitized = salesToProcess.map((s) => ({
-    id: s.id,
-    sku: String(s.sku || '').trim(),
-    uid: s.uid,
-    quantity: Number(s.quantity || 0)
+  const sanitized = salesToProcess.map((sale) => ({
+    id: sale.id,
+    sku: String(sale.sku || '').trim(),
+    uid: sale.uid,
   }));
 
   if (sanitized.length > MAX_PROCESS_BATCH) {
@@ -1827,128 +1865,136 @@ router.post('/process', authenticateToken, requireMaster, async (req, res) => {
   const client = await db.pool.connect();
 
   try {
-    for (const sale of sanitized) {
+    for (const requestedSale of sanitized) {
       try {
-        if (!sale.id || !sale.sku || !sale.uid || !sale.quantity) {
-          throw new Error('Dados da venda incompletos (id, sku, uid, quantity).');
+        if (!requestedSale.id || !requestedSale.sku || !requestedSale.uid) {
+          throw new Error('Dados da venda incompletos (id, sku, uid).');
         }
 
         await client.query('BEGIN');
 
-        const skuQ = `
-          SELECT id, quantidade, is_kit
-            FROM public.skus
-           WHERE UPPER(TRIM(sku)) = UPPER(TRIM($1))
-             AND user_id = $2
-           FOR UPDATE;
-        `;
-        const skuR = await client.query(skuQ, [sale.sku, sale.uid]);
-        if (skuR.rowCount === 0) throw new Error(`SKU '${sale.sku}' não encontrado.`);
+        // A venda é bloqueada antes do estoque. Chamadas simultâneas ficam em
+        // fila e a segunda encontra processed_at preenchido, sem nova baixa.
+        // A quantidade usada é sempre a persistida no banco, nunca o payload.
+        const saleResult = await client.query(
+          `SELECT id, sku, uid, quantity, processed_at
+             FROM public.sales
+            WHERE id = $1
+              AND UPPER(TRIM(sku)) = UPPER(TRIM($2))
+              AND uid = $3
+            FOR UPDATE`,
+          [requestedSale.id, requestedSale.sku, requestedSale.uid]
+        );
+        if (saleResult.rowCount === 0) throw new Error('Venda não encontrada.');
 
-        const stock = skuR.rows[0];
-        
-        // Handle kit vs regular SKU logic
+        const sale = saleResult.rows[0];
+        if (sale.processed_at) {
+          await client.query('COMMIT');
+          results.success.push({ saleId: sale.id, sku: sale.sku, alreadyProcessed: true });
+          continue;
+        }
+
+        sale.quantity = Number(sale.quantity);
+        if (!Number.isInteger(sale.quantity) || sale.quantity <= 0) {
+          throw new Error('Quantidade inválida na venda salva.');
+        }
+
+        const skuResult = await client.query(
+          `SELECT id, sku, quantidade, is_kit
+             FROM public.skus
+            WHERE UPPER(TRIM(sku)) = UPPER(TRIM($1))
+              AND user_id = $2
+              AND ativo = true
+            ORDER BY id
+            LIMIT 2
+            FOR UPDATE`,
+          [sale.sku, sale.uid]
+        );
+        if (skuResult.rowCount === 0) throw new Error(`SKU '${sale.sku}' não encontrado ou inativo.`);
+        if (skuResult.rowCount > 1) throw new Error(`SKU '${sale.sku}' está duplicado no armazenamento.`);
+
+        const stock = skuResult.rows[0];
         if (stock.is_kit) {
-          // For kits, check component availability and deduct from child SKUs
-          const kitComponentsQuery = `
-            SELECT child_sku_id, quantity_per_kit
-            FROM public.sku_kit_components
-            WHERE kit_sku_id = $1
-          `;
-          const kitComponents = await client.query(kitComponentsQuery, [stock.id]);
-
-          if (kitComponents.rows.length === 0) {
+          const kitComponents = await client.query(
+            `SELECT child_sku_id, quantity_per_kit
+               FROM public.sku_kit_components
+              WHERE kit_sku_id = $1`,
+            [stock.id]
+          );
+          if (kitComponents.rowCount === 0) {
             throw new Error(`Kit '${sale.sku}' não possui componentes configurados.`);
           }
 
-          // Check if we have enough stock of all child SKUs
           for (const component of kitComponents.rows) {
-            const childSkuQuery = 'SELECT id, sku, quantidade FROM public.skus WHERE id = $1 FOR UPDATE';
-            const childSku = await client.query(childSkuQuery, [component.child_sku_id]);
-            
-            if (childSku.rows.length === 0) {
-              throw new Error(`SKU filho não encontrado para o kit '${sale.sku}'.`);
+            const childSku = await client.query(
+              'SELECT id, sku, quantidade, ativo FROM public.skus WHERE id = $1 FOR UPDATE',
+              [component.child_sku_id]
+            );
+            if (childSku.rowCount === 0 || !childSku.rows[0].ativo) {
+              throw new Error(`SKU filho não encontrado ou inativo para o kit '${sale.sku}'.`);
             }
-            
-            const requiredQuantity = component.quantity_per_kit * sale.quantity;
-            if (childSku.rows[0].quantidade < requiredQuantity) {
-              throw new Error(`Estoque insuficiente do SKU filho ${childSku.rows[0].sku} para o kit '${sale.sku}'. Disponível: ${childSku.rows[0].quantidade}, Necessário: ${requiredQuantity}`);
+            const required = Number(component.quantity_per_kit) * sale.quantity;
+            if (Number(childSku.rows[0].quantidade) < required) {
+              throw new Error(`Estoque insuficiente do SKU filho ${childSku.rows[0].sku} para o kit '${sale.sku}'. Disponível: ${childSku.rows[0].quantidade}, necessário: ${required}.`);
             }
           }
 
-          // Deduct from child SKUs
           for (const component of kitComponents.rows) {
-            const requiredQuantity = component.quantity_per_kit * sale.quantity;
-            
-            // Update child SKU quantity
-            const updateChildQuery = `
-              UPDATE public.skus SET quantidade = quantidade - $1, updated_at = NOW() WHERE id = $2;
-            `;
-            await client.query(updateChildQuery, [requiredQuantity, component.child_sku_id]);
-            
-            // Record movement for child SKU
-            const insertChildMovementQuery = `
-              INSERT INTO public.stock_movements (sku_id, user_id, movement_type, quantity_change, reason, related_sale_id)
-              VALUES ($1, $2, 'saida', $3, $4, $5)
-            `;
-            await client.query(insertChildMovementQuery, [
-              component.child_sku_id, 
-              sale.uid, 
-              requiredQuantity, 
-              `Saída por Kit: Saída por Venda em Lote - ID: ${sale.id}`, 
-              sale.id
-            ]);
+            const required = Number(component.quantity_per_kit) * sale.quantity;
+            await client.query(
+              'UPDATE public.skus SET quantidade = quantidade - $1, updated_at = NOW() WHERE id = $2',
+              [required, component.child_sku_id]
+            );
+            await client.query(
+              `INSERT INTO public.stock_movements
+                 (sku_id, user_id, movement_type, quantity_change, reason, related_sale_id)
+               VALUES ($1, $2, 'saida', $3, $4, $5)`,
+              [component.child_sku_id, sale.uid, required, `Saída por Kit: Venda Mercado Livre - ID ${sale.id}`, sale.id]
+            );
           }
 
-          // Record movement for the kit itself (informational)
-          const insertKitMovementQuery = `
-            INSERT INTO public.stock_movements (sku_id, user_id, movement_type, quantity_change, reason, related_sale_id)
-            VALUES ($1, $2, 'saida', $3, $4, $5)
-          `;
-          await client.query(insertKitMovementQuery, [
-            stock.id, 
-            sale.uid, 
-            sale.quantity, 
-            `Saída por Venda em Lote - ID: ${sale.id}`, 
-            sale.id
-          ]);
-        } else {
-          // Regular SKU logic
-          if (Number(stock.quantidade) < Number(sale.quantity)) {
-            throw new Error(`Estoque insuficiente para SKU '${sale.sku}'.`);
-          }
-
-          await client.query('UPDATE public.skus SET quantidade = quantidade - $1, updated_at = NOW() WHERE id = $2', [
-            sale.quantity,
-            stock.id
-          ]);
-
-          const reason = `Saída por Venda em Lote - ID: ${sale.id}`;
+          // Movimento informativo do kit; o estoque físico está nos filhos.
           await client.query(
             `INSERT INTO public.stock_movements
                (sku_id, user_id, movement_type, quantity_change, reason, related_sale_id)
              VALUES ($1, $2, 'saida', $3, $4, $5)`,
-            [stock.id, sale.uid, sale.quantity, reason, sale.id]
+            [stock.id, sale.uid, sale.quantity, `Saída por Venda Mercado Livre - ID ${sale.id}`, sale.id]
+          );
+        } else {
+          if (Number(stock.quantidade) < sale.quantity) {
+            throw new Error(`Estoque insuficiente para SKU '${sale.sku}'. Disponível: ${stock.quantidade}, necessário: ${sale.quantity}.`);
+          }
+
+          await client.query(
+            'UPDATE public.skus SET quantidade = quantidade - $1, updated_at = NOW() WHERE id = $2',
+            [sale.quantity, stock.id]
+          );
+          await client.query(
+            `INSERT INTO public.stock_movements
+               (sku_id, user_id, movement_type, quantity_change, reason, related_sale_id)
+             VALUES ($1, $2, 'saida', $3, $4, $5)`,
+            [stock.id, sale.uid, sale.quantity, `Saída por Venda Mercado Livre - ID ${sale.id}`, sale.id]
           );
         }
 
-        const updSaleQ = `
-          UPDATE public.sales
-             SET processed_at = COALESCE(processed_at, NOW()),
-                 updated_at   = NOW()
-           WHERE id = $1
-             AND sku = $2
-             AND uid = $3
-           RETURNING id;
-        `;
-        const upd = await client.query(updSaleQ, [sale.id, sale.sku, sale.uid]);
-        if (upd.rowCount === 0) throw new Error('Venda não pode ser atualizada.');
+        const updatedSale = await client.query(
+          `UPDATE public.sales
+              SET processed_at = NOW(), updated_at = NOW()
+            WHERE id = $1 AND sku = $2 AND uid = $3 AND processed_at IS NULL
+            RETURNING id, processed_at`,
+          [sale.id, sale.sku, sale.uid]
+        );
+        if (updatedSale.rowCount === 0) throw new Error('Venda já processada por outra operação.');
 
         await client.query('COMMIT');
-        results.success.push({ saleId: sale.id, sku: sale.sku });
-      } catch (e) {
-        try { await client.query('ROLLBACK'); } catch (e2) { /* ignore */ }
-        results.failed.push({ saleId: sale.id, sku: sale.sku, reason: e.message });
+        results.success.push({ saleId: sale.id, sku: sale.sku, quantity: sale.quantity });
+      } catch (error) {
+        try { await client.query('ROLLBACK'); } catch { /* ignore */ }
+        results.failed.push({
+          saleId: requestedSale.id,
+          sku: requestedSale.sku,
+          reason: error.message,
+        });
       }
     }
 
