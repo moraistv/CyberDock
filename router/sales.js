@@ -922,79 +922,121 @@ function buildSeparacaoWhere(req) {
 router.get('/separacao', authenticateToken, requireMaster, async (req, res) => {
   try {
     const full = String(req.query.full || '') === '1';
-    const page = Math.max(1, parseInt(req.query.page) || 1);
+    const page = full ? 1 : Math.max(1, parseInt(req.query.page) || 1);
+    // O limite agora representa PACOTES. Todas as linhas pertencentes aos
+    // pacotes da página são carregadas, portanto nenhum pacote é cortado.
     const limit = full
       ? 5000
       : Math.min(200, Math.max(1, parseInt(req.query.limit) || 20));
     const offset = (page - 1) * limit;
 
     const { whereClause, params, paramIdx } = buildSeparacaoWhere(req);
+    // shipping_id é o identificador de pacote usado pelo ML. O UID faz a
+    // chave ser segura entre contas; Shopee e ML sem envio ficam por pedido.
+    const packageKeyExpr = `CONCAT(
+      s.marketplace, ':', s.uid, ':',
+      CASE
+        WHEN s.marketplace = 'ML' AND NULLIF(s.shipping_id, '') IS NOT NULL
+          THEN 'ship:' || s.shipping_id
+        ELSE 'order:' || s.id
+      END
+    )`;
 
-    // Ordenação: por prazo de despacho (mais próximo primeiro) por padrão.
     const sort = (req.query.sort || 'prazo_asc').trim();
-    let orderBy;
+    let sortAggregate = 'MIN(f.shipping_deadline)';
+    let sortDirection = 'ASC NULLS LAST';
     switch (sort) {
       case 'prazo_desc':
-        orderBy = `s.shipping_deadline DESC NULLS LAST`;
+        sortAggregate = 'MAX(f.shipping_deadline)';
+        sortDirection = 'DESC NULLS LAST';
         break;
       case 'venda_desc':
-        orderBy = `s.sale_date DESC`;
+        sortAggregate = 'MAX(f.sale_date)';
+        sortDirection = 'DESC NULLS LAST';
         break;
       case 'venda_asc':
-        orderBy = `s.sale_date ASC`;
+        sortAggregate = 'MIN(f.sale_date)';
+        sortDirection = 'ASC NULLS LAST';
         break;
-      case 'prazo_asc':
       default:
-        orderBy = `s.shipping_deadline ASC NULLS LAST`;
         break;
     }
 
-    // Dia do prazo no fuso de Brasília, para os buckets atrasado/hoje.
+    const matchedPackagesCte = `
+      matched_packages AS (
+        SELECT DISTINCT ${packageKeyExpr} AS package_key
+          FROM public.unified_sales s
+          LEFT JOIN public.users u ON s.uid = u.uid
+          ${whereClause}
+      ),
+      package_rows AS (
+        SELECT s.*, u.name AS user_nickname, ${packageKeyExpr} AS package_key
+          FROM public.unified_sales s
+          JOIN matched_packages mp ON mp.package_key = ${packageKeyExpr}
+          LEFT JOIN public.users u ON s.uid = u.uid
+         WHERE COALESCE(u.active, true) = true
+      )
+    `;
+
+    // O resumo considera o pacote completo. Assim, se um item do pacote já
+    // estiver despachado e outro ainda estiver na fila, ambos aparecem nos
+    // totais e no relatório com seus status individuais.
     const prazoDateExpr = `(s.shipping_deadline AT TIME ZONE 'America/Sao_Paulo')::date`;
     const hojeExpr = `(now() AT TIME ZONE 'America/Sao_Paulo')::date`;
-
-    // Resumo agregado sobre TODO o conjunto filtrado (fila de separação)
     const summaryQuery = `
+      WITH ${matchedPackagesCte}
       SELECT
+        COUNT(DISTINCT s.package_key) AS total_pacotes,
         COUNT(*) AS total_itens,
         COALESCE(SUM(s.quantity), 0) AS total_unidades,
-        COUNT(*) FILTER (WHERE ${prazoDateExpr} < ${hojeExpr}) AS atrasados,
-        COUNT(*) FILTER (WHERE ${prazoDateExpr} = ${hojeExpr}) AS despachar_hoje,
+        COUNT(DISTINCT s.package_key) FILTER (WHERE ${prazoDateExpr} < ${hojeExpr}) AS atrasados,
+        COUNT(DISTINCT s.package_key) FILTER (WHERE ${prazoDateExpr} = ${hojeExpr}) AS despachar_hoje,
         COUNT(DISTINCT s.uid) AS usuarios_ativos
-      FROM public.unified_sales s
-      LEFT JOIN public.users u ON s.uid = u.uid
-      ${whereClause}
+      FROM package_rows s
     `;
-    // Contagem por modalidade, com o mesmo rótulo usado no filtro.
     const modeQuery = `
-      SELECT ${U_SHIPPING_MODE} AS mode, COUNT(*) AS count
-      FROM public.unified_sales s
-      LEFT JOIN public.users u ON s.uid = u.uid
-      ${whereClause}
-      GROUP BY 1
-      ORDER BY count DESC
+      WITH ${matchedPackagesCte}
+      SELECT ${U_SHIPPING_MODE} AS mode, COUNT(DISTINCT s.package_key) AS count
+        FROM package_rows s
+       GROUP BY 1
+       ORDER BY count DESC
     `;
 
-    // Página de itens
     const dataQuery = `
+      WITH filtered AS (
+        SELECT s.*, u.name AS user_nickname, ${packageKeyExpr} AS package_key
+          FROM public.unified_sales s
+          LEFT JOIN public.users u ON s.uid = u.uid
+          ${whereClause}
+      ),
+      selected_packages AS (
+        SELECT f.package_key, ${sortAggregate} AS sort_value
+          FROM filtered f
+         GROUP BY f.package_key
+         ORDER BY sort_value ${sortDirection}, f.package_key
+         LIMIT $${paramIdx} OFFSET $${paramIdx + 1}
+      )
       SELECT s.id, s.sku, s.uid, s.account_nickname, s.quantity,
         s.marketplace,
         s.marketplace AS channel,
+        s.shipping_id,
+        sp.package_key,
+        CASE
+          WHEN s.marketplace = 'ML' THEN COALESCE(NULLIF(s.raw_api_data->>'pack_id', ''), s.shipping_id, s.id)
+          ELSE s.id
+        END AS pack_id,
         s.product_title,
         ${U_SHIPPING_MODE} AS shipping_mode,
         s.shipping_deadline AS shipping_limit_date,
         s.shipping_status,
         s.product_thumbnail,
         u.name AS user_nickname,
-        -- Descrição interna cadastrada no Armazenamento (prioridade 1 na exibição)
         (SELECT sk.descricao FROM public.skus sk
           WHERE sk.user_id = s.uid
             AND UPPER(TRIM(sk.sku)) = UPPER(TRIM(s.sku))
             AND sk.descricao IS NOT NULL AND TRIM(sk.descricao) <> ''
           ORDER BY sk.ativo DESC
           LIMIT 1) AS sku_descricao,
-        -- Variação escolhida na venda (cor, tamanho...). Só o ML publica
-        -- variation_attributes; na Shopee a variação vem no nome do modelo.
         CASE WHEN s.marketplace = 'ML' THEN COALESCE(
           (SELECT oi->'item'->'variation_attributes'
              FROM jsonb_array_elements(COALESCE(s.raw_api_data->'order_items', '[]'::jsonb)) oi
@@ -1005,18 +1047,17 @@ router.get('/separacao', authenticateToken, requireMaster, async (req, res) => {
             LIMIT 1)
         ) END AS variation_attributes,
         s.shipping_deadline AS sla_expected_date,
-        COALESCE(NULLIF(s.shipping_status, ''), ${U_OPERATIONAL_STATUS}) AS shipping_status_live,
+        ${U_OPERATIONAL_STATUS} AS shipping_status_live,
         s.buyer_name AS buyer_first_name,
         NULL::text AS buyer_last_name,
         s.buyer_nickname
       FROM public.unified_sales s
+      JOIN selected_packages sp ON sp.package_key = ${packageKeyExpr}
       LEFT JOIN public.users u ON s.uid = u.uid
-      ${whereClause}
-      ORDER BY ${orderBy}
-      LIMIT $${paramIdx} OFFSET $${paramIdx + 1};
+      WHERE COALESCE(u.active, true) = true
+      ORDER BY sp.sort_value ${sortDirection}, sp.package_key, s.id, s.sku;
     `;
 
-    // Executa as 3 queries em paralelo (mais rápido)
     const [summaryResult, modeResult, dataResult] = await Promise.all([
       db.query(summaryQuery, params),
       db.query(modeQuery, params),
@@ -1024,15 +1065,15 @@ router.get('/separacao', authenticateToken, requireMaster, async (req, res) => {
     ]);
 
     const sRow = summaryResult.rows[0] || {};
+    const totalPacotes = parseInt(sRow.total_pacotes, 10) || 0;
     const totalItens = parseInt(sRow.total_itens, 10) || 0;
-    const total = totalItens;
-
     const porModalidade = {};
     for (const r of modeResult.rows) {
       porModalidade[r.mode] = parseInt(r.count, 10) || 0;
     }
 
     const summary = {
+      totalPacotes,
       totalItens,
       totalUnidades: parseInt(sRow.total_unidades, 10) || 0,
       atrasados: parseInt(sRow.atrasados, 10) || 0,
@@ -1043,10 +1084,10 @@ router.get('/separacao', authenticateToken, requireMaster, async (req, res) => {
 
     res.json({
       items: dataResult.rows,
-      total,
+      total: totalPacotes,
       page,
       limit,
-      totalPages: Math.ceil(total / limit),
+      totalPages: Math.max(1, Math.ceil(totalPacotes / limit)),
       summary,
     });
   } catch (err) {
@@ -2183,29 +2224,10 @@ router.put('/status', authenticateToken, requireMaster, async (req, res) => {
       }
 
       const stock = skuR.rows[0];
-      
-      // Check if this SKU is a component of any kit (for package_type logic)
-      let isKitComponent = false;
-      let kitPackageTypeId = null;
-      let kitSkuCode = null;
-      
-      if (!stock.is_kit) {
-        // Check if this SKU is used as a component in any kit
-        const kitComponentCheckQuery = `
-          SELECT kc.kit_sku_id, ks.sku as kit_sku_code, ks.package_type_id
-          FROM public.sku_kit_components kc
-          JOIN public.skus ks ON kc.kit_sku_id = ks.id
-          WHERE kc.child_sku_id = $1 AND ks.user_id = $2
-        `;
-        const kitComponentCheck = await client.query(kitComponentCheckQuery, [stock.id, uid]);
-        
-        if (kitComponentCheck.rows.length > 0) {
-          isKitComponent = true;
-          // Use the first kit's package_type (assuming one component can't be in multiple kits)
-          kitPackageTypeId = kitComponentCheck.rows[0].package_type_id;
-          kitSkuCode = kitComponentCheck.rows[0].kit_sku_code;
-        }
-      }
+
+      // A embalagem faturada sempre pertence ao SKU efetivamente vendido.
+      // Um SKU individual pode participar de vários kits, mas essa relação
+      // não transforma uma venda unitária em venda de kit.
       
       // Handle kit vs regular SKU logic
       if (stock.is_kit) {
@@ -2214,6 +2236,7 @@ router.put('/status', authenticateToken, requireMaster, async (req, res) => {
           SELECT child_sku_id, quantity_per_kit
           FROM public.sku_kit_components
           WHERE kit_sku_id = $1
+          ORDER BY child_sku_id
         `;
         const kitComponents = await client.query(kitComponentsQuery, [stock.id]);
 
@@ -2265,17 +2288,21 @@ router.put('/status', authenticateToken, requireMaster, async (req, res) => {
           ]);
         }
 
-        // Record movement for the kit itself (informational)
+        // Movimento faturável do kit vendido; as baixas dos filhos acima são
+        // apenas movimentos físicos e não geram outra cobrança de embalagem.
         const insertKitMovementQuery = `
-          INSERT INTO public.stock_movements (sku_id, user_id, movement_type, quantity_change, reason, related_sale_id)
-          VALUES ($1, $2, 'saida', $3, $4, $5)
+          INSERT INTO public.stock_movements
+            (sku_id, user_id, movement_type, quantity_change, reason, related_sale_id, package_type_id, package_type_context)
+          VALUES ($1, $2, 'saida', $3, $4, $5, $6, $7)
         `;
         await client.query(insertKitMovementQuery, [
-          stock.id, 
-          uid, 
-          quantitySold, 
-          `Saída por Venda - ID: ${saleId}`, 
-          saleId
+          stock.id,
+          uid,
+          quantitySold,
+          `Saída por Venda - ID: ${saleId}`,
+          saleId,
+          stock.package_type_id,
+          `Kit vendido: ${stock.sku_code}`
         ]);
       } else {
         // Regular SKU logic
@@ -2290,22 +2317,11 @@ router.put('/status', authenticateToken, requireMaster, async (req, res) => {
         );
 
         const reason = `Saída por Venda - ID: ${saleId}`;
-        
-        // Determine which package_type to use based on context
-        let effectivePackageTypeId = stock.package_type_id;
-        let packageTypeContext = 'SKU próprio';
-        
-        if (isKitComponent && kitPackageTypeId) {
-          // If this SKU is a kit component, use the kit's package_type for billing
-          effectivePackageTypeId = kitPackageTypeId;
-          packageTypeContext = `Kit: ${kitSkuCode}`;
-        }
-        
         await client.query(
           `INSERT INTO public.stock_movements
              (sku_id, user_id, movement_type, quantity_change, reason, related_sale_id, package_type_id, package_type_context)
            VALUES ($1, $2, 'saida', $3, $4, $5, $6, $7)`,
-          [stock.id, uid, quantitySold, reason, saleId, effectivePackageTypeId, packageTypeContext]
+          [stock.id, uid, quantitySold, reason, saleId, stock.package_type_id, 'SKU vendido diretamente']
         );
       }
 
@@ -2407,7 +2423,7 @@ router.post('/process', authenticateToken, requireMaster, async (req, res) => {
         }
 
         const skuResult = await client.query(
-          `SELECT id, sku, quantidade, is_kit
+          `SELECT id, sku, quantidade, is_kit, package_type_id
              FROM public.skus
             WHERE UPPER(TRIM(sku)) = UPPER(TRIM($1))
               AND user_id = $2
@@ -2425,7 +2441,8 @@ router.post('/process', authenticateToken, requireMaster, async (req, res) => {
           const kitComponents = await client.query(
             `SELECT child_sku_id, quantity_per_kit
                FROM public.sku_kit_components
-              WHERE kit_sku_id = $1`,
+              WHERE kit_sku_id = $1
+              ORDER BY child_sku_id`,
             [stock.id]
           );
           if (kitComponents.rowCount === 0) {
@@ -2460,12 +2477,21 @@ router.post('/process', authenticateToken, requireMaster, async (req, res) => {
             );
           }
 
-          // Movimento informativo do kit; o estoque físico está nos filhos.
+          // Movimento faturável do kit efetivamente vendido. Os movimentos
+          // dos filhos representam somente a baixa do estoque compartilhado.
           await client.query(
             `INSERT INTO public.stock_movements
-               (sku_id, user_id, movement_type, quantity_change, reason, related_sale_id)
-             VALUES ($1, $2, 'saida', $3, $4, $5)`,
-            [stock.id, sale.uid, sale.quantity, `Saída por Venda Mercado Livre - ID ${sale.id}`, sale.id]
+               (sku_id, user_id, movement_type, quantity_change, reason, related_sale_id, package_type_id, package_type_context)
+             VALUES ($1, $2, 'saida', $3, $4, $5, $6, $7)`,
+            [
+              stock.id,
+              sale.uid,
+              sale.quantity,
+              `Saída por Venda Mercado Livre - ID ${sale.id}`,
+              sale.id,
+              stock.package_type_id,
+              `Kit vendido: ${stock.sku}`
+            ]
           );
         } else {
           if (Number(stock.quantidade) < sale.quantity) {
@@ -2478,9 +2504,17 @@ router.post('/process', authenticateToken, requireMaster, async (req, res) => {
           );
           await client.query(
             `INSERT INTO public.stock_movements
-               (sku_id, user_id, movement_type, quantity_change, reason, related_sale_id)
-             VALUES ($1, $2, 'saida', $3, $4, $5)`,
-            [stock.id, sale.uid, sale.quantity, `Saída por Venda Mercado Livre - ID ${sale.id}`, sale.id]
+               (sku_id, user_id, movement_type, quantity_change, reason, related_sale_id, package_type_id, package_type_context)
+             VALUES ($1, $2, 'saida', $3, $4, $5, $6, $7)`,
+            [
+              stock.id,
+              sale.uid,
+              sale.quantity,
+              `Saída por Venda Mercado Livre - ID ${sale.id}`,
+              sale.id,
+              stock.package_type_id,
+              'SKU vendido diretamente'
+            ]
           );
         }
 

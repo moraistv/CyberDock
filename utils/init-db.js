@@ -192,7 +192,7 @@ const schema = {
             id SERIAL PRIMARY KEY,
             kit_sku_id INTEGER NOT NULL REFERENCES public.skus(id) ON DELETE CASCADE,
             child_sku_id INTEGER NOT NULL REFERENCES public.skus(id) ON DELETE CASCADE,
-            quantity_per_kit INTEGER NOT NULL DEFAULT 1,
+            quantity_per_kit INTEGER NOT NULL DEFAULT 1 CHECK (quantity_per_kit > 0),
             created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
             updated_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
             UNIQUE (kit_sku_id, child_sku_id)
@@ -291,6 +291,24 @@ async function syncDatabaseSchema() {
                         console.log(`   -> Adicionando coluna 'updated_at' à tabela: public.sku_kit_components`);
                         await client.query('ALTER TABLE public.sku_kit_components ADD COLUMN updated_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP;');
                     }
+                    // O relacionamento já é N:N: a unicidade vale somente para
+                    // o par kit/componente. Estes índices aceleram os dois lados
+                    // e o CHECK impede composições sem quantidade válida.
+                    await client.query('CREATE INDEX IF NOT EXISTS idx_sku_kit_components_child ON public.sku_kit_components(child_sku_id);');
+                    await client.query('CREATE INDEX IF NOT EXISTS idx_sku_kit_components_kit ON public.sku_kit_components(kit_sku_id);');
+                    await client.query(`
+                        DO $$ BEGIN
+                            IF NOT EXISTS (
+                                SELECT 1 FROM pg_constraint
+                                WHERE conname = 'sku_kit_components_quantity_positive'
+                                  AND conrelid = 'public.sku_kit_components'::regclass
+                            ) THEN
+                                ALTER TABLE public.sku_kit_components
+                                  ADD CONSTRAINT sku_kit_components_quantity_positive
+                                  CHECK (quantity_per_kit > 0) NOT VALID;
+                            END IF;
+                        END $$;
+                    `);
                 }
                 if (tableName === 'kit_parents') {
                     // Criar índice para otimizar buscas por user_id na tabela kit_parents

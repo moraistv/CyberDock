@@ -323,7 +323,7 @@ router.get('/user/:userId/billing-summary', authenticateToken, requireOwnerOrMas
       SELECT sm.quantity_change, pt.name as package_type_name, pt.price as package_type_price
       FROM public.stock_movements sm
       JOIN public.skus s ON sm.sku_id = s.id
-      JOIN public.package_types pt ON s.package_type_id = pt.id
+      JOIN public.package_types pt ON COALESCE(sm.package_type_id, s.package_type_id) = pt.id
       WHERE sm.user_id = $1
         AND sm.movement_type = 'saida'
         AND sm.reason LIKE 'Saída por Venda%'
@@ -1177,106 +1177,111 @@ router.delete('/movements/:movementId', authenticateToken, async (req, res) => {
 
 // --- ROTA PARA CONECTAR SKU A KITS EXISTENTES ---
 router.post('/user/:userId/connect-sku-to-kits', authenticateToken, async (req, res) => {
-  console.log('POST /user/:userId/connect-sku-to-kits called');
-  console.log('Request params:', req.params);
-  console.log('Request body:', req.body);
-  
   const { userId } = req.params;
   const { sku_id, connections } = req.body;
 
-  console.log('Extracted userId:', userId);
-  console.log('Extracted sku_id:', sku_id);
-  console.log('Extracted connections:', connections);
-
   if (req.user.role !== 'master' && req.user.uid !== userId) {
-    console.log('Access denied. User role:', req.user.role, 'User uid:', req.user.uid, 'Requested userId:', userId);
     return res.status(403).json({ error: 'Acesso negado.' });
   }
+  if (!sku_id || !Array.isArray(connections)) {
+    return res.status(400).json({ error: 'SKU ID e a lista de conexões são obrigatórios.' });
+  }
 
-  if (!sku_id || !connections || !Array.isArray(connections) || connections.length === 0) {
-    console.log('Validation failed:', { sku_id, connections, isArray: Array.isArray(connections), length: connections?.length });
-    return res.status(400).json({ error: 'SKU ID e conexões são obrigatórios.' });
+  const normalizedConnections = connections.map((connection) => ({
+    kit_id: Number(connection.kit_id),
+    quantity_per_kit: Number(connection.quantity_per_kit),
+  }));
+  const kitIds = normalizedConnections.map((connection) => connection.kit_id);
+  if (normalizedConnections.some((connection) =>
+    !Number.isInteger(connection.kit_id)
+    || !Number.isInteger(connection.quantity_per_kit)
+    || connection.quantity_per_kit < 1
+  )) {
+    return res.status(400).json({ error: 'Kit e quantidade por kit devem ser números inteiros válidos.' });
+  }
+  if (new Set(kitIds).size !== kitIds.length) {
+    return res.status(400).json({ error: 'A lista contém o mesmo kit mais de uma vez.' });
   }
 
   const client = await db.pool.connect();
   try {
     await client.query('BEGIN');
 
-    // Verificar se o SKU existe e pertence ao usuário
-    console.log('Checking SKU existence for sku_id:', sku_id, 'userId:', userId);
     const skuCheck = await client.query(
-      'SELECT id, sku FROM public.skus WHERE id = $1 AND user_id = $2 AND is_kit = false',
+      `SELECT id
+         FROM public.skus
+        WHERE id = $1 AND user_id = $2 AND is_kit = false
+        FOR UPDATE`,
       [sku_id, userId]
     );
-    
-    console.log('SKU check result:', skuCheck.rows);
-    
-    if (skuCheck.rows.length === 0) {
-      console.log('SKU not found or not individual SKU');
-      throw new Error('SKU não encontrado ou não é um SKU individual.');
+    if (skuCheck.rowCount === 0) {
+      const error = new Error('SKU não encontrado ou não é um SKU individual.');
+      error.status = 400;
+      throw error;
     }
 
-    // Verificar se todos os kits existem e pertencem ao usuário
-    for (const connection of connections) {
-      console.log('Checking kit existence for kit_id:', connection.kit_id, 'userId:', userId);
-      const kitCheck = await client.query(
-        'SELECT id, sku FROM public.skus WHERE id = $1 AND user_id = $2 AND is_kit = true',
-        [connection.kit_id, userId]
+    if (kitIds.length > 0) {
+      const kitsCheck = await client.query(
+        `SELECT id
+           FROM public.skus
+          WHERE id = ANY($1::int[]) AND user_id = $2 AND is_kit = true AND ativo = true
+          FOR UPDATE`,
+        [kitIds, userId]
       );
-      
-      console.log('Kit check result for kit_id:', connection.kit_id, ':', kitCheck.rows);
-      
-      if (kitCheck.rows.length === 0) {
-        console.log('Kit not found for kit_id:', connection.kit_id);
-        throw new Error(`Kit com ID ${connection.kit_id} não encontrado.`);
+      if (kitsCheck.rowCount !== kitIds.length) {
+        const error = new Error('Um ou mais kits não existem, estão inativos ou pertencem a outro usuário.');
+        error.status = 400;
+        throw error;
       }
+    }
 
-      // Verificar se a conexão já existe
-      console.log('Checking existing connection for kit_id:', connection.kit_id, 'sku_id:', sku_id);
-      const existingConnection = await client.query(
-        'SELECT id FROM public.sku_kit_components WHERE kit_sku_id = $1 AND child_sku_id = $2',
-        [connection.kit_id, sku_id]
+    // O payload representa o estado completo dos vínculos deste SKU. Remover
+    // um kit não afeta os demais; uma lista vazia desconecta de todos.
+    let removedResult;
+    if (kitIds.length === 0) {
+      removedResult = await client.query(
+        `DELETE FROM public.sku_kit_components kc
+          USING public.skus ks
+          WHERE kc.child_sku_id = $1
+            AND ks.id = kc.kit_sku_id
+            AND ks.user_id = $2`,
+        [sku_id, userId]
       );
+    } else {
+      removedResult = await client.query(
+        `DELETE FROM public.sku_kit_components kc
+          USING public.skus ks
+          WHERE kc.child_sku_id = $1
+            AND ks.id = kc.kit_sku_id
+            AND ks.user_id = $2
+            AND NOT (kc.kit_sku_id = ANY($3::int[]))`,
+        [sku_id, userId, kitIds]
+      );
+    }
 
-      console.log('Existing connection check result:', existingConnection.rows);
-
-      if (existingConnection.rows.length > 0) {
-        // Atualizar quantidade se já existe
-        console.log('Updating existing connection for kit_id:', connection.kit_id, 'sku_id:', sku_id, 'quantity:', connection.quantity_per_kit);
-        await client.query(
-          'UPDATE public.sku_kit_components SET quantity_per_kit = $1, updated_at = NOW() WHERE kit_sku_id = $2 AND child_sku_id = $3',
-          [connection.quantity_per_kit, connection.kit_id, sku_id]
-        );
-        console.log('Connection updated successfully');
-      } else {
-        // Inserir nova conexão
-        console.log('Inserting new connection for kit_id:', connection.kit_id, 'sku_id:', sku_id, 'quantity:', connection.quantity_per_kit);
-        await client.query(
-          'INSERT INTO public.sku_kit_components (kit_sku_id, child_sku_id, quantity_per_kit) VALUES ($1, $2, $3)',
-          [connection.kit_id, sku_id, connection.quantity_per_kit]
-        );
-        console.log('Connection inserted successfully');
-      }
+    for (const connection of normalizedConnections) {
+      await client.query(
+        `INSERT INTO public.sku_kit_components
+           (kit_sku_id, child_sku_id, quantity_per_kit)
+         VALUES ($1, $2, $3)
+         ON CONFLICT (kit_sku_id, child_sku_id)
+         DO UPDATE SET quantity_per_kit = EXCLUDED.quantity_per_kit, updated_at = NOW()`,
+        [connection.kit_id, sku_id, connection.quantity_per_kit]
+      );
     }
 
     await client.query('COMMIT');
-    console.log('Transaction committed successfully');
-    console.log('Sending success response with connections_count:', connections.length);
-    
-    res.status(200).json({ 
-      message: 'SKU conectado aos kits com sucesso.',
-      connections_count: connections.length 
+    res.status(200).json({
+      message: 'Vínculos do SKU atualizados com sucesso.',
+      connections_count: normalizedConnections.length,
+      removed_count: removedResult.rowCount,
     });
-
   } catch (error) {
-    console.error('Error in connect-sku-to-kits route:', error);
-    await client.query('ROLLBACK');
-    console.error('Transaction rolled back');
-    console.error('Erro ao conectar SKU aos kits:', error);
-    res.status(500).json({ error: error.message || 'Erro interno do servidor.' });
+    try { await client.query('ROLLBACK'); } catch { /* ignore */ }
+    console.error('Erro ao atualizar vínculos do SKU com kits:', error);
+    res.status(error.status || 500).json({ error: error.message || 'Erro interno do servidor.' });
   } finally {
     client.release();
-    console.log('Database client released');
   }
 });
 
