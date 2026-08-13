@@ -50,6 +50,21 @@ const salesCountInFlight = new Map();
 const SALES_COUNT_TTL_MS = 20000;
 const SALES_COUNT_CACHE_MAX = 500;
 
+/* Teto da contagem exata.
+ *
+ * COUNT(*) sobre public.unified_sales é caro por um motivo específico: o
+ * Postgres NÃO elimina colunas não usadas de um UNION ALL, então mesmo contando
+ * linhas ele avalia a lista de saída da view — extração de JSONB, regex e cast
+ * do prazo, thumbnail, comprador — para CADA linha das duas tabelas. No tabelão
+ * admin, que não filtra por dono, isso varria a base inteira de todos os
+ * clientes e era o que deixava a tela em dezenas de segundos.
+ *
+ * Contando com LIMIT, o trabalho fica limitado: filtros do dia a dia (que é o
+ * uso real) devolvem número exato, e recortes gigantes viram "10.000+" em vez
+ * de travar a tela para exibir um número que ninguém lê.
+ */
+const SALES_COUNT_MAX = parseInt(process.env.SALES_COUNT_MAX || '10000', 10);
+
 function getCachedSalesCount(key) {
   const hit = salesCountCache.get(key);
   if (!hit) return null;
@@ -92,6 +107,28 @@ function loadSalesCount(key, query, params) {
 
   salesCountInFlight.set(key, promise);
   return promise;
+}
+
+/**
+ * Contagem LIMITADA ao teto: em vez de varrer tudo, para de contar em
+ * SALES_COUNT_MAX + 1. `counted` maior que o teto significa "há mais que isso".
+ */
+function buildBoundedCountQuery(whereClause) {
+  return `
+    SELECT COUNT(*)::int AS total
+      FROM (
+        SELECT 1
+          FROM public.unified_sales s
+          ${whereClause}
+         LIMIT ${SALES_COUNT_MAX + 1}
+      ) bounded`;
+}
+
+/** Traduz a contagem limitada no par (total exibido, é exato?). */
+function resolveBoundedTotal(counted) {
+  return counted > SALES_COUNT_MAX
+    ? { total: SALES_COUNT_MAX, exact: false }
+    : { total: counted, exact: true };
 }
 
 const sendEvent = (clientId, data) => {
@@ -773,6 +810,15 @@ function buildSeparacaoWhere(req) {
     conditions.push(`s.sale_date >= $${paramIdx}`);
     params.push(saleDateStart + 'T00:00:00-03:00');
     paramIdx++;
+  } else if ((req.query.window || '').trim() !== 'all') {
+    // Mesma proteção do tabelão: sem janela, a fila varreria o histórico das
+    // duas tabelas de todos os clientes e estouraria o statement_timeout.
+    // A fila de separação olha o que está para despachar, não o passado.
+    conditions.push(`s.sale_date >= (
+      ((now() AT TIME ZONE 'America/Sao_Paulo')::date - ($${paramIdx})::int)
+    ) AT TIME ZONE 'America/Sao_Paulo'`);
+    params.push(parseInt(process.env.ADMIN_SALES_WINDOW_DAYS || '30', 10));
+    paramIdx++;
   }
   if (saleDateEnd) {
     conditions.push(`s.sale_date <= $${paramIdx}`);
@@ -1094,11 +1140,41 @@ router.get('/all', authenticateToken, requireMaster, async (req, res) => {
       params.push(saleStatus);
       paramIdx++;
     }
+    /* ------------------------ Janela padrão de datas -------------------------
+     * Sem recorte de data, este tabelão pede "as 50 vendas mais recentes de
+     * TODOS os clientes" e o Postgres tem de considerar o histórico inteiro das
+     * duas tabelas. Na prática isso batia no statement_timeout de 30s do pool e
+     * a tela devolvia 500 — era o "29 segundos" observado.
+     *
+     * Com uma janela padrão o intervalo vira uma leitura por índice em
+     * (sale_date DESC), que é limitada por natureza. O cliente continua podendo
+     * pedir qualquer período: `window=all` desliga o padrão explicitamente.
+     */
+    const windowMode = (req.query.window || '').trim();
+    const WINDOW_DAYS = {
+      today: 0,
+      '7d': 7,
+      '30d': 30,
+      '90d': 90,
+    };
+    const DEFAULT_WINDOW_DAYS = parseInt(process.env.ADMIN_SALES_WINDOW_DAYS || '30', 10);
+    let defaultWindowDays = null;
+
     if (saleDateStart) {
       conditions.push(`s.sale_date >= $${paramIdx}`);
       // Limite do dia em horário de Brasília (UTC-3). Antes usava meia-noite
       // UTC, o que trazia vendas do fim da noite de ontem (BRT) no filtro "hoje".
       params.push(saleDateStart + 'T00:00:00-03:00');
+      paramIdx++;
+    } else if (windowMode !== 'all') {
+      defaultWindowDays = Object.prototype.hasOwnProperty.call(WINDOW_DAYS, windowMode)
+        ? WINDOW_DAYS[windowMode]
+        : DEFAULT_WINDOW_DAYS;
+      // Início do dia em Brasília, para "hoje" bater com o calendário do usuário.
+      conditions.push(`s.sale_date >= (
+        ((now() AT TIME ZONE 'America/Sao_Paulo')::date - ($${paramIdx})::int)
+      ) AT TIME ZONE 'America/Sao_Paulo'`);
+      params.push(defaultWindowDays);
       paramIdx++;
     }
     if (saleDateEnd) {
@@ -1165,11 +1241,8 @@ router.get('/all', authenticateToken, requireMaster, async (req, res) => {
 
     const whereClause = conditions.length > 0 ? 'WHERE ' + conditions.join(' AND ') : '';
 
-    // Sem JOIN: os filtros agora vivem todos nas tabelas de venda.
-    const countQuery = `
-      SELECT COUNT(*) as total
-        FROM public.unified_sales s
-        ${whereClause}`;
+    // Sem JOIN e com teto: os filtros agora vivem todos nas tabelas de venda.
+    const countQuery = buildBoundedCountQuery(whereClause);
 
     // Mesma estratégia da tela do usuário: recorta a página primeiro e só
     // depois resolve SKU/JSON, para o custo por linha valer apenas 1 página.
@@ -1253,25 +1326,36 @@ router.get('/all', authenticateToken, requireMaster, async (req, res) => {
     const cachedTotal = getCachedSalesCount(countKey);
 
     if (req.query.countOnly === '1') {
-      const total = cachedTotal === null
+      const counted = cachedTotal === null
         ? await loadSalesCount(countKey, countQuery, params)
         : cachedTotal;
-      return res.json({ total, totalPages: Math.ceil(total / limit) || 1 });
+      const bounded = resolveBoundedTotal(counted);
+      return res.json({
+        total: bounded.total,
+        totalExact: bounded.exact,
+        totalPages: bounded.exact ? (Math.ceil(bounded.total / limit) || 1) : page + 1,
+      });
     }
 
     const dataResult = await db.query(dataQuery, [...params, limit + 1, offset]);
     const hasNext = dataResult.rows.length > limit;
     const rows = hasNext ? dataResult.rows.slice(0, limit) : dataResult.rows;
 
-    let total = cachedTotal;
-    let totalExact = cachedTotal !== null;
+    let total = null;
+    let totalExact = false;
 
-    if (total === null && !hasNext) {
+    if (cachedTotal !== null) {
+      const bounded = resolveBoundedTotal(cachedTotal);
+      total = bounded.total;
+      totalExact = bounded.exact;
+    } else if (!hasNext) {
+      // Última página: o total sai da própria posição, sem contar nada.
       total = offset + rows.length;
       totalExact = true;
       setCachedSalesCount(countKey, total);
+    } else {
+      total = offset + rows.length + 1;
     }
-    if (total === null) total = offset + rows.length + 1;
 
     res.json({
       data: rows,
@@ -1281,6 +1365,8 @@ router.get('/all', authenticateToken, requireMaster, async (req, res) => {
       page,
       limit,
       totalPages: totalExact ? (Math.ceil(total / limit) || 1) : page + 1,
+      // A tela avisa qual janela está em uso, para o número não parecer errado.
+      defaultWindowDays,
     });
 
     if (!totalExact) {
@@ -1290,6 +1376,9 @@ router.get('/all', authenticateToken, requireMaster, async (req, res) => {
         });
       });
     }
+    // Aquece a thumbnail que faltou. A função agrupa por conta e usa o token
+    // daquela conta, então funciona no tabelão global; sem isso, venda cuja
+    // imagem ainda não foi gravada no banco aparece sem foto.
     setImmediate(() => warmMlThumbnailCache(rows));
   } catch (error) {
     console.error("Erro interno ao buscar todas as vendas:", error);
@@ -1870,9 +1959,9 @@ router.get('/my-sales', authenticateToken, async (req, res) => {
 
     const whereClause = 'WHERE ' + conditions.join(' AND ');
 
-    // Count e página usam os mesmos filtros e são independentes; executá-los
-    // juntos elimina uma ida sequencial ao banco em toda troca de filtro.
-    const countQuery = `SELECT COUNT(*) as total FROM public.unified_sales s ${whereClause}`;
+    // Contagem com teto, pelo mesmo motivo do tabelão: COUNT(*) sobre a view
+    // avalia as expressões do UNION ALL linha por linha.
+    const countQuery = buildBoundedCountQuery(whereClause);
     // Primeiro recorta somente a página pedida. O MATERIALIZED é intencional:
     // garante que lookup de SKU, expansão de JSON e montagem do payload sejam
     // executados para no máximo limit + 1 linhas, nunca para todo o histórico.
@@ -1950,10 +2039,15 @@ router.get('/my-sales', authenticateToken, async (req, res) => {
     const cachedTotal = getCachedSalesCount(countKey);
 
     if (req.query.countOnly === '1') {
-      const total = cachedTotal === null
+      const counted = cachedTotal === null
         ? await loadSalesCount(countKey, countQuery, params)
         : cachedTotal;
-      return res.json({ total, totalPages: Math.ceil(total / limit) || 1 });
+      const bounded = resolveBoundedTotal(counted);
+      return res.json({
+        total: bounded.total,
+        totalExact: bounded.exact,
+        totalPages: bounded.exact ? (Math.ceil(bounded.total / limit) || 1) : page + 1,
+      });
     }
 
     // Busca uma linha extra para descobrir se existe próxima página sem COUNT.
@@ -1961,19 +2055,22 @@ router.get('/my-sales', authenticateToken, async (req, res) => {
     const hasNext = dataResult.rows.length > limit;
     const rows = hasNext ? dataResult.rows.slice(0, limit) : dataResult.rows;
 
-    let total = cachedTotal;
-    let totalExact = cachedTotal !== null;
+    let total = null;
+    let totalExact = false;
 
-    // Se não veio a linha extra, esta é a última página e o total já é exato.
-    if (total === null && !hasNext) {
+    if (cachedTotal !== null) {
+      const bounded = resolveBoundedTotal(cachedTotal);
+      total = bounded.total;
+      totalExact = bounded.exact;
+    } else if (!hasNext) {
+      // Última página: o total sai da posição atual, sem contar nada.
       total = offset + rows.length;
       totalExact = true;
       setCachedSalesCount(countKey, total);
+    } else {
+      // Limite inferior enquanto a contagem roda em segundo plano.
+      total = offset + rows.length + 1;
     }
-
-    // Enquanto a contagem exata aquece, devolve um limite inferior suficiente
-    // para a UI habilitar "Próximo" e renderizar os dados imediatamente.
-    if (total === null) total = offset + rows.length + 1;
 
     res.json({
       data: rows,
