@@ -1,5 +1,6 @@
 // backend/routes/users.js
 const express = require('express');
+const bcrypt = require('bcryptjs');
 const db = require('../utils/postgres');
 const { authenticateToken, requireMaster, requireOwnerOrMaster } = require('../utils/authMiddleware');
 
@@ -91,6 +92,44 @@ router.put('/:uid/name', authenticateToken, requireMaster, async (req, res) => {
     } catch (error) {
         console.error(`Erro ao atualizar nome para o usuário ${uid}:`, error);
         res.status(500).json({ error: 'Erro interno ao atualizar nome.' });
+    }
+});
+
+/**
+ * @route   PUT /api/users/:uid/password
+ * @desc    Define uma nova senha para um usuário (suporte/administração).
+ * @access  Private (Master)
+ *
+ * O login compara com bcrypt em public.users.password_hash, então a senha
+ * definida aqui passa a valer imediatamente para o cliente. A senha atual NÃO é
+ * exigida: quem chama é master e o caso de uso é justamente o cliente que
+ * perdeu o acesso. O valor em texto puro nunca é gravado nem registrado em log.
+ */
+router.put('/:uid/password', authenticateToken, requireMaster, async (req, res) => {
+    const { uid } = req.params;
+    const { password } = req.body;
+
+    if (typeof password !== 'string' || password.trim().length < 8) {
+        return res.status(400).json({ error: 'A senha deve ter ao menos 8 caracteres.' });
+    }
+
+    try {
+        const salt = await bcrypt.genSalt(10);
+        const passwordHash = await bcrypt.hash(password.trim(), salt);
+
+        const { rows } = await db.query(
+            'UPDATE public.users SET password_hash = $1, updated_at = NOW() WHERE uid = $2 RETURNING uid, email',
+            [passwordHash, uid]
+        );
+
+        if (rows.length === 0) {
+            return res.status(404).json({ error: 'Usuário não encontrado.' });
+        }
+
+        res.json({ message: 'Senha atualizada com sucesso.', user: rows[0] });
+    } catch (error) {
+        console.error(`Erro ao atualizar senha do usuário ${uid}:`, error.message);
+        res.status(500).json({ error: 'Erro interno ao atualizar a senha.' });
     }
 });
 
