@@ -23,7 +23,9 @@ const clients = {};
 // do EventSource conectar (mais provável agora que o sync incremental é rápido).
 // Sem isto, o evento de progresso 100 poderia se perder e a tela ficaria presa.
 const pendingEvents = {};
-const PENDING_TTL_MS = 60000;
+// Mesmo motivo do shopee.js: uma reconexão que passe do TTL perderia o evento
+// final e deixaria a conta presa em "sincronizando".
+const PENDING_TTL_MS = 5 * 60 * 1000;
 
 const sleep = (ms) => new Promise(resolve => setTimeout(resolve, ms));
 
@@ -729,9 +731,25 @@ router.get('/sync-status/:clientId', (req, res) => {
   res.writeHead(200, {
     'Content-Type': 'text/event-stream',
     Connection: 'keep-alive',
-    'Cache-Control': 'no-cache'
+    'Cache-Control': 'no-cache',
+    // Impede o proxy de bufferizar o stream (eventos chegariam em lote, ou
+    // nunca, e a conexão pareceria morta).
+    'X-Accel-Buffering': 'no'
   });
-  clients[clientId] = { res };
+  res.write(': ok\n\n');
+  if (typeof res.flushHeaders === 'function') res.flushHeaders();
+
+  // Heartbeat: uma conta com backlog grande fica minutos entre eventos, e
+  // proxy/balanceador derruba conexão ociosa. O ping mantém o canal vivo.
+  const heartbeat = setInterval(() => {
+    try {
+      res.write(': ping\n\n');
+    } catch {
+      clearInterval(heartbeat);
+    }
+  }, 15000);
+
+  clients[clientId] = { res, heartbeat };
 
   // Descarrega eventos que aconteceram antes do SSE conectar (incluindo um
   // eventual progresso 100 se o job já tiver terminado).
@@ -747,6 +765,7 @@ router.get('/sync-status/:clientId', (req, res) => {
   }
 
   req.on('close', () => {
+    clearInterval(heartbeat);
     delete clients[clientId];
   });
 });

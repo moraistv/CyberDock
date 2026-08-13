@@ -47,7 +47,14 @@ const REDIRECT_URI = process.env.SHOPEE_REDIRECT_URI || `${FRONTEND_URL}/shopee/
 /* --------------------------- SSE (mesmo padrão de /sales) --------------------------- */
 const clients = {};
 const pendingEvents = {};
-const PENDING_TTL_MS = 60000;
+/* Guarda os eventos enquanto ninguém está conectado.
+ *
+ * 60s era curto demais: se o SSE caía e a reconexão passava desse tempo, o
+ * evento de progresso 100 era descartado e a loja ficava "sincronizando" para
+ * sempre na tela. 5 minutos cobrem uma reconexão real sem acumular memória
+ * (a chave é apagada assim que o cliente reconecta e consome a fila).
+ */
+const PENDING_TTL_MS = 5 * 60 * 1000;
 
 const sendEvent = (clientId, data) => {
   if (clients[clientId]) {
@@ -69,8 +76,31 @@ router.get('/sync-status/:clientId', (req, res) => {
     'Content-Type': 'text/event-stream',
     Connection: 'keep-alive',
     'Cache-Control': 'no-cache',
+    // Sem isto o nginx/proxy BUFFERIZA o stream: os eventos não chegam ao
+    // navegador na hora e a conexão parece morta.
+    'X-Accel-Buffering': 'no',
   });
-  clients[clientId] = { res };
+  // Preenchimento inicial: alguns proxies só liberam a resposta após um bloco.
+  res.write(': ok\n\n');
+  if (typeof res.flushHeaders === 'function') res.flushHeaders();
+
+  /* Heartbeat.
+   *
+   * Uma carga completa de loja percorre janelas de 15 dias com chamadas de
+   * lista, detalhe e escrow. Entre duas janelas o stream pode ficar em silêncio
+   * por muito tempo, e proxy/balanceador encerra conexão ociosa — no navegador
+   * isso virava "A conexão com o servidor foi perdida durante a sincronização
+   * Shopee", mesmo com o trabalho seguindo normalmente no servidor.
+   */
+  const heartbeat = setInterval(() => {
+    try {
+      res.write(': ping\n\n');
+    } catch {
+      clearInterval(heartbeat);
+    }
+  }, 15000);
+
+  clients[clientId] = { res, heartbeat };
 
   const buffered = pendingEvents[clientId];
   if (buffered) {
@@ -82,6 +112,7 @@ router.get('/sync-status/:clientId', (req, res) => {
   }
 
   req.on('close', () => {
+    clearInterval(heartbeat);
     delete clients[clientId];
   });
 });
