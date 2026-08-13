@@ -260,11 +260,26 @@ function epochSeconds(d) {
   return Math.floor(d.getTime() / 1000);
 }
 
-const SP_OFFSET_SECONDS = 3 * 60 * 60;
-
-/** create_time (epoch UTC) → naive wall-clock de São Paulo (mesma convenção do ML). */
-function toSaoPauloWallClock(epochSecondsUtc) {
-  return new Date((epochSecondsUtc - SP_OFFSET_SECONDS) * 1000);
+/**
+ * create_time da Shopee (epoch UTC) → instante real.
+ *
+ * ATENÇÃO ao histórico: antes daqui saía um "wall clock de São Paulo",
+ * subtraindo 3h antes de gravar. Isso vem do projeto V2, onde a coluna
+ * data_venda é `timestamp WITHOUT time zone` — lá o valor ingênuo é exibido e
+ * filtrado direto, sem conversão.
+ *
+ * Aqui a coluna é `TIMESTAMP WITH TIME ZONE`, que guarda instante absoluto.
+ * Subtrair 3h antes de gravar fazia o Postgres armazenar um instante 3h no
+ * passado e o navegador aplicar o fuso DE NOVO: a venda aparecia 3h mais cedo
+ * e, entre 00:00 e 02:59, caía no dia anterior (D-1).
+ *
+ * Os filtros desta base (`T00:00:00-03:00`) e o Dashboard
+ * (`AT TIME ZONE 'America/Sao_Paulo'`) já tratam a coluna como instante real,
+ * então o instante verdadeiro é a convenção correta — e é o que `ship_by_date`
+ * sempre usou.
+ */
+function toSaleInstant(epochSecondsUtc) {
+  return new Date(epochSecondsUtc * 1000);
 }
 
 /** Executa uma operação escopada à loja, renovando o token 1x em caso de invalid_access_token. */
@@ -418,7 +433,7 @@ function unitValueOfItem(item, fallback = 0) {
  */
 function orderToRows(order, account, nickname) {
   const orderSn = String(order.order_sn);
-  const dataVenda = toSaoPauloWallClock(toFiniteNumber(order.create_time) ?? 0);
+  const dataVenda = toSaleInstant(toFiniteNumber(order.create_time) ?? 0);
   const itemList = Array.isArray(order.item_list) && order.item_list.length
     ? order.item_list
     : [{}];

@@ -519,6 +519,38 @@ async function syncDatabaseSchema() {
         await client.query('CREATE INDEX IF NOT EXISTS idx_shopee_sales_uid_saledate ON public.shopee_sales(uid, sale_date DESC);');
         await client.query('CREATE INDEX IF NOT EXISTS idx_shopee_sales_uid_shop ON public.shopee_sales(uid, shop_id);');
 
+        // ------------------------------------------------------------------
+        // Correção de fuso da DATA DA VENDA da Shopee (D-1).
+        //
+        // O sync antigo subtraía 3h do create_time (convenção de "wall clock"
+        // do projeto V2, onde a coluna NÃO tem timezone) e gravava numa coluna
+        // TIMESTAMP WITH TIME ZONE, que guarda instante absoluto. A conversão
+        // para Brasília acontecia de novo na exibição, então a venda aparecia
+        // 3h mais cedo e, entre 00:00 e 02:59, no dia anterior.
+        //
+        // O valor é RECALCULADO a partir do create_time original preservado em
+        // raw_api_data, em vez de somar 3h no valor atual. Isso é idempotente
+        // (rodar de novo não muda nada) e imune a sync concorrente, já que
+        // initializeDatabase roda junto com o servidor no ar — um "+3h" cego
+        // corromperia linhas gravadas já corrigidas.
+        //
+        // ship_by_date NÃO entra aqui: sempre foi gravado como instante real
+        // (new Date(epoch * 1000)) e já exibe o prazo correto.
+        // ------------------------------------------------------------------
+        console.log('   -> Corrigindo fuso da data de venda da Shopee (se necessário)...');
+        const shopeeTzFix = await client.query(`
+            UPDATE public.shopee_sales
+               SET sale_date = to_timestamp((raw_api_data->>'create_time')::double precision)
+             WHERE raw_api_data ? 'create_time'
+               AND (raw_api_data->>'create_time') ~ '^[0-9]+$'
+               AND (raw_api_data->>'create_time')::double precision > 0
+               AND sale_date IS DISTINCT FROM
+                   to_timestamp((raw_api_data->>'create_time')::double precision);
+        `);
+        if (shopeeTzFix.rowCount > 0) {
+            console.log(`   -> ${shopeeTzFix.rowCount} venda(s) Shopee com data corrigida.`);
+        }
+
         await client.query('COMMIT');
         console.log('✅ Esquema do banco de dados está atualizado.');
     } catch (error) {
