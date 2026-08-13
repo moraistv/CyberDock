@@ -713,6 +713,18 @@ router.post('/sync-account', authenticateToken, async (req, res) => {
     // Primeira sincronização percorre pedidos por data de criação. As próximas
     // usam update_time remoto a partir do instante da última gravação local,
     // com 24h de sobreposição para absorver atrasos e diferenças de relógio.
+    /* `legacy_since` procura pedidos multi-item salvos antes da expansão por SKU
+     * (sem `synced_item`) para refazer a carga a partir deles.
+     *
+     * O problema: se esse pedido for ANTIGO demais para a API da Shopee ainda
+     * devolvê-lo, ele nunca recebe `synced_item` — e então TODA sincronização
+     * dessa loja voltava a varrer por create_time desde aquela data, em janelas
+     * de 15 dias, para sempre. Era exatamente o caso da loja que levava minutos
+     * enquanto as outras terminavam em segundos.
+     *
+     * `legacy_scan_done` marca o que já foi tentado e não pôde ser resolvido,
+     * então a loja volta ao caminho incremental.
+     */
     const lastRes = await db.query(
       `SELECT
          MAX(updated_at) AS last_sync,
@@ -723,6 +735,7 @@ router.post('/sync-account', authenticateToken, async (req, res) => {
                    ELSE FALSE
                  END
              AND NOT (raw_api_data ? 'synced_item')
+             AND NOT COALESCE((raw_api_data->>'legacy_scan_done')::boolean, false)
          ) AS legacy_since
        FROM public.shopee_sales
        WHERE uid = $1 AND shop_id = $2`,
@@ -732,10 +745,20 @@ router.post('/sync-account', authenticateToken, async (req, res) => {
     const legacySince = lastRes.rows[0]?.legacy_since ? new Date(lastRes.rows[0].legacy_since) : null;
     let since;
     let timeRangeField;
+    let ranLegacyScan = false;
     if (force || !lastSync || legacySince) {
-      since = legacySince
-        ? new Date(legacySince.getTime() - 24 * 60 * 60 * 1000)
-        : new Date('2024-01-01T00:00:00.000Z');
+      // A API da Shopee só devolve pedidos de um passado limitado, então varrer
+      // desde 2024 gastava dezenas de janelas de 15 dias sem retorno útil.
+      const LEGACY_LOOKBACK_DAYS = parseInt(process.env.SHOPEE_LEGACY_LOOKBACK_DAYS || '120', 10);
+      const oldestUseful = new Date(Date.now() - LEGACY_LOOKBACK_DAYS * 86400000);
+
+      if (legacySince) {
+        ranLegacyScan = true;
+        const desired = new Date(legacySince.getTime() - 24 * 60 * 60 * 1000);
+        since = desired > oldestUseful ? desired : oldestUseful;
+      } else {
+        since = oldestUseful;
+      }
       timeRangeField = 'create_time';
       const message = legacySince
         ? `[${nickname}] Atualizando pedidos antigos com múltiplos itens...`
@@ -747,11 +770,39 @@ router.post('/sync-account', authenticateToken, async (req, res) => {
       sendEvent(clientId, { progress: 20, message: `[${nickname}] Buscando pedidos novos e atualizados...`, type: 'info' });
     }
 
+    /* Encerra o laço do backfill legado.
+     *
+     * Se a varredura terminou e ainda restam pedidos multi-item sem
+     * `synced_item`, é porque a API da Shopee não devolve mais aqueles pedidos
+     * (antigos demais). Marcá-los evita que a loja refaça a varredura completa
+     * em TODA sincronização — o motivo de uma loja levar minutos enquanto as
+     * outras terminavam em segundos. Nenhum dado de venda é alterado: só fica
+     * registrado que a tentativa já foi feita.
+     */
+    const finishLegacyScan = async () => {
+      if (!ranLegacyScan) return;
+      const marked = await db.query(
+        `UPDATE public.shopee_sales
+            SET raw_api_data = jsonb_set(raw_api_data, '{legacy_scan_done}', 'true'::jsonb, TRUE)
+          WHERE uid = $1
+            AND shop_id = $2
+            AND jsonb_typeof(raw_api_data->'item_list') = 'array'
+            AND jsonb_array_length(raw_api_data->'item_list') > 1
+            AND NOT (raw_api_data ? 'synced_item')
+            AND NOT COALESCE((raw_api_data->>'legacy_scan_done')::boolean, false)`,
+        [targetUid, shopId]
+      );
+      if (marked.rowCount > 0) {
+        console.log(`[shopee-sync] ${nickname}: ${marked.rowCount} pedido(s) legado(s) fora do alcance da API marcados; próximas sincronizações passam a ser incrementais.`);
+      }
+    };
+
     const orders = await fetchOrdersSince(account, since, partnerId, partnerKey, (count) => {
       sendEvent(clientId, { progress: Math.min(60, 20 + Math.floor(count / 10)), message: `[${nickname}] Lendo pedidos... ${count}`, type: 'info' });
     }, timeRangeField);
 
     if (orders.length === 0) {
+      await finishLegacyScan();
       sendEvent(clientId, {
         progress: 100,
         message: `[${nickname}] Nenhum pedido novo encontrado.`,
@@ -822,6 +873,8 @@ router.post('/sync-account', authenticateToken, async (req, res) => {
         });
       }
     }
+
+    await finishLegacyScan();
 
     sendEvent(clientId, {
       progress: 100,
