@@ -62,10 +62,21 @@ const SALES_COUNT_CACHE_MAX = 500;
  * clientes e era o que deixava a tela em dezenas de segundos.
  *
  * Contando com LIMIT, o trabalho fica limitado: filtros do dia a dia (que é o
- * uso real) devolvem número exato, e recortes gigantes viram "10.000+" em vez
+ * uso real) devolvem número exato, e recortes gigantes viram "60.000+" em vez
  * de travar a tela para exibir um número que ninguém lê.
+ *
+ * O teto anterior (10.000) era menor que a base real e travava o número de
+ * "todos os períodos" num valor que parecia errado. Como a contagem roda em
+ * SEGUNDO PLANO (a página já foi entregue) e fica em cache, subir o teto não
+ * atrasa a tela; no pior caso o total continua aproximado.
  */
-const SALES_COUNT_MAX = parseInt(process.env.SALES_COUNT_MAX || '10000', 10);
+const SALES_COUNT_MAX = parseInt(process.env.SALES_COUNT_MAX || '60000', 10);
+
+/* Espera após uma contagem que falhou (normalmente statement timeout).
+ * Sem isso, cada requisição dispararia de novo a mesma varredura pesada, já
+ * que só sucesso vai para o cache. */
+const salesCountCooldown = new Map();
+const SALES_COUNT_COOLDOWN_MS = 60000;
 
 function getCachedSalesCount(key) {
   const hit = salesCountCache.get(key);
@@ -99,11 +110,25 @@ function loadSalesCount(key, query, params) {
   const running = salesCountInFlight.get(key);
   if (running) return running;
 
+  const failedAt = salesCountCooldown.get(key);
+  if (failedAt !== undefined) {
+    if (Date.now() - failedAt < SALES_COUNT_COOLDOWN_MS) {
+      return Promise.reject(new Error('Contagem indisponível: tentativa anterior excedeu o tempo limite.'));
+    }
+    salesCountCooldown.delete(key);
+  }
+
   const promise = db.query(query, params)
     .then((result) => {
       const total = parseInt(result.rows[0]?.total || '0', 10);
       setCachedSalesCount(key, total);
+      salesCountCooldown.delete(key);
       return total;
+    })
+    .catch((error) => {
+      if (salesCountCooldown.size > SALES_COUNT_CACHE_MAX) salesCountCooldown.clear();
+      salesCountCooldown.set(key, Date.now());
+      throw error;
     })
     .finally(() => salesCountInFlight.delete(key));
 
@@ -923,8 +948,8 @@ router.get('/separacao', authenticateToken, requireMaster, async (req, res) => {
   try {
     const full = String(req.query.full || '') === '1';
     const page = full ? 1 : Math.max(1, parseInt(req.query.page) || 1);
-    // O limite agora representa PACOTES. Todas as linhas pertencentes aos
-    // pacotes da página são carregadas, portanto nenhum pacote é cortado.
+    // O limite representa PACOTES: a página traz todas as linhas do pacote que
+    // atendem ao filtro, então um pacote nunca é cortado entre duas páginas.
     const limit = full
       ? 5000
       : Math.min(200, Math.max(1, parseInt(req.query.limit) || 20));
@@ -962,56 +987,53 @@ router.get('/separacao', authenticateToken, requireMaster, async (req, res) => {
         break;
     }
 
-    const matchedPackagesCte = `
-      matched_packages AS (
-        SELECT DISTINCT ${packageKeyExpr} AS package_key
-          FROM public.unified_sales s
-          LEFT JOIN public.users u ON s.uid = u.uid
-          ${whereClause}
-      ),
-      package_rows AS (
-        SELECT s.*, u.name AS user_nickname, ${packageKeyExpr} AS package_key
-          FROM public.unified_sales s
-          JOIN matched_packages mp ON mp.package_key = ${packageKeyExpr}
-          LEFT JOIN public.users u ON s.uid = u.uid
-         WHERE COALESCE(u.active, true) = true
+    // CTE enxuta: só as colunas necessárias para agrupar/ordenar/contar.
+    // MATERIALIZED garante uma única varredura reaproveitada pelas agregações.
+    // Ela carrega o MESMO filtro da listagem (inclusive a janela de datas), por
+    // isso não varre o histórico das duas tabelas de todos os clientes.
+    const packageKeysCte = `
+      package_keys AS MATERIALIZED (
+        SELECT
+          ${packageKeyExpr} AS package_key,
+          s.uid,
+          s.quantity,
+          s.shipping_deadline,
+          s.sale_date,
+          ${U_SHIPPING_MODE} AS shipping_mode
+        FROM public.unified_sales s
+        LEFT JOIN public.users u ON s.uid = u.uid
+        ${whereClause}
       )
     `;
 
-    // O resumo considera o pacote completo. Assim, se um item do pacote já
-    // estiver despachado e outro ainda estiver na fila, ambos aparecem nos
-    // totais e no relatório com seus status individuais.
-    const prazoDateExpr = `(s.shipping_deadline AT TIME ZONE 'America/Sao_Paulo')::date`;
+    const prazoDateExpr = `(k.shipping_deadline AT TIME ZONE 'America/Sao_Paulo')::date`;
     const hojeExpr = `(now() AT TIME ZONE 'America/Sao_Paulo')::date`;
+    // Resumo e modalidades numa única consulta: antes eram duas varreduras.
     const summaryQuery = `
-      WITH ${matchedPackagesCte}
+      WITH ${packageKeysCte}
       SELECT
-        COUNT(DISTINCT s.package_key) AS total_pacotes,
+        COUNT(DISTINCT k.package_key) AS total_pacotes,
         COUNT(*) AS total_itens,
-        COALESCE(SUM(s.quantity), 0) AS total_unidades,
-        COUNT(DISTINCT s.package_key) FILTER (WHERE ${prazoDateExpr} < ${hojeExpr}) AS atrasados,
-        COUNT(DISTINCT s.package_key) FILTER (WHERE ${prazoDateExpr} = ${hojeExpr}) AS despachar_hoje,
-        COUNT(DISTINCT s.uid) AS usuarios_ativos
-      FROM package_rows s
-    `;
-    const modeQuery = `
-      WITH ${matchedPackagesCte}
-      SELECT ${U_SHIPPING_MODE} AS mode, COUNT(DISTINCT s.package_key) AS count
-        FROM package_rows s
-       GROUP BY 1
-       ORDER BY count DESC
+        COALESCE(SUM(k.quantity), 0) AS total_unidades,
+        COUNT(DISTINCT k.package_key) FILTER (WHERE ${prazoDateExpr} < ${hojeExpr}) AS atrasados,
+        COUNT(DISTINCT k.package_key) FILTER (WHERE ${prazoDateExpr} = ${hojeExpr}) AS despachar_hoje,
+        COUNT(DISTINCT k.uid) AS usuarios_ativos,
+        (
+          SELECT COALESCE(jsonb_object_agg(m.shipping_mode, m.pacotes), '{}'::jsonb)
+            FROM (
+              SELECT k2.shipping_mode, COUNT(DISTINCT k2.package_key) AS pacotes
+                FROM package_keys k2
+               GROUP BY k2.shipping_mode
+            ) m
+        ) AS por_modalidade
+      FROM package_keys k
     `;
 
     const dataQuery = `
-      WITH filtered AS (
-        SELECT s.*, u.name AS user_nickname, ${packageKeyExpr} AS package_key
-          FROM public.unified_sales s
-          LEFT JOIN public.users u ON s.uid = u.uid
-          ${whereClause}
-      ),
+      WITH ${packageKeysCte},
       selected_packages AS (
         SELECT f.package_key, ${sortAggregate} AS sort_value
-          FROM filtered f
+          FROM package_keys f
          GROUP BY f.package_key
          ORDER BY sort_value ${sortDirection}, f.package_key
          LIMIT $${paramIdx} OFFSET $${paramIdx + 1}
@@ -1052,15 +1074,14 @@ router.get('/separacao', authenticateToken, requireMaster, async (req, res) => {
         NULL::text AS buyer_last_name,
         s.buyer_nickname
       FROM public.unified_sales s
-      JOIN selected_packages sp ON sp.package_key = ${packageKeyExpr}
       LEFT JOIN public.users u ON s.uid = u.uid
-      WHERE COALESCE(u.active, true) = true
+      JOIN selected_packages sp ON sp.package_key = ${packageKeyExpr}
+      ${whereClause}
       ORDER BY sp.sort_value ${sortDirection}, sp.package_key, s.id, s.sku;
     `;
 
-    const [summaryResult, modeResult, dataResult] = await Promise.all([
+    const [summaryResult, dataResult] = await Promise.all([
       db.query(summaryQuery, params),
-      db.query(modeQuery, params),
       db.query(dataQuery, [...params, limit, offset]),
     ]);
 
@@ -1068,8 +1089,8 @@ router.get('/separacao', authenticateToken, requireMaster, async (req, res) => {
     const totalPacotes = parseInt(sRow.total_pacotes, 10) || 0;
     const totalItens = parseInt(sRow.total_itens, 10) || 0;
     const porModalidade = {};
-    for (const r of modeResult.rows) {
-      porModalidade[r.mode] = parseInt(r.count, 10) || 0;
+    for (const [mode, count] of Object.entries(sRow.por_modalidade || {})) {
+      porModalidade[mode] = parseInt(count, 10) || 0;
     }
 
     const summary = {
@@ -1386,9 +1407,17 @@ router.get('/all', authenticateToken, requireMaster, async (req, res) => {
     const cachedTotal = getCachedSalesCount(countKey);
 
     if (req.query.countOnly === '1') {
-      const counted = cachedTotal === null
-        ? await loadSalesCount(countKey, countQuery, params)
-        : cachedTotal;
+      // A contagem é um refinamento do número já exibido. Se ela falhar ou
+      // estiver em espera, a tela mantém o total aproximado em vez de erro.
+      let counted;
+      try {
+        counted = cachedTotal === null
+          ? await loadSalesCount(countKey, countQuery, params)
+          : cachedTotal;
+      } catch (countError) {
+        console.error('Total do tabelão indisponível:', countError.message);
+        return res.json({ total: null, totalExact: false, totalPages: page + 1 });
+      }
       const bounded = resolveBoundedTotal(counted);
       return res.json({
         total: bounded.total,
@@ -2099,9 +2128,16 @@ router.get('/my-sales', authenticateToken, async (req, res) => {
     const cachedTotal = getCachedSalesCount(countKey);
 
     if (req.query.countOnly === '1') {
-      const counted = cachedTotal === null
-        ? await loadSalesCount(countKey, countQuery, params)
-        : cachedTotal;
+      // Mesma regra do tabelão: o total é um refinamento, não pode virar erro.
+      let counted;
+      try {
+        counted = cachedTotal === null
+          ? await loadSalesCount(countKey, countQuery, params)
+          : cachedTotal;
+      } catch (countError) {
+        console.error('Total de vendas indisponível:', countError.message);
+        return res.json({ total: null, totalExact: false, totalPages: page + 1 });
+      }
       const bounded = resolveBoundedTotal(counted);
       return res.json({
         total: bounded.total,
