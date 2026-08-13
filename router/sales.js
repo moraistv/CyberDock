@@ -997,29 +997,52 @@ router.get('/all', authenticateToken, requireMaster, async (req, res) => {
     const shippingLimitEnd = (req.query.shippingLimitEnd || '').trim();
     const shippingMode = (req.query.shippingMode || '').trim();
     const processed = (req.query.processed || '').trim(); // 'yes' = processados | 'no' = não processados
+    // Canal: 'ML' | 'Shopee' | lista em CSV | vazio = todos.
+    const marketplace = (req.query.marketplace || '').trim();
 
     const conditions = [];
     const params = [];
     let paramIdx = 1;
 
+    const asList = (value) => String(value || '').split(',').map((v) => v.trim()).filter(Boolean);
+
+    if (marketplace) {
+      conditions.push(`s.marketplace = ANY($${paramIdx})`);
+      params.push(asList(marketplace));
+      paramIdx++;
+    }
     if (search) {
+      // `s.id` já é TEXT na view unificada (order_id do ML e order_sn da Shopee),
+      // então o CAST anterior deixou de ser necessário.
       conditions.push(`(
         s.product_title ILIKE $${paramIdx}
         OR s.sku ILIKE $${paramIdx}
         OR s.account_nickname ILIKE $${paramIdx}
         OR u.name ILIKE $${paramIdx}
-        OR CAST(s.id AS TEXT) ILIKE $${paramIdx}
+        OR s.id ILIKE $${paramIdx}
       )`);
       params.push(`%${search}%`);
       paramIdx++;
     }
     if (shippingStatus) {
-      conditions.push(`s.shipping_status = $${paramIdx}`);
-      params.push(shippingStatus);
-      paramIdx++;
+      // Mesma expressão canônica da tela do usuário: sem ela, "Pendente"
+      // (status ausente) e diferenças de caixa não casavam com nada.
+      const wanted = asList(shippingStatus).map((v) => v.toLowerCase());
+      const wantsCancelled = wanted.includes('cancelled');
+      const shippingWanted = wanted.filter((v) => v !== 'cancelled');
+      const parts = [];
+      if (shippingWanted.length) {
+        parts.push(`LOWER(${U_SHIPPING_STATUS}) = ANY($${paramIdx})`);
+        params.push(shippingWanted);
+        paramIdx++;
+      }
+      if (wantsCancelled) {
+        parts.push(`LOWER(COALESCE(s.order_status, '')) = 'cancelled'`);
+      }
+      if (parts.length) conditions.push(`(${parts.join(' OR ')})`);
     }
     if (saleStatus) {
-      conditions.push(`s.raw_api_data->>'status' = $${paramIdx}`);
+      conditions.push(`s.order_status = $${paramIdx}`);
       params.push(saleStatus);
       paramIdx++;
     }
@@ -1036,30 +1059,23 @@ router.get('/all', authenticateToken, requireMaster, async (req, res) => {
       paramIdx++;
     }
     if (account) {
-      conditions.push(`(s.seller_id::text = $${paramIdx} OR s.account_nickname ILIKE $${paramIdx + 1})`);
+      // `/filter-options` devolve apelido do ML e nome da loja Shopee, mas
+      // links antigos ainda mandam o id numérico — os três formatos casam.
+      conditions.push(`(s.account_id = $${paramIdx} OR s.account_nickname ILIKE $${paramIdx + 1})`);
       params.push(account, `%${account}%`);
       paramIdx += 2;
     }
     if (buyer) {
-      conditions.push(`(
-        s.raw_api_data->'buyer'->>'first_name' ILIKE $${paramIdx}
-        OR s.raw_api_data->'buyer'->>'last_name' ILIKE $${paramIdx}
-        OR s.raw_api_data->'buyer'->>'nickname' ILIKE $${paramIdx}
-      )`);
+      conditions.push(`(s.buyer_name ILIKE $${paramIdx} OR s.buyer_nickname ILIKE $${paramIdx})`);
       params.push(`%${buyer}%`);
       paramIdx++;
     }
     if (shippingMode) {
-      const modes = shippingMode.split(',').map(m => m.trim()).filter(Boolean);
-      if (modes.length === 1) {
-        conditions.push(`s.shipping_mode = $${paramIdx}`);
-        params.push(modes[0]);
-        paramIdx++;
-      } else if (modes.length > 1) {
-        conditions.push(`s.shipping_mode = ANY($${paramIdx})`);
-        params.push(modes);
-        paramIdx++;
-      }
+      // Modalidade derivada igual à do usuário (logistic_type do ML e
+      // transportadora da Shopee), senão chips válidos voltavam vazios.
+      conditions.push(`${U_SHIPPING_MODE} = ANY($${paramIdx})`);
+      params.push(asList(shippingMode));
+      paramIdx++;
     }
     // Filtro de PROCESSADO / NÃO PROCESSADO (abatimento de estoque).
     if (processed === 'yes') {
@@ -1074,13 +1090,15 @@ router.get('/all', authenticateToken, requireMaster, async (req, res) => {
       paramIdx++;
     }
     if (shippingLimitStart) {
-      conditions.push(`COALESCE(s.raw_api_data->'sla_data'->>'expected_date', s.shipping_limit_date::text) >= $${paramIdx}`);
-      params.push(shippingLimitStart);
+      // A view já resolve o prazo real (SLA do ML / ship_by_date da Shopee),
+      // então o filtro compara timestamp com timestamp, não texto.
+      conditions.push(`s.shipping_deadline >= $${paramIdx}`);
+      params.push(shippingLimitStart + 'T00:00:00-03:00');
       paramIdx++;
     }
     if (shippingLimitEnd) {
-      conditions.push(`COALESCE(s.raw_api_data->'sla_data'->>'expected_date', s.shipping_limit_date::text) <= $${paramIdx}`);
-      params.push(shippingLimitEnd + 'T23:59:59.999Z');
+      conditions.push(`s.shipping_deadline <= $${paramIdx}`);
+      params.push(shippingLimitEnd + 'T23:59:59.999-03:00');
       paramIdx++;
     }
     // Ao filtrar por PRAZO DE EXPEDIÇÃO, exclui FULL: o vendedor não despacha
@@ -1095,37 +1113,59 @@ router.get('/all', authenticateToken, requireMaster, async (req, res) => {
 
     const whereClause = conditions.length > 0 ? 'WHERE ' + conditions.join(' AND ') : '';
 
-    // Count total
-    const countQuery = `SELECT COUNT(*) as total FROM public.sales s LEFT JOIN public.users u ON s.uid = u.uid ${whereClause}`;
-    const countResult = await db.query(countQuery, params);
-    const total = parseInt(countResult.rows[0].total);
+    const countQuery = `
+      SELECT COUNT(*) as total
+        FROM public.unified_sales s
+        LEFT JOIN public.users u ON s.uid = u.uid
+        ${whereClause}`;
 
-    // Fetch page — extract thumbnail and permalink from raw_api_data via SQL
+    // Mesma estratégia da tela do usuário: recorta a página primeiro e só
+    // depois resolve SKU/JSON, para o custo por linha valer apenas 1 página.
     const dataQuery = `
-      SELECT s.id, s.sku, s.uid, s.seller_id, s.channel, s.account_nickname, s.sale_date,
-        s.product_title, s.quantity, s.shipping_mode, s.shipping_limit_date,
-        s.packages, s.shipping_status, s.updated_at, s.processed_at,
-        s.raw_api_data as raw_api_data,
-        u.name as user_nickname,
-        s.raw_api_data->>'status' as sale_status,
-        s.raw_api_data->'shipping'->>'id' as shipping_id,
-        s.raw_api_data->'sla_data'->>'expected_date' as sla_expected_date,
-        (s.raw_api_data->'order_items'->0->'item'->>'thumbnail') as product_thumbnail,
-        (s.raw_api_data->'order_items'->0->'item'->>'permalink') as product_permalink,
-        (s.raw_api_data->'order_items'->0->'item'->>'id') as ml_item_id,
-        s.raw_api_data->'buyer'->>'first_name' as buyer_first_name,
-        s.raw_api_data->'buyer'->>'last_name' as buyer_last_name,
-        s.raw_api_data->'buyer'->>'nickname' as buyer_nickname,
-        EXISTS (SELECT 1 FROM public.skus sk WHERE sk.user_id = s.uid AND UPPER(TRIM(sk.sku)) = UPPER(TRIM(s.sku)) AND sk.ativo = true) as is_sku_mapped,
-        -- Descrição interna cadastrada no Armazenamento (prioridade 1 na exibição)
-        (SELECT sk.descricao FROM public.skus sk
-          WHERE sk.user_id = s.uid
-            AND UPPER(TRIM(sk.sku)) = UPPER(TRIM(s.sku))
-            AND sk.descricao IS NOT NULL AND TRIM(sk.descricao) <> ''
-          ORDER BY sk.ativo DESC
-          LIMIT 1) AS sku_descricao,
-        -- Variação escolhida na venda (cor, tamanho...)
-        COALESCE(
+      WITH page_rows AS MATERIALIZED (
+        SELECT s.*, u.name AS user_nickname
+          FROM public.unified_sales s
+          LEFT JOIN public.users u ON s.uid = u.uid
+          ${whereClause}
+         ORDER BY s.sale_date DESC, s.marketplace, s.id, s.sku
+         LIMIT $${paramIdx} OFFSET $${paramIdx + 1}
+      )
+      SELECT s.id, s.sku, s.uid, s.marketplace,
+        s.marketplace AS channel,
+        s.account_id AS seller_id,
+        s.account_nickname, s.sale_date,
+        s.product_title, s.quantity, s.shipping_mode,
+        s.shipping_deadline AS shipping_limit_date,
+        s.shipping_status, s.updated_at, s.processed_at,
+        s.user_nickname,
+        -- raw_api_data enxuto: o payload cheio chega a dezenas de KB por linha.
+        jsonb_build_object(
+          'status', s.order_status,
+          'tags', COALESCE(s.raw_api_data->'tags', '[]'::jsonb),
+          'sla_data', jsonb_build_object('expected_date', s.shipping_deadline),
+          'shipping', jsonb_build_object(
+            'id', s.shipping_id,
+            'logistic_type', s.raw_api_data->'shipping'->>'logistic_type'
+          ),
+          'seller', jsonb_build_object('id', s.account_id),
+          'buyer', jsonb_build_object(
+            'first_name', s.buyer_name,
+            'last_name', NULL,
+            'nickname', s.buyer_nickname
+          )
+        ) AS raw_api_data,
+        s.order_status as sale_status,
+        s.shipping_id,
+        s.shipping_deadline as sla_expected_date,
+        s.product_thumbnail,
+        s.product_permalink,
+        s.item_id as ml_item_id,
+        s.buyer_name as buyer_first_name,
+        NULL::text as buyer_last_name,
+        s.buyer_nickname,
+        COALESCE(skm.mapped, false) AS is_sku_mapped,
+        skm.descricao AS sku_descricao,
+        CASE WHEN s.marketplace = 'ML' THEN COALESCE(
           (SELECT oi->'item'->'variation_attributes'
              FROM jsonb_array_elements(COALESCE(s.raw_api_data->'order_items', '[]'::jsonb)) oi
             WHERE UPPER(TRIM(COALESCE(oi->'item'->>'seller_sku', oi->'item'->>'id', ''))) = UPPER(TRIM(s.sku))
@@ -1133,28 +1173,64 @@ router.get('/all', authenticateToken, requireMaster, async (req, res) => {
           (SELECT oi->'item'->'variation_attributes'
              FROM jsonb_array_elements(COALESCE(s.raw_api_data->'order_items', '[]'::jsonb)) oi
             LIMIT 1)
-        ) AS variation_attributes
-      FROM public.sales s
-      LEFT JOIN public.users u ON s.uid = u.uid
-      ${whereClause}
-      ORDER BY s.sale_date DESC
-      LIMIT $${paramIdx} OFFSET $${paramIdx + 1};
+        ) END AS variation_attributes
+      FROM page_rows s
+      LEFT JOIN LATERAL (
+        SELECT
+          bool_or(sk.ativo) AS mapped,
+          (array_agg(sk.descricao ORDER BY sk.ativo DESC)
+             FILTER (WHERE sk.descricao IS NOT NULL AND TRIM(sk.descricao) <> ''))[1] AS descricao
+        FROM public.skus sk
+        WHERE sk.user_id = s.uid
+          AND UPPER(TRIM(sk.sku)) = UPPER(TRIM(s.sku))
+      ) skm ON TRUE
+      ORDER BY s.sale_date DESC, s.marketplace, s.id, s.sku;
     `;
 
+    // O tabelão global varre as duas tabelas de TODOS os clientes; contar isso
+    // em cada página era o maior custo da tela. Agora a contagem é separada.
+    const countKey = `admin|${whereClause}|${JSON.stringify(params)}`;
+    const cachedTotal = getCachedSalesCount(countKey);
 
-    const dataResult = await db.query(dataQuery, [...params, limit, offset]);
+    if (req.query.countOnly === '1') {
+      const total = cachedTotal === null
+        ? await loadSalesCount(countKey, countQuery, params)
+        : cachedTotal;
+      return res.json({ total, totalPages: Math.ceil(total / limit) || 1 });
+    }
 
-    // Resposta imediata; o enriquecimento de thumbnails do ML roda em
-    // background (ver warmMlThumbnailCache) para não somar segundos ao request.
+    const dataResult = await db.query(dataQuery, [...params, limit + 1, offset]);
+    const hasNext = dataResult.rows.length > limit;
+    const rows = hasNext ? dataResult.rows.slice(0, limit) : dataResult.rows;
+
+    let total = cachedTotal;
+    let totalExact = cachedTotal !== null;
+
+    if (total === null && !hasNext) {
+      total = offset + rows.length;
+      totalExact = true;
+      setCachedSalesCount(countKey, total);
+    }
+    if (total === null) total = offset + rows.length + 1;
+
     res.json({
-      data: dataResult.rows,
+      data: rows,
       total,
+      totalExact,
+      hasNext,
       page,
       limit,
-      totalPages: Math.ceil(total / limit) || 1
+      totalPages: totalExact ? (Math.ceil(total / limit) || 1) : page + 1,
     });
 
-    setImmediate(() => warmMlThumbnailCache(dataResult.rows));
+    if (!totalExact) {
+      setImmediate(() => {
+        loadSalesCount(countKey, countQuery, params).catch((error) => {
+          console.error('Erro ao aquecer total do tabelão:', error);
+        });
+      });
+    }
+    setImmediate(() => warmMlThumbnailCache(rows));
   } catch (error) {
     console.error("Erro interno ao buscar todas as vendas:", error);
     res.status(500).json({ error: 'Erro interno ao buscar vendas globais.' });
