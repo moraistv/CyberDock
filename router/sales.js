@@ -1015,6 +1015,37 @@ router.get('/all', authenticateToken, requireMaster, async (req, res) => {
 
     const asList = (value) => String(value || '').split(',').map((v) => v.trim()).filter(Boolean);
 
+    const userNickname = (req.query.userNickname || '').trim();
+
+    /* --------------------- Filtros de usuário resolvidos antes ---------------
+     * O tabelão global não filtra por dono, então o LEFT JOIN em users existia
+     * só para (a) esconder cliente inativo, (b) buscar por nome e (c) exibir o
+     * nome. Com o JOIN dentro da consulta paginada, o Postgres precisava juntar
+     * a base inteira ANTES de ordenar por data e cortar a página — era o custo
+     * dominante da tela.
+     *
+     * public.users tem dezenas de linhas: resolver os uid aqui é barato e deixa
+     * a consulta pesada com predicados apenas sobre as tabelas de venda, que
+     * têm índice por (sale_date DESC). O nome volta a ser buscado depois do
+     * LIMIT, para as 50 linhas da página.
+     */
+    const [inactiveUsers, searchUsers, nicknameUsers] = await Promise.all([
+      db.query(`SELECT uid FROM public.users WHERE active = false`),
+      search
+        ? db.query(`SELECT uid FROM public.users WHERE name ILIKE $1`, [`%${search}%`])
+        : Promise.resolve({ rows: [] }),
+      userNickname
+        ? db.query(`SELECT uid FROM public.users WHERE name ILIKE $1`, [`%${userNickname}%`])
+        : Promise.resolve({ rows: [] }),
+    ]);
+
+    const inactiveUids = inactiveUsers.rows.map((r) => r.uid);
+    if (inactiveUids.length) {
+      conditions.push(`s.uid <> ALL($${paramIdx})`);
+      params.push(inactiveUids);
+      paramIdx++;
+    }
+
     if (marketplace) {
       conditions.push(`s.marketplace = ANY($${paramIdx})`);
       params.push(asList(marketplace));
@@ -1023,15 +1054,23 @@ router.get('/all', authenticateToken, requireMaster, async (req, res) => {
     if (search) {
       // `s.id` já é TEXT na view unificada (order_id do ML e order_sn da Shopee),
       // então o CAST anterior deixou de ser necessário.
-      conditions.push(`(
-        s.product_title ILIKE $${paramIdx}
-        OR s.sku ILIKE $${paramIdx}
-        OR s.account_nickname ILIKE $${paramIdx}
-        OR u.name ILIKE $${paramIdx}
-        OR s.id ILIKE $${paramIdx}
-      )`);
+      const searchParts = [
+        `s.product_title ILIKE $${paramIdx}`,
+        `s.sku ILIKE $${paramIdx}`,
+        `s.account_nickname ILIKE $${paramIdx}`,
+        `s.id ILIKE $${paramIdx}`,
+      ];
       params.push(`%${search}%`);
       paramIdx++;
+
+      // Busca por nome do cliente vira comparação direta de uid.
+      const searchUids = searchUsers.rows.map((r) => r.uid);
+      if (searchUids.length) {
+        searchParts.push(`s.uid = ANY($${paramIdx})`);
+        params.push(searchUids);
+        paramIdx++;
+      }
+      conditions.push(`(${searchParts.join(' OR ')})`);
     }
     if (shippingStatus) {
       // Mesma expressão canônica da tela do usuário: sem ela, "Pendente"
@@ -1092,10 +1131,17 @@ router.get('/all', authenticateToken, requireMaster, async (req, res) => {
     } else if (processed === 'no') {
       conditions.push(`s.processed_at IS NULL`);
     }
-    const userNickname = (req.query.userNickname || '').trim();
     if (userNickname) {
-      conditions.push(`u.name ILIKE $${paramIdx}`);
-      params.push(`%${userNickname}%`);
+      // Nenhum cliente com esse nome: devolve vazio sem varrer as vendas.
+      const nicknameUids = nicknameUsers.rows.map((r) => r.uid);
+      if (nicknameUids.length === 0) {
+        return res.json({
+          data: [], total: 0, totalExact: true, hasNext: false,
+          page, limit, totalPages: 1,
+        });
+      }
+      conditions.push(`s.uid = ANY($${paramIdx})`);
+      params.push(nicknameUids);
       paramIdx++;
     }
     if (shippingLimitStart) {
@@ -1114,29 +1160,31 @@ router.get('/all', authenticateToken, requireMaster, async (req, res) => {
     // pedido FULL (o ML expede), então ele não faz parte da fila de expedição.
     // IS DISTINCT FROM mantém linhas com shipping_mode NULL.
     if (shippingLimitStart || shippingLimitEnd) {
-      conditions.push(`s.shipping_mode IS DISTINCT FROM 'FULL'`);
+      conditions.push(`${U_SHIPPING_MODE} IS DISTINCT FROM 'FULL'`);
     }
-
-    // Default system filter: do not show sales of inactive users in the master table
-    conditions.push(`COALESCE(u.active, true) = true`);
 
     const whereClause = conditions.length > 0 ? 'WHERE ' + conditions.join(' AND ') : '';
 
+    // Sem JOIN: os filtros agora vivem todos nas tabelas de venda.
     const countQuery = `
       SELECT COUNT(*) as total
         FROM public.unified_sales s
-        LEFT JOIN public.users u ON s.uid = u.uid
         ${whereClause}`;
 
     // Mesma estratégia da tela do usuário: recorta a página primeiro e só
     // depois resolve SKU/JSON, para o custo por linha valer apenas 1 página.
     const dataQuery = `
       WITH page_rows AS MATERIALIZED (
-        SELECT s.*, u.name AS user_nickname
+        SELECT s.*
           FROM public.unified_sales s
-          LEFT JOIN public.users u ON s.uid = u.uid
           ${whereClause}
-         ORDER BY s.sale_date DESC, s.marketplace, s.id, s.sku
+         -- Ordena SÓ por sale_date: as duas tabelas de origem têm índice
+         -- (sale_date DESC), então o Postgres percorre os índices e para na
+         -- página pedida. Acrescentar marketplace/id/sku aqui como desempate
+         -- obrigava ORDENAR TODAS as vendas de TODOS os clientes antes do
+         -- LIMIT, e era o custo dominante desta tela. O desempate para exibição
+         -- continua no ORDER BY externo, aplicado só às 50 linhas da página.
+         ORDER BY s.sale_date DESC
          LIMIT $${paramIdx} OFFSET $${paramIdx + 1}
       )
       SELECT s.id, s.sku, s.uid, s.marketplace,
@@ -1146,7 +1194,9 @@ router.get('/all', authenticateToken, requireMaster, async (req, res) => {
         s.product_title, s.quantity, s.shipping_mode,
         s.shipping_deadline AS shipping_limit_date,
         s.shipping_status, s.updated_at, s.processed_at,
-        s.user_nickname,
+        -- Nome do cliente resolvido DEPOIS do LIMIT: 50 buscas por chave
+        -- primária, em vez de juntar a base inteira antes de ordenar.
+        u.name AS user_nickname,
         -- raw_api_data enxuto: o payload cheio chega a dezenas de KB por linha.
         jsonb_build_object(
           'status', s.order_status,
@@ -1184,6 +1234,7 @@ router.get('/all', authenticateToken, requireMaster, async (req, res) => {
             LIMIT 1)
         ) END AS variation_attributes
       FROM page_rows s
+      LEFT JOIN public.users u ON s.uid = u.uid
       LEFT JOIN LATERAL (
         SELECT
           bool_or(sk.ativo) AS mapped,
@@ -1830,7 +1881,9 @@ router.get('/my-sales', authenticateToken, async (req, res) => {
         SELECT s.*
           FROM public.unified_sales s
           ${whereClause}
-         ORDER BY s.sale_date DESC, s.marketplace, s.id, s.sku
+         -- Só sale_date, para aproveitar o índice (sale_date DESC) das tabelas
+         -- de origem e não ordenar o histórico inteiro antes do LIMIT.
+         ORDER BY s.sale_date DESC
          LIMIT $${paramIdx} OFFSET $${paramIdx + 1}
       )
       SELECT s.id, s.sku, s.uid, s.marketplace,
