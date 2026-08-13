@@ -193,6 +193,35 @@ router.get('/contas/:uid', authenticateToken, async (req, res) => {
   }
 });
 
+/**
+ * Todas as lojas Shopee ativas do sistema (visão master).
+ *
+ * Equivalente ao /ml/all-accounts: o "Sincronizar Tudo" do painel admin
+ * precisa varrer os DOIS canais. Sem esta rota, o botão global sincronizava
+ * apenas Mercado Livre e as vendas Shopee só entravam quando o próprio
+ * cliente sincronizava na tela dele.
+ *
+ * Traz o `uid` do dono porque a sincronização master roda em nome do cliente
+ * (clientUid), e apenas lojas de usuários ativos, para não gastar chamadas de
+ * API com conta desativada.
+ */
+router.get('/all-accounts', authenticateToken, requireMaster, async (req, res) => {
+  try {
+    const { rows } = await db.query(`
+      SELECT sa.shop_id, sa.shop_name, sa.uid, u.name AS user_name
+        FROM public.shopee_accounts sa
+        LEFT JOIN public.users u ON sa.uid = u.uid
+       WHERE sa.status = 'active'
+         AND COALESCE(u.active, true) = true
+       ORDER BY u.name NULLS LAST, sa.shop_name
+    `);
+    res.json(rows);
+  } catch (error) {
+    console.error('Erro ao listar todas as lojas Shopee:', error);
+    res.status(500).json({ error: 'Erro interno ao listar as lojas Shopee.' });
+  }
+});
+
 router.delete('/contas/:shopId', authenticateToken, async (req, res) => {
   const { shopId } = req.params;
   const { uid } = req.user;
