@@ -779,33 +779,33 @@ function buildSeparacaoWhere(req) {
     params.push(saleDateEnd + 'T23:59:59.999-03:00');
     paramIdx++;
   }
-  // Prazo de despacho: usa o SLA (expected_date) quando houver, senão o
-  // shipping_limit_date. É o MESMO campo exibido na tela, garantindo coerência.
-  const prazoExpr = `COALESCE(s.raw_api_data->'sla_data'->>'expected_date', s.shipping_limit_date::text)`;
+  // Canal: permite separar só ML, só Shopee, ou os dois (padrão).
+  const marketplace = (req.query.marketplace || '').trim();
+  if (marketplace) {
+    conditions.push(`s.marketplace = ANY($${paramIdx})`);
+    params.push(marketplace.split(',').map((v) => v.trim()).filter(Boolean));
+    paramIdx++;
+  }
+  // Prazo de despacho: a view já resolve o prazo real de cada canal (SLA do ML
+  // e ship_by_date da Shopee), então a comparação é timestamp com timestamp.
   if (shippingLimitStart) {
-    conditions.push(`${prazoExpr} >= $${paramIdx}`);
-    params.push(shippingLimitStart);
+    conditions.push(`s.shipping_deadline >= $${paramIdx}`);
+    params.push(shippingLimitStart + 'T00:00:00-03:00');
     paramIdx++;
   }
   if (shippingLimitEnd) {
-    conditions.push(`${prazoExpr} <= $${paramIdx}`);
-    params.push(shippingLimitEnd + 'T23:59:59.999Z');
+    conditions.push(`s.shipping_deadline <= $${paramIdx}`);
+    params.push(shippingLimitEnd + 'T23:59:59.999-03:00');
     paramIdx++;
   }
   if (shippingMode) {
-    const modes = shippingMode.split(',').map(m => m.trim()).filter(Boolean);
-    if (modes.length === 1) {
-      conditions.push(`s.shipping_mode = $${paramIdx}`);
-      params.push(modes[0]);
-      paramIdx++;
-    } else if (modes.length > 1) {
-      conditions.push(`s.shipping_mode = ANY($${paramIdx})`);
-      params.push(modes);
-      paramIdx++;
-    }
+    // Modalidade canônica: cobre logistic_type do ML e transportadora Shopee.
+    conditions.push(`${U_SHIPPING_MODE} = ANY($${paramIdx})`);
+    params.push(shippingMode.split(',').map((m) => m.trim()).filter(Boolean));
+    paramIdx++;
   }
   if (account) {
-    conditions.push(`(s.seller_id::text = $${paramIdx} OR s.account_nickname ILIKE $${paramIdx + 1})`);
+    conditions.push(`(s.account_id = $${paramIdx} OR s.account_nickname ILIKE $${paramIdx + 1})`);
     params.push(account, `%${account}%`);
     paramIdx += 2;
   }
@@ -815,12 +815,13 @@ function buildSeparacaoWhere(req) {
     paramIdx++;
   }
   if (search) {
+    // `s.id` já é TEXT na view (order_id do ML e order_sn da Shopee).
     conditions.push(`(
       s.product_title ILIKE $${paramIdx}
       OR s.sku ILIKE $${paramIdx}
       OR s.account_nickname ILIKE $${paramIdx}
       OR u.name ILIKE $${paramIdx}
-      OR CAST(s.id AS TEXT) ILIKE $${paramIdx}
+      OR s.id ILIKE $${paramIdx}
     )`);
     params.push(`%${search}%`);
     paramIdx++;
@@ -831,19 +832,22 @@ function buildSeparacaoWhere(req) {
 
   // ===== Regras da FILA DE SEPARAÇÃO =====
   // 1) FULL nunca entra: quem separa/expede FULL é o próprio Mercado Livre.
-  conditions.push(`s.shipping_mode IS DISTINCT FROM 'FULL'`);
-  // 2) Não mostrar pedidos cancelados.
-  conditions.push(`COALESCE(s.raw_api_data->>'status','') <> 'cancelled'`);
-  // 3) Situação de despacho. Usa o status REAL do envio (raw shipping.status),
-  //    não a coluna local shipping_status (alterada durante o processamento).
+  //    Usa a modalidade canônica para não deixar passar um FULL cujo
+  //    shipping_mode está vazio e só aparece no logistic_type.
+  conditions.push(`${U_SHIPPING_MODE} IS DISTINCT FROM 'FULL'`);
+  // 2) Não mostrar pedidos cancelados (regra única para os dois canais).
+  conditions.push(`NOT ${U_CANCELLED}`);
+  // 3) Situação de despacho pelo status operacional canônico: no ML vem do
+  //    shipping.status do payload e na Shopee do order_status, em vez de
+  //    depender de um campo que só existe no ML.
   if (despacho === 'sim') {
-    // Já despachados (enviados/entregues)
-    conditions.push(`COALESCE(s.raw_api_data->'shipping'->>'status','') IN ('shipped','delivered')`);
+    conditions.push(`${U_OPERATIONAL_STATUS} IN ('shipped', 'delivered', 'completed')`);
   } else if (despacho === 'todos') {
-    // Todos (a despachar + despachados), mantendo apenas a exclusão de cancelados/FULL
+    // Todos (a despachar + despachados), mantendo a exclusão de cancelados/FULL
   } else {
-    // Padrão: só o que falta separar (não despachado)
-    conditions.push(`COALESCE(s.raw_api_data->'shipping'->>'status','') NOT IN ('shipped','delivered','not_delivered','cancelled','canceled')`);
+    // Padrão: só o que falta separar (ainda não despachado)
+    conditions.push(`${U_OPERATIONAL_STATUS} NOT IN
+      ('shipped', 'delivered', 'completed', 'not_delivered', 'cancelled', 'canceled')`);
   }
 
   const whereClause = conditions.length > 0 ? 'WHERE ' + conditions.join(' AND ') : '';
@@ -866,7 +870,7 @@ router.get('/separacao', authenticateToken, requireMaster, async (req, res) => {
     let orderBy;
     switch (sort) {
       case 'prazo_desc':
-        orderBy = `COALESCE(s.raw_api_data->'sla_data'->>'expected_date', s.shipping_limit_date::text) DESC NULLS LAST`;
+        orderBy = `s.shipping_deadline DESC NULLS LAST`;
         break;
       case 'venda_desc':
         orderBy = `s.sale_date DESC`;
@@ -876,13 +880,12 @@ router.get('/separacao', authenticateToken, requireMaster, async (req, res) => {
         break;
       case 'prazo_asc':
       default:
-        orderBy = `COALESCE(s.raw_api_data->'sla_data'->>'expected_date', s.shipping_limit_date::text) ASC NULLS LAST`;
+        orderBy = `s.shipping_deadline ASC NULLS LAST`;
         break;
     }
 
-    // Expressão do prazo de despacho (SLA quando houver, senão shipping_limit_date),
-    // convertida para data no fuso de Brasília para os buckets atrasado/hoje.
-    const prazoDateExpr = `(NULLIF(COALESCE(s.raw_api_data->'sla_data'->>'expected_date', s.shipping_limit_date::text), '')::timestamptz AT TIME ZONE 'America/Sao_Paulo')::date`;
+    // Dia do prazo no fuso de Brasília, para os buckets atrasado/hoje.
+    const prazoDateExpr = `(s.shipping_deadline AT TIME ZONE 'America/Sao_Paulo')::date`;
     const hojeExpr = `(now() AT TIME ZONE 'America/Sao_Paulo')::date`;
 
     // Resumo agregado sobre TODO o conjunto filtrado (fila de separação)
@@ -893,24 +896,30 @@ router.get('/separacao', authenticateToken, requireMaster, async (req, res) => {
         COUNT(*) FILTER (WHERE ${prazoDateExpr} < ${hojeExpr}) AS atrasados,
         COUNT(*) FILTER (WHERE ${prazoDateExpr} = ${hojeExpr}) AS despachar_hoje,
         COUNT(DISTINCT s.uid) AS usuarios_ativos
-      FROM public.sales s
+      FROM public.unified_sales s
       LEFT JOIN public.users u ON s.uid = u.uid
       ${whereClause}
     `;
-    // Contagem por modalidade
+    // Contagem por modalidade, com o mesmo rótulo usado no filtro.
     const modeQuery = `
-      SELECT COALESCE(s.shipping_mode, 'Outros') AS mode, COUNT(*) AS count
-      FROM public.sales s
+      SELECT ${U_SHIPPING_MODE} AS mode, COUNT(*) AS count
+      FROM public.unified_sales s
       LEFT JOIN public.users u ON s.uid = u.uid
       ${whereClause}
-      GROUP BY COALESCE(s.shipping_mode, 'Outros')
+      GROUP BY 1
       ORDER BY count DESC
     `;
 
     // Página de itens
     const dataQuery = `
       SELECT s.id, s.sku, s.uid, s.account_nickname, s.quantity,
-        s.product_title, s.shipping_mode, s.shipping_limit_date, s.shipping_status,
+        s.marketplace,
+        s.marketplace AS channel,
+        s.product_title,
+        ${U_SHIPPING_MODE} AS shipping_mode,
+        s.shipping_deadline AS shipping_limit_date,
+        s.shipping_status,
+        s.product_thumbnail,
         u.name AS user_nickname,
         -- Descrição interna cadastrada no Armazenamento (prioridade 1 na exibição)
         (SELECT sk.descricao FROM public.skus sk
@@ -919,9 +928,9 @@ router.get('/separacao', authenticateToken, requireMaster, async (req, res) => {
             AND sk.descricao IS NOT NULL AND TRIM(sk.descricao) <> ''
           ORDER BY sk.ativo DESC
           LIMIT 1) AS sku_descricao,
-        -- Variação escolhida na venda (cor, tamanho...). Casa o item do pedido
-        -- pelo seller_sku da linha; se não achar, usa o primeiro item.
-        COALESCE(
+        -- Variação escolhida na venda (cor, tamanho...). Só o ML publica
+        -- variation_attributes; na Shopee a variação vem no nome do modelo.
+        CASE WHEN s.marketplace = 'ML' THEN COALESCE(
           (SELECT oi->'item'->'variation_attributes'
              FROM jsonb_array_elements(COALESCE(s.raw_api_data->'order_items', '[]'::jsonb)) oi
             WHERE UPPER(TRIM(COALESCE(oi->'item'->>'seller_sku', oi->'item'->>'id', ''))) = UPPER(TRIM(s.sku))
@@ -929,13 +938,13 @@ router.get('/separacao', authenticateToken, requireMaster, async (req, res) => {
           (SELECT oi->'item'->'variation_attributes'
              FROM jsonb_array_elements(COALESCE(s.raw_api_data->'order_items', '[]'::jsonb)) oi
             LIMIT 1)
-        ) AS variation_attributes,
-        s.raw_api_data->'sla_data'->>'expected_date' AS sla_expected_date,
-        COALESCE(s.shipping_status, s.raw_api_data->'shipping'->>'status') AS shipping_status_live,
-        s.raw_api_data->'buyer'->>'first_name' AS buyer_first_name,
-        s.raw_api_data->'buyer'->>'last_name' AS buyer_last_name,
-        s.raw_api_data->'buyer'->>'nickname' AS buyer_nickname
-      FROM public.sales s
+        ) END AS variation_attributes,
+        s.shipping_deadline AS sla_expected_date,
+        COALESCE(NULLIF(s.shipping_status, ''), ${U_OPERATIONAL_STATUS}) AS shipping_status_live,
+        s.buyer_name AS buyer_first_name,
+        NULL::text AS buyer_last_name,
+        s.buyer_nickname
+      FROM public.unified_sales s
       LEFT JOIN public.users u ON s.uid = u.uid
       ${whereClause}
       ORDER BY ${orderBy}
@@ -1322,6 +1331,22 @@ function buildUnifiedFilters(query, uid, options = {}) {
   }
   if (uses('period') && to) {
     conditions.push(`s.sale_date <= $${p}`); params.push(`${to}T23:59:59.999-03:00`); p++;
+  }
+
+  // Prazo de ENVIO é uma janela independente da data da venda: a operação
+  // pergunta "o que vendi neste período" e "o que tenho de despachar neste
+  // outro". A view já resolve o prazo real de cada canal.
+  const shipFrom = (query.shipFrom || '').trim();
+  const shipTo = (query.shipTo || '').trim();
+  if (uses('shipPeriod') && shipFrom) {
+    conditions.push(`s.shipping_deadline >= $${p}`); params.push(`${shipFrom}T00:00:00-03:00`); p++;
+  }
+  if (uses('shipPeriod') && shipTo) {
+    conditions.push(`s.shipping_deadline <= $${p}`); params.push(`${shipTo}T23:59:59.999-03:00`); p++;
+  }
+  // Filtrar por prazo de despacho exclui FULL: quem expede FULL é o marketplace.
+  if (uses('shipPeriod') && (shipFrom || shipTo)) {
+    conditions.push(`${U_SHIPPING_MODE} IS DISTINCT FROM 'FULL'`);
   }
 
   const marketplace = (query.marketplace || '').trim();
