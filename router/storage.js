@@ -2,6 +2,12 @@
 const express = require('express');
 const jwt = require('jsonwebtoken');
 const db = require('../utils/postgres');
+const {
+  STORAGE_TYPES,
+  ADDITIONAL_STORAGE_TYPE,
+  buildStorageItems,
+  daysInMonth: realDaysInMonth,
+} = require('../utils/billingRules');
 
 const router = express.Router();
 const JWT_SECRET = process.env.JWT_SECRET || 'seu-segredo-super-secreto-para-jwt';
@@ -110,104 +116,43 @@ router.delete('/package-types/:id', authenticateToken, requireMaster, async (req
 router.get('/user/:userId/billing-summary', authenticateToken, requireOwnerOrMaster, async (req, res) => {
   const { userId } = req.params;
   try {
-    const masterPricesQuery = `SELECT type, price FROM public.services WHERE type IN ('base_storage', 'additional_storage');`;
-    const masterPricesResult = await db.query(masterPricesQuery);
+    // Mesmas regras da fatura (utils/billingRules.js). Esta rota tinha a sua
+    // própria cópia do proporcional, com dois defeitos: 30 dias fixos e
+    // comparação com o MÊS ATUAL em vez do mês consultado — o que mostrava
+    // proporcional em meses que já deveriam ser integrais.
+    const masterPricesResult = await db.query(
+      `SELECT type, price FROM public.services WHERE type = ANY($1);`,
+      [STORAGE_TYPES]
+    );
     const masterPrices = masterPricesResult.rows.reduce((acc, service) => {
       acc[service.type] = parseFloat(service.price);
       return acc;
     }, {});
+    const masterAdditionalPrice = masterPrices[ADDITIONAL_STORAGE_TYPE] || 0;
 
-    const masterBasePrice = masterPrices['base_storage'] || 0;
-    const masterAdditionalPrice = masterPrices['additional_storage'] || 0;
-    
-    // === DEBUG: Log dos preços master ===
-    console.log('🔍 DEBUG - Preços master:');
-    console.log('Query:', masterPricesQuery);
-    console.log('Resultados:', JSON.stringify(masterPricesResult.rows, null, 2));
-    console.log(`• masterBasePrice: R$ ${masterBasePrice.toFixed(2)}`);
-    console.log(`• masterAdditionalPrice: R$ ${masterAdditionalPrice.toFixed(2)}`);
-
-    const contractsQuery = `
-      SELECT s.type, uc.volume, uc.start_date
+    const contractsResult = await db.query(`
+      SELECT s.type, s.id AS service_id, uc.volume, uc.start_date
       FROM public.user_contracts uc
       JOIN public.services s ON uc.service_id = s.id
-      WHERE uc.uid = $1 AND s.type IN ('base_storage', 'additional_storage');
-    `;
-    const contractsResult = await db.query(contractsQuery, [userId]);
-    
-    // === DEBUG: Log dos contratos encontrados ===
-    console.log('🔍 DEBUG - Contratos encontrados:');
-    console.log('Query:', contractsQuery);
-    console.log('User ID:', userId);
-    console.log('Resultados:', JSON.stringify(contractsResult.rows, null, 2));
+      WHERE uc.uid = $1 AND s.type = ANY($2)
+      ORDER BY uc.start_date ASC;
+    `, [userId, STORAGE_TYPES]);
 
-    let totalCost = 0, baseCost = 0, additionalCost = 0, additionalVolume = 0;
+    const reference = new Date();
+    const storageItems = buildStorageItems({
+      contracts: contractsResult.rows,
+      prices: masterPrices,
+      year: reference.getFullYear(),
+      month: reference.getMonth() + 1,
+    });
 
-    // === BUSCAR TODOS OS TIPOS DE CONTRATOS ===
-    const baseService = contractsResult.rows.find(c => c.type === 'base_storage');
-    const additionalService = contractsResult.rows.find(c => c.type === 'additional_storage');
-    
-    console.log('🔍 DEBUG - Serviços encontrados:');
-    console.log('• Base:', baseService);
-    console.log('• Adicional:', additionalService);
-    
-        // === LÓGICA PARA ARMAZENAMENTO BASE COM CÁLCULO PROPORCIONAL ===
-    if (baseService) {
-      const currentDate = new Date();
-      const contractStartDate = new Date(baseService.start_date);
-      const currentYear = currentDate.getFullYear();
-      const currentMonth = currentDate.getMonth();
-      const contractStartYear = contractStartDate.getFullYear();
-      const contractStartMonth = contractStartDate.getMonth();
-      
-      // Se for o mês de entrada do usuário, calcular proporcional
-      if (currentYear === contractStartYear && currentMonth === contractStartMonth) {
-        // === USUÁRIO NO PRIMEIRO MÊS - CÁLCULO PROPORCIONAL ===
-        const startDay = contractStartDate.getDate();
-        const daysInMonth = 30; // Fixo em 30 dias
-        const daysRemaining = daysInMonth - startDay + 1;
-        
-        // Cálculo: 397 ÷ 30 dias × dias restantes
-        const dailyRate = masterBasePrice / daysInMonth;
-        baseCost = dailyRate * daysRemaining;
-        
-        console.log('🔍 DEBUG - Cálculo base (PROPORCIONAL - primeiro mês):');
-        console.log(`• Serviço usado: Armazenamento Base (até 1m³) - Proporcional`);
-        console.log(`• Data do contrato: ${contractStartDate.toLocaleDateString('pt-BR')}`);
-        console.log(`• Mês atual: ${currentDate.toLocaleDateString('pt-BR')}`);
-        console.log(`• Dia de entrada: ${startDay}`);
-        console.log(`• Dias restantes: ${daysRemaining}`);
-        console.log(`• Taxa diária: R$ ${dailyRate.toFixed(2)}`);
-        console.log(`• Custo base (PROPORCIONAL): R$ ${baseCost.toFixed(2)}`);
-        console.log(`• NOTA: Usando contrato base com cálculo proporcional`);
-      } else {
-        // === USUÁRIO TEM CONTRATO BASE (meses seguintes) ===
-        baseCost = masterBasePrice;
-        
-        console.log('🔍 DEBUG - Cálculo base (BASE - meses seguintes):');
-        console.log(`• Serviço usado: Armazenamento Base (até 1m³)`);
-        console.log(`• Custo base (COMPLETO): R$ ${baseCost.toFixed(2)}`);
-        console.log(`• NOTA: Usando contrato base (valor integral)`);
-      }
-    } else {
-      console.log('🔍 DEBUG - Nenhum serviço base encontrado');
-    }
+    const baseItems = storageItems.filter(i => i.quantity === 1 && i.unit === 'm3' && !/Adicional/.test(i.description));
+    const additionalItem = storageItems.find(i => /Adicional/.test(i.description));
 
-    if (additionalService) {
-      const quantity = parseInt(additionalService.volume, 10) || 0;
-      // === CORREÇÃO: Armazenamento adicional é sempre valor completo ===
-      // Não é proporcional como o base
-      additionalCost = masterAdditionalPrice * quantity;
-      additionalVolume = quantity;
-      
-      console.log('🔍 DEBUG - Cálculo adicional:');
-      console.log(`• Volume: ${quantity}`);
-      console.log(`• Preço por m³: R$ ${masterAdditionalPrice.toFixed(2)}`);
-      console.log(`• Custo adicional (COMPLETO): R$ ${additionalCost.toFixed(2)}`);
-      console.log(`• NOTA: Armazenamento adicional sempre cobra valor integral`);
-    } else {
-      console.log('🔍 DEBUG - Nenhum serviço adicional encontrado');
-    }
+    let baseCost = baseItems.reduce((sum, i) => sum + i.total_price, 0);
+    let additionalCost = additionalItem ? additionalItem.total_price : 0;
+    let additionalVolume = additionalItem ? additionalItem.quantity : 0;
+    let totalCost = 0;
 
     totalCost = baseCost + additionalCost;
     
@@ -218,15 +163,13 @@ router.get('/user/:userId/billing-summary', authenticateToken, requireOwnerOrMas
     console.log(`• totalCost: R$ ${totalCost.toFixed(2)}`);
     console.log(`• additionalVolume: ${additionalVolume} m³`);
 
-    // === NOVA LÓGICA: Cálculo de armazenamento mensal proporcional ===
+    // === Armazenamento mensal por SKU (proporcional no mês de entrada) ===
     const now = new Date();
     const currentYear = now.getUTCFullYear();
     const currentMonth = now.getUTCMonth();
-    const daysInMonth = 30; // Fixo em 30 dias
-    
-    // === CÁLCULO DE ARMAZENAMENTO PROPORCIONAL ESPECÍFICO PARA 21/08 ===
-    const august21Date = new Date(2024, 7, 21); // 21 de agosto de 2024 (mês 7 = agosto)
-    const isAugust2024 = currentYear === 2024 && currentMonth === 7;
+    // Dias reais do mês. Era 30 fixo, o que subestimava meses de 31 dias e
+    // superestimava fevereiro.
+    const daysInMonth = realDaysInMonth(currentYear, currentMonth + 1);
     
     const monthlyStorageQuery = `
       SELECT 
@@ -255,24 +198,10 @@ router.get('/user/:userId/billing-summary', authenticateToken, requireOwnerOrMas
       const startYear = startDate.getUTCFullYear();
       const startMonth = startDate.getUTCMonth();
       
-      // === LÓGICA ESPECIAL PARA AGOSTO 2024 - CÁLCULO PROPORCIONAL A PARTIR DE 21/08 ===
-      if (isAugust2024 && startDate >= august21Date) {
-        // SKU iniciado em 21/08 ou depois - cálculo proporcional para agosto
-        const startDay = startDate.getUTCDate();
-        const daysInAugust = daysInMonth - startDay + 1;
-        const proportionalPrice = (sku.monthly_price / daysInMonth) * daysInAugust;
-        
-        monthlyStorageCost += proportionalPrice;
-        monthlyStorageDetails.push({
-          sku: sku.sku,
-          descricao: sku.descricao,
-          monthlyPrice: parseFloat(sku.monthly_price),
-          startDate: sku.monthly_start_date,
-          daysInMonth: daysInAugust,
-          proportionalPrice: Math.round(proportionalPrice * 100) / 100,
-          tipo: 'proporcional_agosto_21'
-        });
-      } else if (startYear === currentYear && startMonth === currentMonth) {
+      // A regra que existia aqui era fixa para 21/08/2024 e já não se aplica a
+      // nenhum período corrente. A regra geral abaixo (proporcional no mês de
+      // entrada do SKU) cobre esse caso e todos os outros.
+      if (startYear === currentYear && startMonth === currentMonth) {
         // Se o SKU foi criado no mês atual (outros meses)
         const startDay = startDate.getUTCDate();
         const daysInCurrentMonth = daysInMonth - startDay + 1;

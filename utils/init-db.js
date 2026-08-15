@@ -255,6 +255,14 @@ async function syncDatabaseSchema() {
                         console.log(`   -> Adicionando coluna 'config' à tabela: public.services`);
                         await client.query('ALTER TABLE public.services ADD COLUMN config JSONB;');
                     }
+                    // Unidade de medida do serviço (m³, pacote, viagem, venda, unidade).
+                    // Antes a unidade só existia embutida no nome ("... (até 1m³)"),
+                    // o que impedia exibir "3 pacotes" ou "1 m³" na fatura.
+                    const unitColRes = await client.query(`SELECT 1 FROM information_schema.columns WHERE table_schema = 'public' AND table_name = 'services' AND column_name = 'unit'`);
+                    if (unitColRes.rowCount === 0) {
+                        console.log(`   -> Adicionando coluna 'unit' à tabela: public.services`);
+                        await client.query(`ALTER TABLE public.services ADD COLUMN unit VARCHAR(30);`);
+                    }
                     const constraintRes = await client.query(`SELECT constraint_name FROM information_schema.table_constraints WHERE table_name = 'services' AND constraint_type = 'UNIQUE' AND table_schema = 'public' AND constraint_name = 'services_name_key';`);
                     if(constraintRes.rowCount === 0) {
                         console.log(`   -> Adicionando restrição UNIQUE à coluna 'name' em public.services`);
@@ -266,6 +274,37 @@ async function syncDatabaseSchema() {
                     if (colRes.rowCount === 0) {
                         console.log(`   -> Adicionando coluna 'service_date' à tabela: public.invoice_items`);
                         await client.query('ALTER TABLE public.invoice_items ADD COLUMN service_date DATE;');
+                    }
+                    // Sem esta coluna era impossível saber de qual serviço um item
+                    // veio (a descrição é texto livre), logo impossível editar ou
+                    // remover um lançamento avulso com segurança.
+                    const serviceIdColRes = await client.query(`SELECT 1 FROM information_schema.columns WHERE table_schema = 'public' AND table_name = 'invoice_items' AND column_name = 'service_id'`);
+                    if (serviceIdColRes.rowCount === 0) {
+                        console.log(`   -> Adicionando coluna 'service_id' à tabela: public.invoice_items`);
+                        await client.query('ALTER TABLE public.invoice_items ADD COLUMN service_id INTEGER REFERENCES public.services(id) ON DELETE SET NULL;');
+                    }
+                    // A unidade fica congelada no item: se o serviço mudar de
+                    // unidade depois, faturas antigas continuam corretas.
+                    const unitColRes = await client.query(`SELECT 1 FROM information_schema.columns WHERE table_schema = 'public' AND table_name = 'invoice_items' AND column_name = 'unit'`);
+                    if (unitColRes.rowCount === 0) {
+                        console.log(`   -> Adicionando coluna 'unit' à tabela: public.invoice_items`);
+                        await client.query(`ALTER TABLE public.invoice_items ADD COLUMN unit VARCHAR(30);`);
+                    }
+                    await client.query('CREATE INDEX IF NOT EXISTS idx_invoice_items_invoice ON public.invoice_items(invoice_id);');
+                }
+                if (tableName === 'invoices') {
+                    // O status era sempre reescrito para 'pending' pelo recálculo.
+                    // paid_at/paid_by registram quem baixou a fatura e quando,
+                    // e permitem ao recálculo preservar uma fatura já paga.
+                    const paidByColRes = await client.query(`SELECT 1 FROM information_schema.columns WHERE table_schema = 'public' AND table_name = 'invoices' AND column_name = 'paid_by'`);
+                    if (paidByColRes.rowCount === 0) {
+                        console.log(`   -> Adicionando coluna 'paid_by' à tabela: public.invoices`);
+                        await client.query('ALTER TABLE public.invoices ADD COLUMN paid_by VARCHAR(255);');
+                    }
+                    const paidAtColRes = await client.query(`SELECT 1 FROM information_schema.columns WHERE table_schema = 'public' AND table_name = 'invoices' AND column_name = 'paid_at'`);
+                    if (paidAtColRes.rowCount === 0) {
+                        console.log(`   -> Adicionando coluna 'paid_at' à tabela: public.invoices`);
+                        await client.query('ALTER TABLE public.invoices ADD COLUMN paid_at TIMESTAMP WITH TIME ZONE;');
                     }
                 }
                 if (tableName === 'skus') {
@@ -596,16 +635,57 @@ async function seedInitialData() {
             );
         }
 
+        // Catálogo base. Os preços seguem a tabela oficial CyberDock; o seed é
+        // idempotente e nunca sobrescreve um preço já ajustado pelo master,
+        // exceto onde indicado (tiers da Montagem de Full, que estavam abaixo
+        // da tabela e por isso cobravam menos do que o devido).
         const servicesCheck = await client.query("SELECT COUNT(*) FROM public.services WHERE type IN ('base_storage', 'additional_storage', 'avulso_simples', 'avulso_quantidade')");
         if (parseInt(servicesCheck.rows[0].count, 10) < 5) {
             console.log('Serviços não encontrados ou incompletos. Inserindo/Atualizando...');
-            
-            await client.query(`INSERT INTO public.services (name, price, description, type) VALUES ('Armazenamento Base (até 1m³)', 397.00, 'Taxa base de armazenamento para o primeiro metro cúbico. Cobrança proporcional baseada na data de entrada do usuário.', 'base_storage'), ('Metro Cúbico Adicional', 197.00, 'Custo por cada metro cúbico adicional utilizado.', 'additional_storage') ON CONFLICT (name) DO NOTHING;`);
-            await client.query(`INSERT INTO public.services (name, price, description, type) VALUES ('Coleta CyberSegura', 50.00, 'Serviço de coleta avulso.', 'avulso_simples'), ('Transbordo Full CyberSeguro', 75.00, 'Serviço de transbordo avulso.', 'avulso_simples') ON CONFLICT (name) DO NOTHING;`);
 
-            const montagemFullConfig = { tiers: [ { from: 1, to: 100, price: 1.49 }, { from: 101, to: 300, price: 1.29 }, { from: 301, to: null, price: 1.09 } ] };
-            await client.query(`INSERT INTO public.services (name, price, description, type, config) VALUES ('Montagem de Full', 0, 'Montagem de pacotes para envio Full. O preço varia com a quantidade.', 'avulso_quantidade', $1) ON CONFLICT (name) DO UPDATE SET config = EXCLUDED.config;`, [JSON.stringify(montagemFullConfig)]);
+            await client.query(`INSERT INTO public.services (name, price, description, type, unit) VALUES ('Armazenamento Base (até 1m³)', 397.00, 'Taxa base de armazenamento para o primeiro metro cúbico. Cobrança proporcional baseada na data de entrada do usuário.', 'base_storage', 'm3'), ('Metro Cúbico Adicional', 197.00, 'Custo por cada metro cúbico adicional utilizado.', 'additional_storage', 'm3') ON CONFLICT (name) DO NOTHING;`);
+            await client.query(`INSERT INTO public.services (name, price, description, type, unit) VALUES ('Coleta CyberSegura', 197.00, 'Coleta até 1m³ e 40km da sede da CyberDock.', 'avulso_simples', 'viagem'), ('Transbordo Full CyberSeguro', 297.00, 'Envios ao Full - C.D do ML - cidade de São Paulo.', 'avulso_simples', 'viagem') ON CONFLICT (name) DO NOTHING;`);
         }
+
+        // === Montagem de Full: faixas conforme a tabela oficial ===
+        // 01 a 100 = 1,49 | 101 a 300 = 1,35 | acima de 301 = 1,19.
+        // Rodava com 1,29 e 1,19 nas duas últimas faixas, cobrando menos.
+        // O UPDATE das faixas é intencional: é correção de preço, não preferência.
+        const montagemFullConfig = {
+            tiers: [
+                { from: 1, to: 100, price: 1.49 },
+                { from: 101, to: 300, price: 1.35 },
+                { from: 301, to: null, price: 1.19 },
+            ],
+            quantity_label: 'Quantidade de pacotes',
+            placeholder: 'Ex: 150',
+        };
+        await client.query(
+            `INSERT INTO public.services (name, price, description, type, config, unit)
+             VALUES ('Montagem de Full', 0, 'Preparação completa no padrão Full. O preço por pacote varia conforme a quantidade.', 'avulso_quantidade', $1, 'pacote')
+             ON CONFLICT (name) DO UPDATE SET config = EXCLUDED.config, type = 'avulso_quantidade', unit = 'pacote', description = EXCLUDED.description;`,
+            [JSON.stringify(montagemFullConfig)]
+        );
+
+        // === Armazenamento Inicial (1m³) 50% | FULL ===
+        // Metade do armazenamento base, para a operação que usa 10% Full.
+        // Tem type próprio para o faturamento reconhecê-lo: criado pela tela de
+        // catálogo ele nasceria com type NULL e jamais seria cobrado.
+        await client.query(
+            `INSERT INTO public.services (name, price, description, type, unit)
+             VALUES ('Armazenamento Inicial (1m³) 50% | FULL', 198.50, 'Metade do armazenamento inicial de 1m³, para operação Full. Cobrança proporcional na entrada, igual ao base.', 'base_storage_50', 'm3')
+             ON CONFLICT (name) DO UPDATE SET type = 'base_storage_50', unit = 'm3';`
+        );
+
+        // Preenche a unidade dos serviços que já existiam antes da coluna.
+        await client.query(`
+            UPDATE public.services SET unit = CASE
+                WHEN type IN ('base_storage', 'base_storage_50', 'additional_storage') THEN 'm3'
+                WHEN type = 'avulso_quantidade' THEN 'pacote'
+                WHEN type = 'avulso_simples' THEN 'viagem'
+                ELSE 'unidade' END
+            WHERE unit IS NULL;
+        `);
 
         const defaultStatuses = [ { value: 'custom_01_imprimir_etiqueta', label: '01 Imprimir Etiqueta' }, { value: 'custom_02_preparar_pacote', label: '02 Preparar Pacote' }, { value: 'custom_03_pacote_embalado', label: '03 Pacote Embalado' }, { value: 'custom_04_aguardando_coleta', label: '04 Aguardando Coleta' }, { value: 'custom_05_enviado', label: '05 Enviado' }, { value: 'custom_05_despachado', label: '05 Despachado' } ];
         const statusesCheck = await client.query("SELECT 1 FROM public.system_settings WHERE key = 'sales_statuses'");

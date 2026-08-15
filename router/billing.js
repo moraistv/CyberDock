@@ -3,6 +3,12 @@ const express = require('express');
 const db = require('../utils/postgres');
 const { authenticateToken, requireMaster } = require('../utils/authMiddleware');
 const { BillingQueryBuilder } = require('../utils/billingQueryBuilder');
+const {
+  STORAGE_TYPES,
+  buildStorageItems,
+  getTierUnitPrice,
+  round,
+} = require('../utils/billingRules');
 
 const router = express.Router();
 
@@ -15,119 +21,40 @@ const billingQueryBuilder = new BillingQueryBuilder();
  */
 async function calculateAndSaveInvoice(client, uid, period) {
   const [year, month] = period.split('-').map(Number);
-  const startDate = new Date(Date.UTC(year, month - 1, 1));
-  const endDate = new Date(Date.UTC(year, month, 1, 0, 0, 0, -1));
 
   // === 1) Preços "master" dos serviços de armazenamento ===
+  // Inclui base_storage_50 (Armazenamento Inicial 1m³ 50% | FULL).
   const masterPricesRes = await client.query(`
     SELECT type, price
     FROM public.services
-    WHERE type IN ('base_storage', 'additional_storage');
-  `);
+    WHERE type = ANY($1);
+  `, [STORAGE_TYPES]);
   const masterPrices = masterPricesRes.rows.reduce((acc, s) => {
     acc[s.type] = parseFloat(s.price);
     return acc;
   }, {});
-  const masterBasePrice = masterPrices['base_storage'] || 0;
-  const masterAdditionalPrice = masterPrices['additional_storage'] || 0;
 
-  // === 2) Contratos do cliente para armazenamento ===
+  // === 2) Contratos de armazenamento do cliente ===
+  // A start_date vem junto: antes era buscada numa segunda query por
+  // `type = 'base_storage' LIMIT 1`, que apontava para o serviço errado
+  // quando havia mais de um registro do mesmo tipo no catálogo.
   const contractsRes = await client.query(`
-    SELECT s.type, uc.volume
+    SELECT s.type, s.id AS service_id, uc.volume, uc.start_date
     FROM public.user_contracts uc
     JOIN public.services s ON uc.service_id = s.id
-    WHERE uc.uid = $1 AND s.type IN ('base_storage', 'additional_storage');
-  `, [uid]);
+    WHERE uc.uid = $1 AND s.type = ANY($2)
+    ORDER BY uc.start_date ASC;
+  `, [uid, STORAGE_TYPES]);
 
-  let autoItems = [];
-  let autoTotal = 0;
-
-  const baseService = contractsRes.rows.find(c => c.type === 'base_storage');
-  if (baseService) {
-    // === CÁLCULO PROPORCIONAL BASEADO NA DATA DE ENTRADA DO USUÁRIO ===
-    const currentDate = new Date();
-    const currentYear = currentDate.getFullYear();
-    const currentMonth = currentDate.getMonth();
-    
-    // Buscar a data de início do contrato do usuário
-    const userContractRes = await client.query(`
-      SELECT uc.start_date
-      FROM public.user_contracts uc
-      WHERE uc.uid = $1 AND uc.service_id = (
-        SELECT id FROM public.services WHERE type = 'base_storage' LIMIT 1
-      )
-      ORDER BY uc.start_date ASC
-      LIMIT 1;
-    `, [uid]);
-    
-    if (userContractRes.rows.length > 0) {
-      const contractStartDate = new Date(userContractRes.rows[0].start_date);
-      const contractStartYear = contractStartDate.getFullYear();
-      const contractStartMonth = contractStartDate.getMonth();
-      
-      // Se for o mês de entrada do usuário, calcular proporcional
-      if (year === contractStartYear && month === contractStartMonth + 1) {
-        const startDay = contractStartDate.getDate();
-        const daysInMonth = 30; // Fixo em 30 dias
-        const daysRemaining = daysInMonth - startDay + 1;
-        
-        // Cálculo: preço base ÷ 30 dias × dias restantes
-        const dailyRate = masterBasePrice / daysInMonth;
-        const proportionalPrice = dailyRate * daysRemaining;
-        // O cálculo é feito automaticamente com base na data de entrada do cliente
-        // e no número de dias do mês, sem usar valores fixos
-        
-        autoItems.push({
-          description: `Armazenamento Base (até 1m³) - Proporcional ${daysRemaining} dias (entrada dia ${startDay})`,
-          quantity: 1,
-          unit_price: Math.round(proportionalPrice * 100) / 100,
-          total_price: Math.round(proportionalPrice * 100) / 100,
-          type: 'storage'
-        });
-        autoTotal += Math.round(proportionalPrice * 100) / 100;
-      } else {
-        // Mês completo ou meses seguintes - cobrar valor integral
-        autoItems.push({
-          description: 'Armazenamento Base (até 1m³)',
-          quantity: 1,
-          unit_price: masterBasePrice,
-          total_price: masterBasePrice,
-          type: 'storage'
-        });
-        autoTotal += masterBasePrice;
-      }
-    } else {
-      // Fallback: se não encontrar contrato, cobrar valor integral
-      autoItems.push({
-        description: 'Armazenamento Base (até 1m³)',
-        quantity: 1,
-        unit_price: masterBasePrice,
-        total_price: masterBasePrice,
-        type: 'storage'
-      });
-      autoTotal += masterBasePrice;
-    }
-  }
-
-  const additionalService = contractsRes.rows.find(c => c.type === 'additional_storage');
-  if (additionalService) {
-    const quantity = parseInt(additionalService.volume, 10) || 0;
-    if (quantity > 0) {
-      const total = masterAdditionalPrice * quantity;
-      autoItems.push({
-        description: 'Armazenamento Adicional (m³)',
-        quantity,
-        unit_price: masterAdditionalPrice,
-        total_price: total,
-        type: 'storage'
-      });
-      autoTotal += total;
-    }
-  }
-
-  // === 2.1) CÁLCULO PROPORCIONAL AUTOMÁTICO ===
-  // O armazenamento base é calculado proporcionalmente baseado na data de entrada do usuário
-  // Para meses seguintes, será cobrado o valor completo
+  // Regras de proporcional e rótulos ficam em utils/billingRules.js, para não
+  // divergirem de novo entre a fatura e a estimativa do armazenamento.
+  const autoItems = buildStorageItems({
+    contracts: contractsRes.rows,
+    prices: masterPrices,
+    year,
+    month,
+  });
+  let autoTotal = autoItems.reduce((sum, item) => sum + item.total_price, 0);
 
   // === 3) Expedições por período (QUERY CORRIGIDA) ===
   console.log(`[BILLING-FIX] Buscando expedições para ${uid}, período ${period}`);
@@ -149,26 +76,30 @@ async function calculateAndSaveInvoice(client, uid, period) {
 
   for (const [description, data] of Object.entries(shipmentSummary)) {
     if (data.quantity > 0) {
-      const total = data.quantity * data.price;
+      const total = round(data.quantity * data.price);
       autoItems.push({
         description,
         quantity: data.quantity,
+        unit: 'venda',
         unit_price: data.price,
         total_price: total,
-        type: 'shipment'
+        type: 'shipment',
+        service_id: null
       });
       autoTotal += total;
     }
   }
 
   // === 4) Upsert da fatura (cria se não existir) ===
+  // O status NÃO é mais reescrito aqui. Antes o recálculo forçava 'pending' e
+  // a leitura da fatura dispara o recálculo, então uma fatura marcada como paga
+  // voltava para pendente sozinha na próxima vez que a tela era aberta.
   const dueDate = new Date(Date.UTC(year, month, 5));
   const upsertRes = await client.query(`
     INSERT INTO public.invoices (uid, period, due_date, total_amount, status)
     VALUES ($1, $2, $3, 0, 'pending')
     ON CONFLICT (uid, period) DO UPDATE
-      SET due_date = EXCLUDED.due_date,
-          status = 'pending'
+      SET due_date = EXCLUDED.due_date
     RETURNING id;
   `, [uid, period, dueDate]);
   const invoiceId = upsertRes.rows[0].id;
@@ -182,9 +113,9 @@ async function calculateAndSaveInvoice(client, uid, period) {
   if (autoItems.length) {
     for (const it of autoItems) {
       await client.query(`
-        INSERT INTO public.invoice_items (invoice_id, description, quantity, unit_price, total_price, type)
-        VALUES ($1, $2, $3, $4, $5, $6);
-      `, [invoiceId, it.description, it.quantity, it.unit_price, it.total_price, it.type]);
+        INSERT INTO public.invoice_items (invoice_id, description, quantity, unit, unit_price, total_price, type, service_id)
+        VALUES ($1, $2, $3, $4, $5, $6, $7, $8);
+      `, [invoiceId, it.description, it.quantity, it.unit || null, it.unit_price, it.total_price, it.type, it.service_id || null]);
     }
   }
 
@@ -218,14 +149,18 @@ router.get('/invoices/:uid', authenticateToken, async (req, res) => {
 
     const q = `
       SELECT i.id, i.uid, i.period, i.due_date, i.payment_date, i.total_amount, i.status,
+             i.paid_at, i.paid_by,
              COALESCE(json_agg(json_build_object(
+               'id', it.id,
                'description', it.description,
                'quantity', it.quantity,
+               'unit', it.unit,
                'unit_price', it.unit_price,
                'total_price', it.total_price,
                'type', it.type,
+               'service_id', it.service_id,
                'service_date', it.service_date
-             )) FILTER (WHERE it.id IS NOT NULL), '[]') AS items
+             ) ORDER BY it.type, it.id) FILTER (WHERE it.id IS NOT NULL), '[]') AS items
       FROM public.invoices i
       LEFT JOIN public.invoice_items it ON i.id = it.invoice_id
       WHERE i.uid = $1
@@ -295,19 +230,6 @@ router.get('/manual-services', authenticateToken, requireMaster, async (req, res
   }
 });
 
-/** Util: define preço por faixa (tiers) para serviços "avulso_quantidade" */
-function getTierUnitPrice(cfg, qty) {
-  if (!cfg || !Array.isArray(cfg.tiers) || !qty) return null;
-  for (const tier of cfg.tiers) {
-    const fromOk = typeof tier.from === 'number' ? qty >= tier.from : true;
-    const toOk = typeof tier.to === 'number' ? qty <= tier.to : true;
-    if (fromOk && toOk) return parseFloat(tier.price);
-  }
-  // Se não encontrou, usa último tier sem "to"
-  const openTier = cfg.tiers.find(t => t.to === null || typeof t.to === 'undefined');
-  return openTier ? parseFloat(openTier.price) : null;
-}
-
 /** ===== NOVO: adiciona item manual na fatura (master) ===== */
 router.post('/add-manual-item', authenticateToken, requireMaster, async (req, res) => {
   const { uid, period, serviceId, quantity, serviceDate } = req.body || {};
@@ -321,7 +243,7 @@ router.post('/add-manual-item', authenticateToken, requireMaster, async (req, re
     await client.query('BEGIN');
 
     // 1) Busca o serviço
-    const serviceRes = await client.query(`SELECT id, name, type, price, config FROM public.services WHERE id = $1`, [serviceId]);
+    const serviceRes = await client.query(`SELECT id, name, type, price, config, unit FROM public.services WHERE id = $1`, [serviceId]);
     if (serviceRes.rowCount === 0) throw new Error('Serviço não encontrado.');
     const service = serviceRes.rows[0];
 
@@ -363,11 +285,12 @@ router.post('/add-manual-item', authenticateToken, requireMaster, async (req, re
       if (!isNaN(d)) serviceDateSql = d.toISOString().slice(0, 10);
     }
 
-    // 6) Insere item manual
+    // 6) Insere item manual. Guarda service_id e unidade para o item ser
+    //    rastreável até o catálogo e para a fatura poder exibir "150 pacotes".
     await client.query(`
-      INSERT INTO public.invoice_items (invoice_id, description, quantity, unit_price, total_price, type, service_date)
-      VALUES ($1, $2, $3, $4, $5, 'manual', $6);
-    `, [invoiceId, service.name, qty, unitPrice, totalPrice, serviceDateSql]);
+      INSERT INTO public.invoice_items (invoice_id, description, quantity, unit, unit_price, total_price, type, service_id, service_date)
+      VALUES ($1, $2, $3, $4, $5, $6, 'manual', $7, $8);
+    `, [invoiceId, service.name, qty, service.unit || null, unitPrice, totalPrice, service.id, serviceDateSql]);
 
     // 7) Recalcula total da fatura (manual + automáticos)
     const sumRes = await client.query(`
@@ -419,6 +342,107 @@ router.get('/debug-comparison/:uid', authenticateToken, requireMaster, async (re
   } catch (err) {
     console.error('Erro ao comparar sistemas de cobrança:', err);
     res.status(500).json({ error: 'Erro ao comparar sistemas de cobrança.' });
+  }
+});
+
+/**
+ * ===== Baixa/reabertura de fatura (master) =====
+ * Só o master altera o status. Antes isso não existia em nenhum lugar: o único
+ * status escrito era 'pending', e o recálculo o reescrevia a cada leitura da
+ * fatura — por isso o passo 4 de calculateAndSaveInvoice deixou de tocar nele.
+ */
+router.patch('/invoices/:uid/:period/status', authenticateToken, requireMaster, async (req, res) => {
+  const { uid, period } = req.params;
+  const { status, paymentDate } = req.body || {};
+
+  const allowed = ['paid', 'pending'];
+  if (!allowed.includes(status)) {
+    return res.status(400).json({ error: `Status inválido. Use: ${allowed.join(' ou ')}.` });
+  }
+  if (!/^\d{4}-\d{2}$/.test(period)) {
+    return res.status(400).json({ error: 'Competência inválida. Use o formato YYYY-MM.' });
+  }
+
+  try {
+    // Data do pagamento: a informada, ou hoje. Ao reabrir, é limpa.
+    let paidDate = null;
+    if (status === 'paid') {
+      const parsed = paymentDate ? new Date(paymentDate) : new Date();
+      if (Number.isNaN(parsed.getTime())) {
+        return res.status(400).json({ error: 'Data de pagamento inválida.' });
+      }
+      paidDate = parsed.toISOString().slice(0, 10);
+    }
+
+    const { rows, rowCount } = await db.query(`
+      UPDATE public.invoices
+         SET status = $1,
+             payment_date = $2,
+             paid_at = CASE WHEN $1 = 'paid' THEN NOW() ELSE NULL END,
+             paid_by = CASE WHEN $1 = 'paid' THEN $3 ELSE NULL END
+       WHERE uid = $4 AND period = $5
+       RETURNING id, uid, period, status, payment_date, paid_at, paid_by, total_amount;
+    `, [status, paidDate, req.user.email || req.user.uid, uid, period]);
+
+    if (rowCount === 0) {
+      return res.status(404).json({ error: 'Fatura não encontrada para este cliente e competência.' });
+    }
+
+    const invoice = rows[0];
+    res.json({
+      ok: true,
+      invoice: { ...invoice, total_amount: parseFloat(invoice.total_amount) }
+    });
+  } catch (err) {
+    console.error('Erro ao atualizar status da fatura:', err);
+    res.status(500).json({ error: 'Erro interno ao atualizar o status da fatura.' });
+  }
+});
+
+/**
+ * ===== Remove um serviço avulso lançado (master) =====
+ * Não existia forma de desfazer um lançamento errado a não ser no banco.
+ * Restrito a itens 'manual': storage e shipment são recalculados automaticamente.
+ */
+router.delete('/manual-item/:itemId', authenticateToken, requireMaster, async (req, res) => {
+  const { itemId } = req.params;
+  const client = await db.pool.connect();
+  try {
+    await client.query('BEGIN');
+
+    const { rows } = await client.query(
+      `SELECT id, invoice_id, type FROM public.invoice_items WHERE id = $1`,
+      [itemId]
+    );
+    if (rows.length === 0) {
+      await client.query('ROLLBACK');
+      return res.status(404).json({ error: 'Lançamento não encontrado.' });
+    }
+    if (rows[0].type !== 'manual') {
+      await client.query('ROLLBACK');
+      return res.status(400).json({ error: 'Somente serviços avulsos podem ser removidos.' });
+    }
+
+    const invoiceId = rows[0].invoice_id;
+    await client.query(`DELETE FROM public.invoice_items WHERE id = $1`, [itemId]);
+
+    const sumRes = await client.query(
+      `SELECT COALESCE(SUM(total_price), 0) AS sum FROM public.invoice_items WHERE invoice_id = $1`,
+      [invoiceId]
+    );
+    await client.query(
+      `UPDATE public.invoices SET total_amount = $1 WHERE id = $2`,
+      [parseFloat(sumRes.rows[0].sum || 0), invoiceId]
+    );
+
+    await client.query('COMMIT');
+    res.json({ ok: true, invoice_id: invoiceId });
+  } catch (err) {
+    await client.query('ROLLBACK');
+    console.error('Erro ao remover serviço avulso:', err);
+    res.status(500).json({ error: 'Erro ao remover o lançamento.' });
+  } finally {
+    client.release();
   }
 });
 

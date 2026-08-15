@@ -3,6 +3,7 @@ const express = require('express');
 const bcrypt = require('bcryptjs');
 const db = require('../utils/postgres');
 const { authenticateToken, requireMaster, requireOwnerOrMaster } = require('../utils/authMiddleware');
+const { BASE_STORAGE_TYPES } = require('../utils/billingRules');
 
 const router = express.Router();
 
@@ -58,12 +59,62 @@ router.put('/:uid/role', authenticateToken, requireMaster, async (req, res) => {
             return res.status(404).json({ error: 'Usuário não encontrado.' });
         }
 
-        res.json({ message: 'Permissão atualizada com sucesso.', user: rows[0] });
+        // Todo cliente tem o 1m³ inicial por padrão. Sem contrato base o
+        // faturamento simplesmente não gera o item de armazenamento, e o
+        // cliente ficava sem ser cobrado até alguém lembrar de contratar à mão.
+        let defaultContract = null;
+        if (role === 'cliente') {
+            defaultContract = await ensureDefaultStorageContract(uid);
+        }
+
+        res.json({
+            message: 'Permissão atualizada com sucesso.',
+            user: rows[0],
+            defaultContract
+        });
     } catch (error) {
         console.error(`Erro ao atualizar permissão para o usuário ${uid}:`, error);
         res.status(500).json({ error: 'Erro interno ao atualizar permissão.' });
     }
 });
+
+/**
+ * Garante o contrato de armazenamento inicial (1m³) do cliente.
+ *
+ * Não sobrescreve nada: se o cliente já tem qualquer contrato de armazenamento
+ * inicial (o base ou a variante FULL 50%), não faz nada. A data de início é
+ * hoje, para o proporcional do mês de entrada sair correto.
+ *
+ * @returns {Object|null} o contrato criado, ou null se já existia
+ */
+async function ensureDefaultStorageContract(uid) {
+    const existing = await db.query(`
+        SELECT 1
+          FROM public.user_contracts uc
+          JOIN public.services s ON s.id = uc.service_id
+         WHERE uc.uid = $1 AND s.type = ANY($2)
+         LIMIT 1;
+    `, [uid, BASE_STORAGE_TYPES]);
+    if (existing.rowCount > 0) return null;
+
+    const service = await db.query(
+        `SELECT id, name, price FROM public.services WHERE type = 'base_storage' ORDER BY id ASC LIMIT 1;`
+    );
+    if (service.rowCount === 0) {
+        console.warn(`[users] Serviço de armazenamento base não encontrado; contrato padrão não criado para ${uid}.`);
+        return null;
+    }
+
+    const { id, name, price } = service.rows[0];
+    const today = new Date().toISOString().slice(0, 10);
+    const { rows } = await db.query(`
+        INSERT INTO public.user_contracts (uid, service_id, name, price, volume, start_date)
+        VALUES ($1, $2, $3, $4, 1, $5)
+        ON CONFLICT (uid, service_id) DO NOTHING
+        RETURNING id, service_id, name, price, volume, start_date;
+    `, [uid, id, name, price, today]);
+    return rows[0] || null;
+}
 
 /**
  * @route   PUT /api/users/:uid/name
