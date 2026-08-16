@@ -1,5 +1,6 @@
 // backend/utils/init-db.js
 
+const crypto = require('crypto');
 const db = require('./postgres');
 
 const schema = {
@@ -240,6 +241,166 @@ const schema = {
             updated_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
         );`
 };
+
+/* ---------------------------------------------------------------------------
+ * View unificada de vendas (Mercado Livre + Shopee).
+ *
+ * As telas de venda/expedição são multi-marketplace: quem separa pedido precisa
+ * de UMA fila, não de uma tela por canal. A view normaliza as duas tabelas num
+ * formato comum para que filtro, busca e paginação funcionem sobre o conjunto.
+ *
+ * `id` é TEXT porque o ML usa order_id numérico e a Shopee usa order_sn
+ * alfanumérico. Coluna exclusiva de um canal vem NULL no outro.
+ * ------------------------------------------------------------------------- */
+const UNIFIED_SALES_VIEW_SQL = `
+    CREATE VIEW public.unified_sales AS
+    SELECT
+        'ML'::text                              AS marketplace,
+        s.id::text                              AS id,
+        s.sku,
+        s.uid,
+        s.seller_id::text                       AS account_id,
+        s.account_nickname,
+        s.sale_date,
+        s.product_title,
+        s.quantity,
+        s.shipping_mode,
+        -- O SLA do ML é o prazo real de despacho e tem precedência. O cast é
+        -- guardado por regex: um valor malformado no JSON derrubaria a consulta
+        -- inteira da view, não apenas a linha.
+        COALESCE(
+            CASE
+                WHEN s.raw_api_data->'sla_data'->>'expected_date' ~ '^\\d{4}-\\d{2}-\\d{2}'
+                THEN (s.raw_api_data->'sla_data'->>'expected_date')::timestamptz
+            END,
+            s.shipping_limit_date
+        )                                       AS shipping_deadline,
+        s.shipping_status,
+        s.processed_at,
+        s.updated_at,
+        s.raw_api_data->>'status'               AS order_status,
+        s.raw_api_data->'shipping'->>'id'       AS shipping_id,
+        s.raw_api_data->'order_items'->0->'item'->>'thumbnail'  AS product_thumbnail,
+        s.raw_api_data->'order_items'->0->'item'->>'permalink'  AS product_permalink,
+        s.raw_api_data->'order_items'->0->'item'->>'id'         AS item_id,
+        TRIM(CONCAT_WS(' ',
+            s.raw_api_data->'buyer'->>'first_name',
+            s.raw_api_data->'buyer'->>'last_name'
+        ))                                      AS buyer_name,
+        s.raw_api_data->'buyer'->>'nickname'    AS buyer_nickname,
+        s.raw_api_data                          AS raw_api_data
+    FROM public.sales s
+
+    UNION ALL
+
+    SELECT
+        'Shopee'::text                          AS marketplace,
+        sp.order_sn                             AS id,
+        sp.sku,
+        sp.uid,
+        sp.shop_id::text                        AS account_id,
+        sp.account_nickname,
+        sp.sale_date,
+        sp.product_title,
+        sp.quantity,
+        -- A Shopee não tem a modalidade do ML (FULL/FLEX). Usamos a
+        -- transportadora do pacote como modalidade exibida.
+        COALESCE(NULLIF(sp.shipping_carrier, ''), 'Shopee')     AS shipping_mode,
+        sp.ship_by_date                         AS shipping_deadline,
+        sp.shipping_status,
+        sp.processed_at,
+        sp.updated_at,
+        sp.order_status,
+        NULL::text                              AS shipping_id,
+        COALESCE(
+            sp.raw_api_data->'synced_item',
+            sp.raw_api_data->'item_list'->0
+        )->'image_info'->>'image_url'           AS product_thumbnail,
+        CASE
+            WHEN COALESCE(
+                sp.raw_api_data->'synced_item',
+                sp.raw_api_data->'item_list'->0
+            )->>'item_id' IS NOT NULL
+            THEN 'https://shopee.com.br/product/' || sp.shop_id::text || '/' ||
+                 (COALESCE(
+                    sp.raw_api_data->'synced_item',
+                    sp.raw_api_data->'item_list'->0
+                 )->>'item_id')
+            ELSE NULL
+        END                                     AS product_permalink,
+        COALESCE(
+            sp.raw_api_data->'synced_item',
+            sp.raw_api_data->'item_list'->0
+        )->>'item_id'                           AS item_id,
+        sp.recipient_name                       AS buyer_name,
+        sp.buyer_username                       AS buyer_nickname,
+        sp.raw_api_data                         AS raw_api_data
+    FROM public.shopee_sales sp;
+`;
+
+/**
+ * Cria/atualiza public.unified_sales fora da transação de schema.
+ *
+ * Antes isto rodava dentro da transação que já mantinha lock exclusivo em
+ * `sales` (ALTER TABLE/CREATE INDEX). O DROP/CREATE da view precisa de
+ * AccessExclusiveLock nela; uma requisição simultânea lendo `unified_sales` e
+ * precisando de `sales` fechava o ciclo e o Postgres abortava o boot com
+ * deadlock (40P01) — a aplicação entrava em loop de reinício.
+ *
+ * Agora: só recria quando a definição realmente mudou, usa lock_timeout curto e
+ * não é fatal quando a view já existe.
+ */
+async function applyUnifiedSalesView() {
+    const desiredHash = crypto.createHash('md5').update(UNIFIED_SALES_VIEW_SQL).digest('hex');
+    const client = await db.pool.connect();
+
+    try {
+        const existing = await client.query(`SELECT to_regclass('public.unified_sales') IS NOT NULL AS exists`);
+        const viewExists = existing.rows[0]?.exists === true;
+
+        const stored = await client.query(
+            `SELECT value #>> '{}' AS hash FROM public.system_settings WHERE key = 'unified_sales_view_hash'`
+        );
+        const storedHash = stored.rows[0]?.hash || null;
+
+        if (viewExists && storedHash === desiredHash) {
+            console.log('   -> View public.unified_sales já está atualizada.');
+            return;
+        }
+
+        console.log('   -> Criando/atualizando view public.unified_sales...');
+        await client.query('BEGIN');
+        // Desiste rápido em vez de brigar por lock com as telas em uso.
+        await client.query("SET LOCAL lock_timeout = '5s'");
+        await client.query('DROP VIEW IF EXISTS public.unified_sales;');
+        await client.query(UNIFIED_SALES_VIEW_SQL);
+        await client.query(
+            `INSERT INTO public.system_settings (key, value, updated_at)
+             VALUES ('unified_sales_view_hash', to_jsonb($1::text), NOW())
+             ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value, updated_at = NOW()`,
+            [desiredHash]
+        );
+        await client.query('COMMIT');
+        console.log('   -> View public.unified_sales atualizada.');
+    } catch (error) {
+        try { await client.query('ROLLBACK'); } catch { /* transação já encerrada */ }
+
+        const viewStillThere = await client
+            .query(`SELECT to_regclass('public.unified_sales') IS NOT NULL AS exists`)
+            .then((r) => r.rows[0]?.exists === true)
+            .catch(() => false);
+
+        if (viewStillThere) {
+            // A view antiga continua servindo as telas. Não vale derrubar o
+            // sistema por não conseguir atualizá-la agora.
+            console.warn(`⚠️  Não foi possível atualizar public.unified_sales agora (${error.message}). A versão atual segue em uso; será tentado no próximo start.`);
+            return;
+        }
+        throw error;
+    } finally {
+        client.release();
+    }
+}
 
 async function syncDatabaseSchema() {
     const client = await db.pool.connect();
@@ -522,94 +683,13 @@ async function syncDatabaseSchema() {
         // DROP antes de criar: CREATE OR REPLACE VIEW falha se a lista de
         // colunas mudar (nome, tipo ou ordem), o que travaria o boot numa
         // futura evolução do schema.
-        console.log('   -> Criando/atualizando view public.unified_sales...');
-        await client.query('DROP VIEW IF EXISTS public.unified_sales;');
-        await client.query(`
-            CREATE VIEW public.unified_sales AS
-            SELECT
-                'ML'::text                              AS marketplace,
-                s.id::text                              AS id,
-                s.sku,
-                s.uid,
-                s.seller_id::text                       AS account_id,
-                s.account_nickname,
-                s.sale_date,
-                s.product_title,
-                s.quantity,
-                s.shipping_mode,
-                -- O SLA do ML é o prazo real de despacho e tem precedência.
-                -- O cast é guardado por regex: um valor malformado no JSON
-                -- derrubaria toda a consulta da view, não apenas a linha.
-                COALESCE(
-                    CASE
-                        WHEN s.raw_api_data->'sla_data'->>'expected_date' ~ '^\\d{4}-\\d{2}-\\d{2}'
-                        THEN (s.raw_api_data->'sla_data'->>'expected_date')::timestamptz
-                    END,
-                    s.shipping_limit_date
-                )                                       AS shipping_deadline,
-                s.shipping_status,
-                s.processed_at,
-                s.updated_at,
-                s.raw_api_data->>'status'               AS order_status,
-                s.raw_api_data->'shipping'->>'id'       AS shipping_id,
-                s.raw_api_data->'order_items'->0->'item'->>'thumbnail'  AS product_thumbnail,
-                s.raw_api_data->'order_items'->0->'item'->>'permalink'  AS product_permalink,
-                s.raw_api_data->'order_items'->0->'item'->>'id'         AS item_id,
-                TRIM(CONCAT_WS(' ',
-                    s.raw_api_data->'buyer'->>'first_name',
-                    s.raw_api_data->'buyer'->>'last_name'
-                ))                                      AS buyer_name,
-                s.raw_api_data->'buyer'->>'nickname'    AS buyer_nickname,
-                s.raw_api_data                          AS raw_api_data
-            FROM public.sales s
-
-            UNION ALL
-
-            SELECT
-                'Shopee'::text                          AS marketplace,
-                sp.order_sn                             AS id,
-                sp.sku,
-                sp.uid,
-                sp.shop_id::text                        AS account_id,
-                sp.account_nickname,
-                sp.sale_date,
-                sp.product_title,
-                sp.quantity,
-                -- A Shopee não tem o conceito de modalidade do ML (FULL/FLEX).
-                -- Usamos a transportadora do pacote como modalidade exibida.
-                COALESCE(NULLIF(sp.shipping_carrier, ''), 'Shopee')     AS shipping_mode,
-                sp.ship_by_date                         AS shipping_deadline,
-                sp.shipping_status,
-                sp.processed_at,
-                sp.updated_at,
-                sp.order_status,
-                NULL::text                              AS shipping_id,
-                COALESCE(
-                    sp.raw_api_data->'synced_item',
-                    sp.raw_api_data->'item_list'->0
-                )->'image_info'->>'image_url'              AS product_thumbnail,
-                CASE
-                    WHEN COALESCE(
-                        sp.raw_api_data->'synced_item',
-                        sp.raw_api_data->'item_list'->0
-                    )->>'item_id' IS NOT NULL
-                    THEN 'https://shopee.com.br/product/' || sp.shop_id::text || '/' ||
-                         (COALESCE(
-                            sp.raw_api_data->'synced_item',
-                            sp.raw_api_data->'item_list'->0
-                         )->>'item_id')
-                    ELSE NULL
-                END                                     AS product_permalink,
-                COALESCE(
-                    sp.raw_api_data->'synced_item',
-                    sp.raw_api_data->'item_list'->0
-                )->>'item_id'                           AS item_id,
-                sp.recipient_name                       AS buyer_name,
-                sp.buyer_username                       AS buyer_nickname,
-                sp.raw_api_data                         AS raw_api_data
-            FROM public.shopee_sales sp;
-        `);
-
+        //
+        // A recriação NÃO acontece mais aqui. Ela exige AccessExclusiveLock na
+        // view enquanto esta transação já mantém lock exclusivo em `sales`
+        // (ALTER TABLE/CREATE INDEX acima). Uma requisição simultânea lendo
+        // `unified_sales` e precisando de `sales` fechava o ciclo e o Postgres
+        // matava o boot com deadlock (40P01) — derrubando a aplicação em loop.
+        // Ver applyUnifiedSalesView(), executada depois do COMMIT.
         // ------------------------------------------------------------------
         // Índice FUNCIONAL em public.skus.
         //
@@ -767,6 +847,8 @@ async function seedInitialData() {
 async function initializeDatabase() {
     try {
         await syncDatabaseSchema();
+        // Fora da transação de schema, para não disputar lock com as telas.
+        await applyUnifiedSalesView();
         await seedInitialData();
         console.log('✅ Banco de dados inicializado e pronto para uso.');
     } catch (error) {
