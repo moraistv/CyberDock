@@ -41,6 +41,13 @@ const UPSERT_BATCH_SIZE = 300;
 
 const MAX_PROCESS_BATCH = 500;
 
+/** Lê um inteiro de ambiente com limites, tolerando valor inválido. */
+function configInt(name, fallback, min, max) {
+  const parsed = Number.parseInt(process.env[name] || '', 10);
+  const value = Number.isFinite(parsed) ? parsed : fallback;
+  return Math.min(max, Math.max(min, value));
+}
+
 /* ----------------------- Cache curto do total de vendas -------------------
  * O COUNT(*) da view unificada varre as duas tabelas de origem e era refeito
  * em TODA requisição da tabela — inclusive ao trocar de página, quando o total
@@ -530,26 +537,43 @@ async function warmMlThumbnailCache(rows, uid = null) {
 
     if (Object.keys(thumbMap).length === 0) return;
 
-    // Grava a thumbnail encontrada nas vendas correspondentes. Só ML, pois o
-    // destino é public.sales (id BIGINT).
+    /* Gravação em UMA instrução, não uma por linha.
+     *
+     * Antes era um UPDATE por venda, em série. Cada um reescreve o documento
+     * JSONB inteiro (novo TOAST, WAL e nova versão da tupla em todos os
+     * índices) só para guardar uma URL de imagem: numa página de 50 vendas sem
+     * thumbnail, 50 round-trips e 50 reescritas de blob competindo com a
+     * consulta da própria tela pelas conexões do pool.
+     */
+    const updates = [];
     for (const row of rows) {
       if (!isMlRow(row) || row.product_thumbnail || !row.ml_item_id) continue;
       const thumb = thumbMap[String(row.ml_item_id).toUpperCase()];
       if (!thumb) continue;
-      try {
-        const sql = `
-          UPDATE public.sales
-             SET raw_api_data = jsonb_set(
-                   COALESCE(raw_api_data, '{}')::jsonb,
-                   '{order_items,0,item,thumbnail}',
-                   $1::jsonb
-                 )
-           WHERE id = $2 AND sku = $3` + (uid ? ' AND uid = $4' : '');
-        const args = uid
-          ? [JSON.stringify(thumb), row.id, row.sku, uid]
-          : [JSON.stringify(thumb), row.id, row.sku];
-        await db.query(sql, args);
-      } catch { /* ignora linha problemática */ }
+      updates.push({ id: row.id, sku: row.sku, thumb });
+    }
+    if (updates.length === 0) return;
+
+    try {
+      await db.query(
+        `UPDATE public.sales AS s
+            SET raw_api_data = jsonb_set(
+                  COALESCE(s.raw_api_data, '{}')::jsonb,
+                  '{order_items,0,item,thumbnail}',
+                  to_jsonb(v.thumb)
+                )
+           FROM (
+             SELECT * FROM unnest($1::bigint[], $2::text[], $3::text[]) AS t(id, sku, thumb)
+           ) AS v
+          WHERE s.id = v.id
+            AND s.sku = v.sku
+            ${uid ? 'AND s.uid = $4' : ''}`,
+        uid
+          ? [updates.map((u) => u.id), updates.map((u) => u.sku), updates.map((u) => u.thumb), uid]
+          : [updates.map((u) => u.id), updates.map((u) => u.sku), updates.map((u) => u.thumb)]
+      );
+    } catch (err) {
+      console.warn('[THUMB] Falha ao gravar thumbnails em lote:', err.message);
     }
   } catch (err) {
     console.warn('[THUMB] Falha ao aquecer cache de thumbnails:', err.message);
@@ -1619,6 +1643,21 @@ function buildUnifiedFilters(query, uid, options = {}) {
 
   if (uses('period') && from) {
     conditions.push(`s.sale_date >= $${p}`); params.push(`${from}T00:00:00-03:00`); p++;
+  } else if (uses('period') && (query.window || '').trim() !== 'all') {
+    /* Janela padrão obrigatória.
+     *
+     * Dashboard e facetas rodam de 5 a 7 agregações sobre a view unificada. Sem
+     * recorte de data, cada uma varre TODO o histórico do usuário nos dois
+     * canais, com extração de JSONB por linha — passava do statement_timeout de
+     * 30s e ainda ocupava várias conexões do pool ao mesmo tempo.
+     *
+     * `window=all` continua disponível como escolha explícita.
+     */
+    const DEFAULT_DAYS = configInt('SALES_STATS_WINDOW_DAYS', 30, 1, 3650);
+    conditions.push(`s.sale_date >= (
+      ((now() AT TIME ZONE 'America/Sao_Paulo')::date - ($${p})::int)
+    ) AT TIME ZONE 'America/Sao_Paulo'`);
+    params.push(DEFAULT_DAYS); p++;
   }
   if (uses('period') && to) {
     conditions.push(`s.sale_date <= $${p}`); params.push(`${to}T23:59:59.999-03:00`); p++;
@@ -2091,10 +2130,30 @@ router.get('/my-sales', authenticateToken, async (req, res) => {
       params.push(saleStatus);
       paramIdx++;
     }
+    /* Janela padrão, igual à do tabelão admin.
+     *
+     * Esta tela é a do cliente e não tinha recorte de data nenhum: sem filtro,
+     * varria o histórico completo do usuário nos dois canais, com extração de
+     * JSONB por linha. Era o principal caminho para o "Carregando vendas..."
+     * eterno seguido de erro por tempo limite.
+     */
+    const windowMode = (req.query.window || '').trim();
+    const WINDOW_DAYS = { today: 0, '7d': 7, '30d': 30, '90d': 90 };
+    let defaultWindowDays = null;
+
     if (saleDateStart) {
       conditions.push(`s.sale_date >= $${paramIdx}`);
       // Limite do dia em horário de Brasília (UTC-3), consistente com o tabelão.
       params.push(saleDateStart + 'T00:00:00-03:00');
+      paramIdx++;
+    } else if (windowMode !== 'all') {
+      defaultWindowDays = Object.prototype.hasOwnProperty.call(WINDOW_DAYS, windowMode)
+        ? WINDOW_DAYS[windowMode]
+        : configInt('USER_SALES_WINDOW_DAYS', 30, 1, 3650);
+      conditions.push(`s.sale_date >= (
+        ((now() AT TIME ZONE 'America/Sao_Paulo')::date - ($${paramIdx})::int)
+      ) AT TIME ZONE 'America/Sao_Paulo'`);
+      params.push(defaultWindowDays);
       paramIdx++;
     }
     if (saleDateEnd) {
@@ -2288,6 +2347,8 @@ router.get('/my-sales', authenticateToken, async (req, res) => {
       page,
       limit,
       totalPages: totalExact ? (Math.ceil(total / limit) || 1) : page + 1,
+      // A tela avisa qual janela está em uso, para o total não parecer errado.
+      defaultWindowDays,
     });
 
     if (!totalExact) {

@@ -350,6 +350,74 @@ const UNIFIED_SALES_VIEW_SQL = `
  * Agora: só recria quando a definição realmente mudou, usa lock_timeout curto e
  * não é fatal quando a view já existe.
  */
+/* Índices de performance das telas de venda.
+ *
+ * Estavam apenas em migrations/create-unified-sales-indexes.sql, que só roda por
+ * `psql -f` manual — ou seja, em produção provavelmente NÃO existiam, e toda
+ * busca textual virava varredura completa das duas tabelas.
+ *
+ * Rodam FORA da transação de schema e com CONCURRENTLY: não bloqueiam escrita e
+ * uma falha aqui não derruba o boot (o índice é otimização, não requisito).
+ */
+const PERFORMANCE_INDEXES = [
+    'CREATE EXTENSION IF NOT EXISTS pg_trgm',
+    // Busca por produto/SKU/conta (ILIKE '%termo%' precisa de trigrama).
+    'CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_sales_product_title_trgm ON public.sales USING gin (product_title gin_trgm_ops)',
+    'CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_sales_sku_trgm ON public.sales USING gin (sku gin_trgm_ops)',
+    'CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_sales_nickname_trgm ON public.sales USING gin (account_nickname gin_trgm_ops)',
+    'CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_shopee_sales_product_title_trgm ON public.shopee_sales USING gin (product_title gin_trgm_ops)',
+    'CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_shopee_sales_sku_trgm ON public.shopee_sales USING gin (sku gin_trgm_ops)',
+    'CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_shopee_sales_nickname_trgm ON public.shopee_sales USING gin (account_nickname gin_trgm_ops)',
+    // Filtro "processado / não processado", nos dois sentidos.
+    'CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_sales_pending_processing ON public.sales (uid, sale_date DESC) WHERE processed_at IS NULL',
+    'CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_sales_done_processing ON public.sales (uid, processed_at DESC) WHERE processed_at IS NOT NULL',
+    'CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_shopee_sales_pending_processing ON public.shopee_sales (uid, sale_date DESC) WHERE processed_at IS NULL',
+    'CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_shopee_sales_done_processing ON public.shopee_sales (uid, processed_at DESC) WHERE processed_at IS NOT NULL',
+    // Prazo de despacho do ML: o COALESCE não é indexável, mas os dois lados são.
+    `CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_sales_sla_expected_text ON public.sales ((raw_api_data->'sla_data'->>'expected_date')) WHERE raw_api_data->'sla_data'->>'expected_date' IS NOT NULL`,
+    `CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_sales_limit_date_no_sla ON public.sales (shipping_limit_date) WHERE raw_api_data->'sla_data'->>'expected_date' IS NULL`,
+    // Modalidade, status e agrupamento de pacote.
+    `CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_sales_logistic_type ON public.sales ((raw_api_data->'shipping'->>'logistic_type'))`,
+    `CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_sales_shipping_id_expr ON public.sales ((raw_api_data->'shipping'->>'id')) WHERE raw_api_data->'shipping'->>'id' IS NOT NULL`,
+    'CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_sales_uid_shipping_status ON public.sales (uid, shipping_status)',
+    'CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_shopee_sales_order_status ON public.shopee_sales (order_status)',
+    'CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_shopee_sales_ship_by_date ON public.shopee_sales (ship_by_date)',
+    'CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_shopee_sales_shipping_status ON public.shopee_sales (shipping_status)',
+    'CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_shopee_sales_carrier ON public.shopee_sales (shipping_carrier)',
+    // Cursores de sincronização.
+    'CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_ml_sync_cursors_lookup ON public.ml_sync_cursors (uid, seller_id)',
+    // Movimentações de estoque: a tabela não tinha NENHUM índice, e a tela de
+    // armazenamento pagina por usuário e data.
+    'CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_stock_movements_user_created ON public.stock_movements (user_id, created_at DESC)',
+    'CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_stock_movements_sku ON public.stock_movements (sku_id)',
+];
+
+async function applyPerformanceIndexes() {
+    console.log('   -> Verificando índices de performance das telas de venda...');
+    let created = 0;
+    let failed = 0;
+
+    for (const statement of PERFORMANCE_INDEXES) {
+        try {
+            // Sem transação: CONCURRENTLY não é permitido dentro de uma.
+            await db.query(statement);
+            created += 1;
+        } catch (error) {
+            failed += 1;
+            const name = statement.match(/idx_[a-z0-9_]+/i)?.[0] || 'extensão pg_trgm';
+            console.warn(`   -> índice ${name} não pôde ser criado agora: ${error.message}`);
+        }
+    }
+
+    console.log(`   -> Índices verificados (${created} ok, ${failed} pendentes).`);
+    try {
+        await db.query('ANALYZE public.sales');
+        await db.query('ANALYZE public.shopee_sales');
+    } catch (error) {
+        console.warn(`   -> ANALYZE não concluído: ${error.message}`);
+    }
+}
+
 async function applyUnifiedSalesView() {
     const desiredHash = crypto.createHash('md5').update(UNIFIED_SALES_VIEW_SQL).digest('hex');
     const client = await db.pool.connect();
@@ -851,6 +919,16 @@ async function initializeDatabase() {
         await applyUnifiedSalesView();
         await seedInitialData();
         console.log('✅ Banco de dados inicializado e pronto para uso.');
+
+        /* Índices em segundo plano.
+         *
+         * CONCURRENTLY é lento em tabela grande e o servidor não precisa
+         * esperar por otimização para começar a atender. Falha aqui é logada,
+         * nunca derruba a aplicação.
+         */
+        applyPerformanceIndexes().catch((error) => {
+            console.warn('Índices de performance não concluídos:', error.message);
+        });
     } catch (error) {
         console.error('Falha crítica ao inicializar o banco de dados. A aplicação não pode continuar.');
         process.exit(1);

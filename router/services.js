@@ -188,12 +188,41 @@ router.delete('/:id', authenticateToken, requireMaster, async (req, res) => {
   const { id } = req.params;
 
   try {
-    const deleteQuery = `
-      DELETE FROM public.services
-      WHERE id = $1
-      RETURNING id
-    `;
-    const { rows } = await db.query(deleteQuery, [id]);
+    /* Serviço contratado não pode ser excluído.
+     *
+     * `user_contracts.service_id` tem ON DELETE RESTRICT, então o banco recusava
+     * a exclusão e a tela recebia um 500 com a mensagem crua do Postgres
+     * ("violates foreign key constraint"), sem dizer o que fazer. Agora o caso
+     * é detectado antes e explicado: quantos clientes usam e quais.
+     */
+    const inUse = await db.query(
+      `SELECT COUNT(*)::int AS total,
+              (array_agg(COALESCE(NULLIF(TRIM(u.name), ''), u.email) ORDER BY u.email))[1:3] AS amostra
+         FROM public.user_contracts c
+         JOIN public.users u ON u.uid = c.uid
+        WHERE c.service_id = $1`,
+      [id]
+    );
+
+    const total = inUse.rows[0]?.total || 0;
+    if (total > 0) {
+      const amostra = (inUse.rows[0].amostra || []).filter(Boolean);
+      const listados = amostra.join(', ');
+      const resto = total - amostra.length;
+      return res.status(409).json({
+        error:
+          `Este serviço está contratado por ${total} cliente(s) e não pode ser excluído.` +
+          (listados ? ` Ex.: ${listados}${resto > 0 ? ` e mais ${resto}` : ''}.` : '') +
+          ' Remova o serviço desses clientes antes de excluí-lo do catálogo.',
+        code: 'SERVICE_IN_USE',
+        contracts: total,
+      });
+    }
+
+    const { rows } = await db.query(
+      `DELETE FROM public.services WHERE id = $1 RETURNING id`,
+      [id]
+    );
 
     if (rows.length === 0) {
       return res.status(404).json({ error: 'Serviço não encontrado.' });
@@ -201,6 +230,14 @@ router.delete('/:id', authenticateToken, requireMaster, async (req, res) => {
 
     res.json({ message: 'Serviço excluído com sucesso.' });
   } catch (error) {
+    // Rede de segurança: se um contrato for criado entre a checagem e o DELETE,
+    // o banco ainda barra — e a mensagem continua sendo útil, não um 500 cru.
+    if (error.code === '23503') {
+      return res.status(409).json({
+        error: 'Este serviço está contratado por algum cliente e não pode ser excluído. Remova o serviço dos clientes antes.',
+        code: 'SERVICE_IN_USE',
+      });
+    }
     console.error('Erro ao deletar serviço:', error);
     res.status(500).json({ error: 'Erro interno ao deletar serviço.' });
   }
