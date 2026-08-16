@@ -640,9 +640,17 @@ async function syncDatabaseSchema() {
                     await client.query('ALTER TABLE public.shopee_sync_cursors ADD COLUMN IF NOT EXISTS last_result JSONB;');
                     await client.query('ALTER TABLE public.shopee_sync_cursors ADD COLUMN IF NOT EXISTS backfill_scanned_through TIMESTAMP WITH TIME ZONE;');
                     await client.query('ALTER TABLE public.shopee_sync_cursors ADD COLUMN IF NOT EXISTS backfill_started_at TIMESTAMP WITH TIME ZONE;');
-                    // Quando a loja fez por último a varredura profunda de 24h.
-                    // Nulo = nunca fez, então a próxima execução já faz.
+                    // Antes desta coluna existir, toda sincronização incremental já
+                    // relia 24h. Portanto um cursor existente já fez uma varredura
+                    // profunda; carimbá-lo evita cobrar novamente esse mesmo dia
+                    // inteiro logo no primeiro clique após o deploy.
                     await client.query('ALTER TABLE public.shopee_sync_cursors ADD COLUMN IF NOT EXISTS last_deep_sweep_at TIMESTAMP WITH TIME ZONE;');
+                    await client.query(`
+                        UPDATE public.shopee_sync_cursors
+                           SET last_deep_sweep_at = NOW()
+                         WHERE last_deep_sweep_at IS NULL
+                           AND update_time_scanned_through IS NOT NULL
+                    `);
                 }
                 if (tableName === 'users') {
                     // Verifica e adiciona a coluna 'name' se não existir

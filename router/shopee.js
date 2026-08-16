@@ -778,8 +778,46 @@ const UPSERT_QUERY = `
     ship_by_date     = EXCLUDED.ship_by_date,
     raw_api_data     = EXCLUDED.raw_api_data,
     updated_at       = NOW()
-  WHERE public.shopee_sales.processed_at IS NULL
-     OR public.shopee_sales.order_status IS DISTINCT FROM EXCLUDED.order_status
+  /* Só chama de "atualizada" quando algum valor que realmente seria gravado
+   * mudou. O WHERE antigo aceitava toda linha ainda não processada, portanto
+   * TODA linha executava UPDATE, recebia updated_at=NOW() e voltava no
+   * RETURNING mesmo quando todos os valores eram idênticos. Era a origem dos
+   * "122 atualizadas" sem 122 mudanças remotas. */
+  WHERE ROW(
+          public.shopee_sales.account_nickname,
+          public.shopee_sales.sale_date,
+          public.shopee_sales.order_status,
+          public.shopee_sales.buyer_username,
+          public.shopee_sales.recipient_name,
+          public.shopee_sales.tracking_number,
+          public.shopee_sales.shipping_carrier,
+          public.shopee_sales.ship_by_date,
+          public.shopee_sales.raw_api_data,
+          CASE WHEN public.shopee_sales.processed_at IS NULL THEN public.shopee_sales.product_title END,
+          CASE WHEN public.shopee_sales.processed_at IS NULL THEN public.shopee_sales.quantity END,
+          CASE WHEN public.shopee_sales.processed_at IS NULL THEN public.shopee_sales.unit_price END,
+          CASE WHEN public.shopee_sales.processed_at IS NULL THEN public.shopee_sales.total_amount END,
+          CASE WHEN public.shopee_sales.processed_at IS NULL THEN public.shopee_sales.platform_fee END,
+          CASE WHEN public.shopee_sales.processed_at IS NULL THEN public.shopee_sales.freight END,
+          CASE WHEN public.shopee_sales.processed_at IS NULL THEN public.shopee_sales.net_revenue END
+        ) IS DISTINCT FROM ROW(
+          EXCLUDED.account_nickname,
+          EXCLUDED.sale_date,
+          EXCLUDED.order_status,
+          EXCLUDED.buyer_username,
+          EXCLUDED.recipient_name,
+          EXCLUDED.tracking_number,
+          EXCLUDED.shipping_carrier,
+          EXCLUDED.ship_by_date,
+          EXCLUDED.raw_api_data,
+          CASE WHEN public.shopee_sales.processed_at IS NULL THEN EXCLUDED.product_title END,
+          CASE WHEN public.shopee_sales.processed_at IS NULL THEN EXCLUDED.quantity END,
+          CASE WHEN public.shopee_sales.processed_at IS NULL THEN EXCLUDED.unit_price END,
+          CASE WHEN public.shopee_sales.processed_at IS NULL THEN EXCLUDED.total_amount END,
+          CASE WHEN public.shopee_sales.processed_at IS NULL THEN EXCLUDED.platform_fee END,
+          CASE WHEN public.shopee_sales.processed_at IS NULL THEN EXCLUDED.freight END,
+          CASE WHEN public.shopee_sales.processed_at IS NULL THEN EXCLUDED.net_revenue END
+        )
   RETURNING (xmax = 0) AS inserted;
 `;
 
@@ -839,7 +877,32 @@ async function updateProcessedOrder(orderSn, uid, row, executor = db) {
             updated_at = NOW()
       WHERE order_sn = $1
         AND uid = $2
-        AND processed_at IS NOT NULL`,
+        AND processed_at IS NOT NULL
+        /* UPDATE só quando os metadados que seriam gravados realmente mudam.
+         * Sem este predicado, rowCount era o número de linhas encontradas, não
+         * o número de linhas alteradas, e inflava "atualizadas". */
+        AND ROW(
+          public.shopee_sales.account_nickname,
+          public.shopee_sales.order_status,
+          public.shopee_sales.buyer_username,
+          public.shopee_sales.recipient_name,
+          public.shopee_sales.tracking_number,
+          public.shopee_sales.shipping_carrier,
+          public.shopee_sales.ship_by_date,
+          public.shopee_sales.raw_api_data
+        ) IS DISTINCT FROM ROW(
+          $3, $4, $5, $6, $7, $8, $9,
+          jsonb_set(
+            $10::jsonb,
+            '{synced_item}',
+            COALESCE(
+              public.shopee_sales.raw_api_data->'synced_item',
+              public.shopee_sales.raw_api_data->'item_list'->0,
+              'null'::jsonb
+            ),
+            TRUE
+          )
+        )`,
     [
       orderSn,
       uid,
@@ -913,6 +976,7 @@ router.post('/sync-account', authenticateToken, async (req, res) => {
 
         if (recent.rowCount > 0) {
           const age = recent.rows[0].age_seconds ?? 0;
+          console.log(`[shopee-sync] ${nickname}: carência ativa, concluída há ${age}s; nenhuma chamada à Shopee.`);
           const payload = {
             ...(recent.rows[0].last_result || {}),
             message: `[${nickname}] Já estava atualizada (sincronizada há ${age}s).`,
@@ -1092,9 +1156,15 @@ router.post('/sync-account', authenticateToken, async (req, res) => {
        */
       const overlapMinutes = configInt('SHOPEE_OVERLAP_MINUTES', 15, 1, 1440);
       const deepSweepHours = configInt('SHOPEE_DEEP_SWEEP_HOURS', 12, 1, 168);
-      const lastDeepSweep = cursorState.last_deep_sweep_at
-        ? new Date(cursorState.last_deep_sweep_at)
-        : null;
+      /* Bancos atualizados a partir da versão antiga já varriam 24h em toda
+       * execução. `last_success_at` é um fallback defensivo caso a coluna nova
+       * ainda esteja nula: o primeiro clique pós-deploy não precisa reler o dia
+       * inteiro que a última execução já releu. A migração persiste esse marco. */
+      const deepSweepBaseline =
+        cursorState.last_deep_sweep_at
+        || cursorState.last_success_at
+        || cursorState.initial_backfill_completed_at;
+      const lastDeepSweep = deepSweepBaseline ? new Date(deepSweepBaseline) : null;
       isDeepSweep = !lastDeepSweep
         || (Date.now() - lastDeepSweep.getTime()) > deepSweepHours * 3600000;
 

@@ -3046,6 +3046,7 @@ router.post('/sync-account', authenticateToken, async (req, res) => {
 
         if (recent.rowCount > 0) {
           const age = recent.rows[0].age_seconds ?? 0;
+          console.log(`[SYNC] ${nickname}: carência ativa, concluída há ${age}s; nenhuma chamada ao ML.`);
           res.status(200).json({ message: 'Conta já estava atualizada.', fromCooldown: true });
           sendEvent(clientId, {
             progress: 100,
