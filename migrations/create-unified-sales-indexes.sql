@@ -54,20 +54,35 @@ CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_shopee_sales_pending_processing
 
 -- ---------------------------------------------------------------------------
 -- 3) Prazo de despacho do ML.
--- A view calcula shipping_deadline como COALESCE(sla_data->>'expected_date',
--- shipping_limit_date). Filtrar por prazo não usava índice porque a expressão
--- indexada tem de ser a MESMA. Este índice funcional cobre o COALESCE.
+--
+-- A view calcula shipping_deadline como
+--   COALESCE( (sla_data->>'expected_date')::timestamptz , shipping_limit_date )
+--
+-- NÃO é possível indexar essa expressão. O cast de texto para timestamptz
+-- depende do fuso e do DateStyle da sessão, então o Postgres o classifica como
+-- STABLE e recusa o índice com:
+--   ERROR: functions in index expression must be marked IMMUTABLE
+--
+-- (A tentativa anterior aqui usava exatamente esse cast e falhava.)
+--
+-- O que dá para indexar, sem gambiarra:
+--   a) o texto ISO cru extraído do JSON — extração de JSONB é imutável. As
+--      datas do ML vêm em ISO 8601, que ordena corretamente como texto, então
+--      serve para recortes por faixa quando a comparação é feita em texto;
+--   b) shipping_limit_date, que é o outro lado do COALESCE e já tem índice
+--      (idx_sales_shipping_limit_date, criado em utils/init-db.js).
+--
+-- Com (a) e (b) o planejador tem caminho para a maioria das linhas. Indexar o
+-- COALESCE inteiro exigiria uma coluna materializada preenchida na escrita.
 -- ---------------------------------------------------------------------------
-CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_sales_shipping_deadline_expr
-  ON public.sales (
-    (COALESCE(
-      CASE
-        WHEN raw_api_data->'sla_data'->>'expected_date' ~ '^\d{4}-\d{2}-\d{2}'
-        THEN (raw_api_data->'sla_data'->>'expected_date')::timestamptz
-      END,
-      shipping_limit_date
-    ))
-  );
+CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_sales_sla_expected_text
+  ON public.sales ((raw_api_data->'sla_data'->>'expected_date'))
+  WHERE raw_api_data->'sla_data'->>'expected_date' IS NOT NULL;
+
+-- Cobre as vendas que caem no segundo termo do COALESCE.
+CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_sales_limit_date_no_sla
+  ON public.sales (shipping_limit_date)
+  WHERE raw_api_data->'sla_data'->>'expected_date' IS NULL;
 
 -- ---------------------------------------------------------------------------
 -- 4) Modalidade de envio derivada do logistic_type (filtro "Envio").
