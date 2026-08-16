@@ -90,6 +90,36 @@ const schema = {
             updated_at TIMESTAMP WITH TIME ZONE,
             PRIMARY KEY (uid, shop_id)
         );`,
+    shopee_sync_cursors: `
+        CREATE TABLE public.shopee_sync_cursors (
+            uid VARCHAR(255) NOT NULL,
+            shop_id BIGINT NOT NULL,
+            update_time_scanned_through TIMESTAMP WITH TIME ZONE,
+            initial_backfill_completed_at TIMESTAMP WITH TIME ZONE,
+            last_attempt_at TIMESTAMP WITH TIME ZONE,
+            last_success_at TIMESTAMP WITH TIME ZONE,
+            status VARCHAR(20) NOT NULL DEFAULT 'idle',
+            last_error TEXT,
+            last_result JSONB,
+            job_id VARCHAR(100),
+            locked_until TIMESTAMP WITH TIME ZONE,
+            updated_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            PRIMARY KEY (uid, shop_id),
+            FOREIGN KEY (uid, shop_id) REFERENCES public.shopee_accounts(uid, shop_id) ON DELETE CASCADE
+        );`,
+    shopee_sync_jobs: `
+        CREATE TABLE public.shopee_sync_jobs (
+            client_id VARCHAR(100) PRIMARY KEY,
+            uid VARCHAR(255) NOT NULL,
+            shop_id BIGINT NOT NULL,
+            status VARCHAR(20) NOT NULL DEFAULT 'running',
+            result JSONB,
+            error TEXT,
+            created_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            updated_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            expires_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT (CURRENT_TIMESTAMP + INTERVAL '1 day'),
+            FOREIGN KEY (uid, shop_id) REFERENCES public.shopee_accounts(uid, shop_id) ON DELETE CASCADE
+        );`,
     shopee_sales: `
         CREATE TABLE public.shopee_sales (
             order_sn VARCHAR(50) NOT NULL,
@@ -219,7 +249,7 @@ async function syncDatabaseSchema() {
         const tablesInOrder = [
             'users', 'package_types', 'services', 'ml_accounts', 'ml_sync_cursors', 'system_settings',
             'user_statuses', 'user_contracts', 'skus', 'sku_kit_components', 'kit_parents', 'sales', 'stock_movements',
-            'invoices', 'invoice_items', 'shopee_accounts', 'shopee_sales'
+            'invoices', 'invoice_items', 'shopee_accounts', 'shopee_sync_cursors', 'shopee_sync_jobs', 'shopee_sales'
         ];
 
         await client.query('BEGIN');
@@ -229,6 +259,9 @@ async function syncDatabaseSchema() {
                 await client.query(schema[tableName]);
             } else {
                 // Lógica de migração para tabelas existentes
+                if (tableName === 'shopee_sync_cursors') {
+                    await client.query('ALTER TABLE public.shopee_sync_cursors ADD COLUMN IF NOT EXISTS last_result JSONB;');
+                }
                 if (tableName === 'users') {
                     // Verifica e adiciona a coluna 'name' se não existir
                     const nameColRes = await client.query(`SELECT 1 FROM information_schema.columns WHERE table_schema = 'public' AND table_name = 'users' AND column_name = 'name'`);

@@ -18,6 +18,109 @@ const db = require('./postgres');
 
 const SHOPEE_HOST = 'https://partner.shopeemobile.com';
 
+function readIntEnv(name, fallback, min, max = Number.MAX_SAFE_INTEGER) {
+  const parsed = Number.parseInt(process.env[name] || '', 10);
+  const value = Number.isFinite(parsed) ? parsed : fallback;
+  return Math.min(max, Math.max(min, value));
+}
+
+const SHOPEE_HTTP_TIMEOUT_MS = readIntEnv('SHOPEE_HTTP_TIMEOUT_MS', 30000, 1000, 120000);
+const SHOPEE_HTTP_RETRIES = readIntEnv('SHOPEE_HTTP_RETRIES', 2, 0, 5);
+
+const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+
+/**
+ * Todas as chamadas à Shopee passam por aqui. Nenhuma requisição pode ficar
+ * pendurada indefinidamente; timeout, 429 e 5xx são repetidos com backoff e
+ * jitter. Erros funcionais 4xx não são repetidos.
+ */
+async function fetchShopee(url, options = {}, operation = 'requisição', maxRetries = SHOPEE_HTTP_RETRIES, deadlineAt = Infinity) {
+  let lastError;
+
+  for (let attempt = 0; attempt <= maxRetries; attempt += 1) {
+    const remainingMs = deadlineAt - Date.now();
+    if (remainingMs <= 0) {
+      const deadlineError = new Error(`Shopee ${operation}: prazo total da sincronização excedido.`);
+      deadlineError.code = 'SHOPEE_JOB_TIMEOUT';
+      throw deadlineError;
+    }
+
+    const attemptTimeoutMs = Math.min(SHOPEE_HTTP_TIMEOUT_MS, remainingMs);
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), attemptTimeoutMs);
+
+    try {
+      const response = await fetch(url, { ...options, signal: controller.signal });
+      const text = await response.text();
+      let payload = null;
+      if (text) {
+        try {
+          payload = JSON.parse(text);
+        } catch {
+          const malformed = new Error(`Shopee ${operation}: resposta JSON inválida (HTTP ${response.status}).`);
+          malformed.retryable = response.status === 429 || response.status >= 500;
+          throw malformed;
+        }
+      }
+
+      if (!response.ok) {
+        const detail = payload?.message || payload?.error || response.statusText;
+        const httpError = new Error(`Shopee ${operation}: HTTP ${response.status}${detail ? ` - ${detail}` : ''}`);
+        httpError.status = response.status;
+        httpError.retryable = response.status === 429 || response.status >= 500;
+        throw httpError;
+      }
+
+      // A Shopee também sinaliza indisponibilidade/limite em payload HTTP 200.
+      const apiCode = String(payload?.error || '').toLowerCase();
+      if (apiCode && /(system|internal|busy|timeout|too_many|rate_limit)/.test(apiCode)) {
+        const transient = new Error(`Shopee ${operation}: ${payload.message || payload.error}`);
+        transient.code = 'SHOPEE_TRANSIENT_API_ERROR';
+        transient.shopeeCode = payload.error;
+        transient.retryable = true;
+        throw transient;
+      }
+
+      if (payload === null) {
+        const empty = new Error(`Shopee ${operation}: resposta vazia.`);
+        empty.code = 'SHOPEE_INVALID_RESPONSE';
+        empty.retryable = true;
+        throw empty;
+      }
+      return payload;
+    } catch (error) {
+      const timedOut = error?.name === 'AbortError';
+      if (timedOut) {
+        lastError = new Error(`Shopee ${operation}: tempo limite de ${Math.ceil(attemptTimeoutMs / 1000)}s excedido.`);
+        lastError.code = Date.now() >= deadlineAt ? 'SHOPEE_JOB_TIMEOUT' : 'SHOPEE_TIMEOUT';
+        lastError.retryable = Date.now() < deadlineAt;
+      } else {
+        lastError = error instanceof Error ? error : new Error(String(error));
+        if (lastError.retryable === undefined) lastError.retryable = !lastError.status;
+      }
+    } finally {
+      clearTimeout(timer);
+    }
+
+    if (!lastError.retryable || attempt >= maxRetries) break;
+    const backoff = Math.min(8000, 750 * (2 ** attempt)) + Math.floor(Math.random() * 350);
+    if (Date.now() + backoff >= deadlineAt) break;
+    await sleep(backoff);
+  }
+
+  throw lastError;
+}
+
+function assertShopeeSuccess(payload, operation) {
+  if (payload?.error) {
+    const error = new Error(`Shopee ${operation}: ${payload.message || payload.error}`);
+    error.code = 'SHOPEE_API_ERROR';
+    error.shopeeCode = payload.error;
+    throw error;
+  }
+  return payload;
+}
+
 function getShopeePartnerCredentials() {
   return {
     partnerId: process.env.SHOPEE_PARTNER_ID || '',
@@ -56,15 +159,14 @@ async function exchangeShopeeCode(code, shopId, partnerId, partnerKey) {
   const url = `${SHOPEE_HOST}${path}?partner_id=${partnerId}&timestamp=${ts}&sign=${sign}`;
   const body = { code, shop_id: Number(shopId), partner_id: Number(partnerId) };
 
-  const resp = await fetch(url, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify(body),
-  });
-  const payload = await resp.json().catch(() => null);
-  if (!resp.ok || payload?.error) {
-    throw new Error(`Erro ao obter token Shopee: ${JSON.stringify(payload)}`);
-  }
+  const payload = assertShopeeSuccess(
+    await fetchShopee(url, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body),
+    }, 'obter token', 0),
+    'obter token'
+  );
   return {
     access_token: payload.access_token,
     refresh_token: payload.refresh_token,
@@ -88,15 +190,14 @@ async function refreshShopeeToken(account, partnerId, partnerKey) {
     shop_id: Number(account.shopId),
   };
 
-  const response = await fetch(url, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify(body),
-  });
-  const data = await response.json();
-  if (data.error) {
-    throw new Error(`Shopee refresh error: ${data.message || data.error}`);
-  }
+  const data = assertShopeeSuccess(
+    await fetchShopee(url, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body),
+    }, 'renovar token', 0, account.deadlineAt || Infinity),
+    'refresh token'
+  );
 
   const expiresAt = new Date(Date.now() + (data.expire_in - 300) * 1000); // 5 min de margem
   await db.query(
@@ -116,8 +217,7 @@ async function getShopeeShopName(shopId, accessToken, partnerId, partnerKey) {
     const ts = Math.floor(Date.now() / 1000);
     const sign = generateShopeeSign(partnerId, partnerKey, path, accessToken, shopId, ts);
     const url = `${SHOPEE_HOST}${path}?partner_id=${partnerId}&timestamp=${ts}&access_token=${accessToken}&shop_id=${shopId}&sign=${sign}`;
-    const res = await fetch(url);
-    const data = await res.json();
+    const data = assertShopeeSuccess(await fetchShopee(url, {}, 'consultar loja'), 'getShopInfo');
     return data?.shop_name ?? data?.response?.shop_name ?? null;
   } catch {
     return null;
@@ -145,9 +245,20 @@ async function getShopeeOrderList(p) {
   url.searchParams.append('page_size', p.pageSize.toString());
   if (p.cursor) url.searchParams.append('cursor', p.cursor);
 
-  const response = await fetch(url.toString());
-  const data = await response.json();
-  if (data.error) throw new Error(`Shopee getOrderList error: ${data.message || data.error}`);
+  const data = assertShopeeSuccess(
+    await fetchShopee(url.toString(), {}, 'listar pedidos', SHOPEE_HTTP_RETRIES, p.deadlineAt || Infinity),
+    'getOrderList'
+  );
+  if (!data.response || !Array.isArray(data.response.order_list) || typeof data.response.more !== 'boolean') {
+    const error = new Error('Shopee getOrderList: formato de resposta inválido.');
+    error.code = 'SHOPEE_INVALID_RESPONSE';
+    throw error;
+  }
+  if (data.response.more && !data.response.next_cursor) {
+    const error = new Error('Shopee getOrderList: paginação incompleta (next_cursor ausente).');
+    error.code = 'SHOPEE_INVALID_RESPONSE';
+    throw error;
+  }
   return data.response;
 }
 
@@ -169,9 +280,15 @@ async function getShopeeOrderDetail(p) {
       'buyer_user_id,buyer_username,recipient_address,estimated_shipping_fee,actual_shipping_fee,item_list,total_amount,package_list,shipping_carrier,create_time,order_status,ship_by_date,days_to_ship'
   );
 
-  const response = await fetch(url.toString());
-  const data = await response.json();
-  if (data.error) throw new Error(`Shopee getOrderDetail error: ${data.message || data.error}`);
+  const data = assertShopeeSuccess(
+    await fetchShopee(url.toString(), {}, 'detalhar pedidos', SHOPEE_HTTP_RETRIES, p.deadlineAt || Infinity),
+    'getOrderDetail'
+  );
+  if (!data.response || !Array.isArray(data.response.order_list)) {
+    const error = new Error('Shopee getOrderDetail: formato de resposta inválido.');
+    error.code = 'SHOPEE_INVALID_RESPONSE';
+    throw error;
+  }
   return data.response;
 }
 
@@ -188,9 +305,15 @@ async function getShopeeEscrowDetail(p) {
   url.searchParams.append('sign', sign);
   url.searchParams.append('order_sn', p.orderSn);
 
-  const response = await fetch(url.toString());
-  const data = await response.json();
-  if (data.error) throw new Error(`Shopee getEscrowDetail error: ${data.message || data.error}`);
+  const data = assertShopeeSuccess(
+    await fetchShopee(url.toString(), {}, 'consultar financeiro', SHOPEE_HTTP_RETRIES, p.deadlineAt || Infinity),
+    'getEscrowDetail'
+  );
+  if (!data.response || typeof data.response !== 'object') {
+    const error = new Error('Shopee getEscrowDetail: formato de resposta inválido.');
+    error.code = 'SHOPEE_INVALID_RESPONSE';
+    throw error;
+  }
   return data.response;
 }
 

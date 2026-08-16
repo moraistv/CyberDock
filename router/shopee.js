@@ -47,20 +47,10 @@ const REDIRECT_URI = process.env.SHOPEE_REDIRECT_URI || `${FRONTEND_URL}/shopee/
 /* --------------------------- SSE (mesmo padrão de /sales) --------------------------- */
 const clients = {};
 const pendingEvents = {};
-/* Guarda os eventos enquanto ninguém está conectado.
- *
- * 60s era curto demais: se o SSE caía e a reconexão passava desse tempo, o
- * evento de progresso 100 era descartado e a loja ficava "sincronizando" para
- * sempre na tela. 5 minutos cobrem uma reconexão real sem acumular memória
- * (a chave é apagada assim que o cliente reconecta e consome a fila).
- */
+const finalizedJobs = new Map();
 const PENDING_TTL_MS = 5 * 60 * 1000;
 
-const sendEvent = (clientId, data) => {
-  if (clients[clientId]) {
-    clients[clientId].res.write(`data: ${JSON.stringify(data)}\n\n`);
-    return;
-  }
+const queueEvent = (clientId, data) => {
   if (!pendingEvents[clientId]) {
     pendingEvents[clientId] = { events: [], timer: null };
     pendingEvents[clientId].timer = setTimeout(() => {
@@ -70,50 +60,113 @@ const sendEvent = (clientId, data) => {
   pendingEvents[clientId].events.push(data);
 };
 
+const sendEvent = (clientId, data) => {
+  if (finalizedJobs.has(clientId)) return;
+  const client = clients[clientId];
+  if (client && !client.res.writableEnded) {
+    client.res.write(`data: ${JSON.stringify(data)}\n\n`);
+    return;
+  }
+  queueEvent(clientId, data);
+};
+
+/** Publica exatamente um evento terminal e encerra o SSE quando conectado. */
+const finalizeJob = (clientId, data) => {
+  if (finalizedJobs.has(clientId)) return false;
+  const terminal = { ...data, progress: 100 };
+  const expiry = setTimeout(() => finalizedJobs.delete(clientId), PENDING_TTL_MS);
+  finalizedJobs.set(clientId, { terminal, expiry });
+
+  const client = clients[clientId];
+  if (client && !client.res.writableEnded) {
+    client.res.write(`data: ${JSON.stringify(terminal)}\n\n`);
+    clearInterval(client.heartbeat);
+    clearInterval(client.jobMonitor);
+    client.res.end();
+    delete clients[clientId];
+  } else {
+    queueEvent(clientId, terminal);
+  }
+  return true;
+};
+
 router.get('/sync-status/:clientId', (req, res) => {
   const { clientId } = req.params;
   res.writeHead(200, {
     'Content-Type': 'text/event-stream',
     Connection: 'keep-alive',
     'Cache-Control': 'no-cache',
-    // Sem isto o nginx/proxy BUFFERIZA o stream: os eventos não chegam ao
-    // navegador na hora e a conexão parece morta.
     'X-Accel-Buffering': 'no',
   });
-  // Preenchimento inicial: alguns proxies só liberam a resposta após um bloco.
   res.write(': ok\n\n');
   if (typeof res.flushHeaders === 'function') res.flushHeaders();
 
-  /* Heartbeat.
-   *
-   * Uma carga completa de loja percorre janelas de 15 dias com chamadas de
-   * lista, detalhe e escrow. Entre duas janelas o stream pode ficar em silêncio
-   * por muito tempo, e proxy/balanceador encerra conexão ociosa — no navegador
-   * isso virava "A conexão com o servidor foi perdida durante a sincronização
-   * Shopee", mesmo com o trabalho seguindo normalmente no servidor.
-   */
   const heartbeat = setInterval(() => {
-    try {
-      res.write(': ping\n\n');
-    } catch {
-      clearInterval(heartbeat);
-    }
+    if (res.writableEnded) return clearInterval(heartbeat);
+    try { res.write(': ping\n\n'); } catch { clearInterval(heartbeat); }
   }, 15000);
 
-  clients[clientId] = { res, heartbeat };
+  clients[clientId] = { res, heartbeat, jobMonitor: null };
+
+  // POST e EventSource podem cair em instâncias diferentes. O estado terminal
+  // persistido no banco permite que qualquer instância conclua este SSE.
+  let monitorBusy = false;
+  const jobMonitor = setInterval(async () => {
+    if (monitorBusy || res.writableEnded || finalizedJobs.has(clientId)) return;
+    monitorBusy = true;
+    try {
+      const result = await db.query(
+        `SELECT status, result, error
+           FROM public.shopee_sync_jobs
+          WHERE client_id = $1 AND expires_at > NOW()`,
+        [clientId]
+      );
+      const state = result.rows[0];
+      if (state?.status === 'success' || state?.status === 'error') {
+        const fallback = {
+          type: state.status === 'success' ? 'success' : 'error',
+          message: state.error || 'Sincronização Shopee finalizada.',
+        };
+        finalizeJob(clientId, state.result || fallback);
+      }
+    } catch (error) {
+      console.warn('[shopee-sync] falha ao consultar estado do job SSE:', error.message);
+    } finally {
+      monitorBusy = false;
+    }
+  }, 2000);
+  if (clients[clientId]?.res === res) clients[clientId].jobMonitor = jobMonitor;
 
   const buffered = pendingEvents[clientId];
   if (buffered) {
     if (buffered.timer) clearTimeout(buffered.timer);
-    for (const ev of buffered.events) res.write(`data: ${JSON.stringify(ev)}\n\n`);
+    let hasTerminal = false;
+    for (const event of buffered.events) {
+      res.write(`data: ${JSON.stringify(event)}\n\n`);
+      if (event.progress === 100) hasTerminal = true;
+    }
     delete pendingEvents[clientId];
+    if (hasTerminal) {
+      clearInterval(heartbeat);
+      clearInterval(jobMonitor);
+      res.end();
+      delete clients[clientId];
+    }
+  } else if (finalizedJobs.has(clientId)) {
+    const finalized = finalizedJobs.get(clientId);
+    res.write(`data: ${JSON.stringify(finalized.terminal)}\n\n`);
+    clearInterval(heartbeat);
+    clearInterval(jobMonitor);
+    res.end();
+    delete clients[clientId];
   } else {
     sendEvent(clientId, { progress: 5, message: 'Conexão estabelecida. Aguardando início...', type: 'info' });
   }
 
   req.on('close', () => {
     clearInterval(heartbeat);
-    delete clients[clientId];
+    clearInterval(jobMonitor);
+    if (clients[clientId]?.res === res) delete clients[clientId];
   });
 });
 
@@ -335,11 +388,29 @@ async function withTokenRetry(account, op, partnerId, partnerKey) {
 
 const MAX_WINDOW_DAYS = 15;
 
+function configInt(name, fallback, min, max) {
+  const parsed = Number.parseInt(process.env[name] || '', 10);
+  const value = Number.isFinite(parsed) ? parsed : fallback;
+  return Math.min(max, Math.max(min, value));
+}
+
+const SHOPEE_JOB_TIMEOUT_MS = configInt('SHOPEE_JOB_TIMEOUT_MS', 900000, 60000, 3600000);
+
+function assertJobDeadline(deadlineAt, phase) {
+  if (Date.now() >= deadlineAt) {
+    const error = new Error(`Sincronização Shopee excedeu o limite durante ${phase}. Tente novamente; o próximo ciclo continuará do último checkpoint.`);
+    error.code = 'SHOPEE_JOB_TIMEOUT';
+    throw error;
+  }
+}
+
 /** Busca + enriquece pedidos de uma janela (list -> detail -> escrow). */
-async function fetchWindowOrders(account, from, to, partnerId, partnerKey, timeRangeField = 'create_time') {
+async function fetchWindowOrders(account, from, to, partnerId, partnerKey, timeRangeField = 'create_time', deadlineAt = Infinity) {
   const orderSnList = [];
+  const seenCursors = new Set();
   let cursor;
   do {
+    assertJobDeadline(deadlineAt, 'listagem de pedidos');
     const list = await withTokenRetry(
       account,
       (accessToken) =>
@@ -353,50 +424,53 @@ async function fetchWindowOrders(account, from, to, partnerId, partnerKey, timeR
           timeRangeField,
           pageSize: 100,
           cursor,
+          deadlineAt,
         }),
       partnerId,
       partnerKey
     );
-    if (list?.order_list) list.order_list.forEach((o) => orderSnList.push(String(o.order_sn)));
-    cursor = list?.more ? list.next_cursor : undefined;
+    if (list?.order_list) list.order_list.forEach((order) => orderSnList.push(String(order.order_sn)));
+    const nextCursor = list?.more ? list.next_cursor : undefined;
+    if (nextCursor && seenCursors.has(nextCursor)) throw new Error('A Shopee repetiu o cursor da listagem; sincronização interrompida para evitar loop infinito.');
+    if (nextCursor) seenCursors.add(nextCursor);
+    cursor = nextCursor;
   } while (cursor);
 
   if (orderSnList.length === 0) return [];
 
-  const detailed = [];
+  assertJobDeadline(deadlineAt, 'detalhamento de pedidos');
   const batches = [];
   for (let i = 0; i < orderSnList.length; i += 50) batches.push(orderSnList.slice(i, i + 50));
-
-  await Promise.allSettled(
+  const detailResults = await Promise.all(
     batches.map((batch) =>
       withTokenRetry(
         account,
         (accessToken) =>
-          getShopeeOrderDetail({ partnerId, partnerKey, accessToken, shopId: account.shopId, orderSnList: batch.join(',') }),
+          getShopeeOrderDetail({ partnerId, partnerKey, accessToken, shopId: account.shopId, orderSnList: batch.join(','), deadlineAt }),
         partnerId,
         partnerKey
-      ).then((res) => {
-        if (res?.order_list) detailed.push(...res.order_list);
-      })
+      )
     )
   );
+  const detailed = detailResults.flatMap((result) => result?.order_list || []);
+  if (detailed.length !== orderSnList.length) {
+    throw new Error(`A Shopee retornou detalhes incompletos (${detailed.length}/${orderSnList.length}); o cursor não será avançado.`);
+  }
 
-  // Escrow (financeiro real) com concorrência limitada.
+  // Escrow com concorrência limitada. Qualquer falha interrompe a janela:
+  // financeiro incompleto nunca pode ser consolidado junto com o watermark.
   const ESCROW_CONCURRENCY = 8;
-  let idx = 0;
+  let index = 0;
   async function escrowWorker() {
-    while (idx < detailed.length) {
-      const order = detailed[idx++];
-      try {
-        order.escrow_details = await withTokenRetry(
-          account,
-          (accessToken) => getShopeeEscrowDetail({ partnerId, partnerKey, accessToken, shopId: account.shopId, orderSn: String(order.order_sn) }),
-          partnerId,
-          partnerKey
-        );
-      } catch {
-        order.escrow_details = {};
-      }
+    while (index < detailed.length) {
+      assertJobDeadline(deadlineAt, 'consulta financeira');
+      const order = detailed[index++];
+      order.escrow_details = await withTokenRetry(
+        account,
+        (accessToken) => getShopeeEscrowDetail({ partnerId, partnerKey, accessToken, shopId: account.shopId, orderSn: String(order.order_sn), deadlineAt }),
+        partnerId,
+        partnerKey
+      );
     }
   }
   await Promise.all(Array.from({ length: Math.min(ESCROW_CONCURRENCY, detailed.length) }, () => escrowWorker()));
@@ -404,20 +478,26 @@ async function fetchWindowOrders(account, from, to, partnerId, partnerKey, timeR
   return detailed;
 }
 
-/** Percorre janelas de tempo desde `since` até agora. */
-async function fetchOrdersSince(account, since, partnerId, partnerKey, onProgress, timeRangeField = 'create_time') {
+/** Percorre janelas até o limite superior capturado no início do job. */
+async function fetchOrdersSince(account, since, upperBound, partnerId, partnerKey, onProgress, timeRangeField, deadlineAt) {
   const all = [];
   const MAX_ORDERS_PER_SHOP = 10000;
-  const now = new Date();
   let windowStart = since;
-  while (windowStart < now && all.length < MAX_ORDERS_PER_SHOP) {
-    const windowEnd = new Date(Math.min(windowStart.getTime() + MAX_WINDOW_DAYS * 86400000, now.getTime()));
-    const orders = await fetchWindowOrders(account, windowStart, windowEnd, partnerId, partnerKey, timeRangeField);
+  let windowsDone = 0;
+
+  while (windowStart < upperBound) {
+    assertJobDeadline(deadlineAt, 'varredura das janelas');
+    const windowEnd = new Date(Math.min(windowStart.getTime() + MAX_WINDOW_DAYS * 86400000, upperBound.getTime()));
+    const orders = await fetchWindowOrders(account, windowStart, windowEnd, partnerId, partnerKey, timeRangeField, deadlineAt);
+    if (all.length + orders.length > MAX_ORDERS_PER_SHOP) {
+      throw new Error(`A sincronização encontrou mais de ${MAX_ORDERS_PER_SHOP} pedidos. O cursor não foi avançado; reduza a janela e tente novamente.`);
+    }
     all.push(...orders);
-    if (onProgress) onProgress(all.length);
+    windowsDone += 1;
+    if (onProgress) onProgress(all.length, windowsDone, windowEnd);
     windowStart = new Date(windowEnd.getTime() + 1);
   }
-  return all.slice(0, MAX_ORDERS_PER_SHOP);
+  return all;
 }
 
 function roundCurrency(value) {
@@ -670,14 +750,16 @@ async function updateProcessedOrder(orderSn, uid, row) {
 router.post('/sync-account', authenticateToken, async (req, res) => {
   const { shopId, clientId, force, clientUid } = req.body;
   let targetUid = clientUid || req.user.uid;
+  let nickname = String(shopId || 'Shopee');
+  let lockAcquired = false;
+  let leaseLost = false;
+  let leaseTimer = null;
+  const startedAt = Date.now();
+  const deadlineAt = startedAt + SHOPEE_JOB_TIMEOUT_MS;
 
   if (!shopId || !clientId) return res.status(400).json({ error: 'shopId e clientId são obrigatórios.' });
 
-  res.status(202).json({ message: 'Sincronização Shopee iniciada. Acompanhe status.' });
-
   try {
-    sendEvent(clientId, { progress: 10, message: 'Buscando credenciais da loja...', type: 'info' });
-
     let accRes;
     if (req.user.role === 'master' && clientUid) {
       accRes = await db.query('SELECT * FROM public.shopee_accounts WHERE shop_id = $1 AND uid = $2', [shopId, clientUid]);
@@ -686,9 +768,90 @@ router.post('/sync-account', authenticateToken, async (req, res) => {
     } else {
       accRes = await db.query('SELECT * FROM public.shopee_accounts WHERE shop_id = $1 AND uid = $2', [shopId, targetUid]);
     }
-    if (accRes.rowCount === 0) throw new Error('Loja Shopee não encontrada.');
+    if (accRes.rowCount === 0) {
+      finalizeJob(clientId, { message: 'Loja Shopee não encontrada.', type: 'error' });
+      return res.status(404).json({ error: 'Loja Shopee não encontrada.' });
+    }
+
     const accRow = accRes.rows[0];
     targetUid = accRow.uid;
+    nickname = accRow.shop_name || String(accRow.shop_id);
+
+    // POST idempotente por clientId: uma resposta 202 perdida pode ser repetida
+    // sem iniciar outro job ou transformar o próprio job em conflito.
+    const existingJob = await db.query(
+      `SELECT status, result, error FROM public.shopee_sync_jobs
+        WHERE client_id = $1 AND uid = $2 AND shop_id = $3 AND expires_at > NOW()`,
+      [clientId, targetUid, shopId]
+    );
+    if (existingJob.rowCount > 0) {
+      const job = existingJob.rows[0];
+      if (job.status === 'success' || job.status === 'error') {
+        finalizeJob(clientId, job.result || { type: job.status, message: job.error || 'Sincronização finalizada.' });
+      }
+      return res.status(job.status === 'running' ? 202 : 200).json({ message: 'Job Shopee já registrado.', status: job.status });
+    }
+
+    // Lock durável: funciona entre instâncias e expira se o processo cair.
+    const lockDurationMs = SHOPEE_JOB_TIMEOUT_MS + 2 * 60 * 1000;
+    const lockResult = await db.query(
+      `INSERT INTO public.shopee_sync_cursors
+         (uid, shop_id, status, job_id, last_attempt_at, locked_until, updated_at)
+       VALUES ($1, $2, 'running', $3, NOW(), NOW() + ($4::int * interval '1 millisecond'), NOW())
+       ON CONFLICT (uid, shop_id) DO UPDATE SET
+         status = 'running', job_id = EXCLUDED.job_id,
+         last_attempt_at = NOW(), locked_until = EXCLUDED.locked_until,
+         last_error = NULL, last_result = NULL, updated_at = NOW()
+       WHERE public.shopee_sync_cursors.status <> 'running'
+          OR public.shopee_sync_cursors.locked_until IS NULL
+          OR public.shopee_sync_cursors.locked_until < NOW()
+       RETURNING *`,
+      [targetUid, shopId, clientId, lockDurationMs]
+    );
+
+    if (lockResult.rowCount === 0) {
+      const owner = await db.query(
+        'SELECT job_id FROM public.shopee_sync_cursors WHERE uid = $1 AND shop_id = $2',
+        [targetUid, shopId]
+      );
+      if (owner.rows[0]?.job_id === clientId) {
+        return res.status(202).json({ message: 'Sincronização Shopee já iniciada.', status: 'running' });
+      }
+      const message = `[${nickname}] Já existe uma sincronização Shopee em andamento.`;
+      finalizeJob(clientId, { message, type: 'error', alreadyRunning: true });
+      return res.status(409).json({ error: message, alreadyRunning: true });
+    }
+    lockAcquired = true;
+    const cursorState = lockResult.rows[0];
+
+    await db.query('DELETE FROM public.shopee_sync_jobs WHERE expires_at < NOW()');
+    await db.query(
+      `INSERT INTO public.shopee_sync_jobs (client_id, uid, shop_id, status)
+       VALUES ($1, $2, $3, 'running')`,
+      [clientId, targetUid, shopId]
+    );
+
+    leaseTimer = setInterval(async () => {
+      try {
+        const renewed = await db.query(
+          `UPDATE public.shopee_sync_cursors
+              SET locked_until = NOW() + ($1::int * interval '1 millisecond'), updated_at = NOW()
+            WHERE uid = $2 AND shop_id = $3 AND job_id = $4 AND status = 'running'
+          RETURNING job_id`,
+          [lockDurationMs, targetUid, shopId, clientId]
+        );
+        if (renewed.rowCount !== 1) leaseLost = true;
+      } catch (error) {
+        console.warn(`[shopee-sync] ${nickname}: falha ao renovar lease:`, error.message);
+      }
+    }, 30000);
+
+    const ensureLease = () => {
+      if (leaseLost) throw new Error('A sincronização perdeu o lock da loja e foi interrompida com segurança.');
+    };
+
+    res.status(202).json({ message: 'Sincronização Shopee iniciada. Acompanhe status.' });
+    sendEvent(clientId, { progress: 10, message: `[${nickname}] Preparando sincronização...`, type: 'info' });
 
     const account = {
       uid: accRow.uid,
@@ -696,38 +859,23 @@ router.post('/sync-account', authenticateToken, async (req, res) => {
       shopName: accRow.shop_name,
       accessToken: accRow.access_token,
       refreshToken: accRow.refresh_token,
+      deadlineAt,
     };
-    const nickname = account.shopName || account.shopId;
-
     const { partnerId, partnerKey } = getShopeePartnerCredentials();
+    if (!partnerId || !partnerKey) throw new Error('Credenciais Shopee não configuradas no servidor.');
 
-    // Renova o token se estiver perto de expirar.
     const expiresAt = accRow.expires_at ? new Date(accRow.expires_at).getTime() : 0;
     if (expiresAt - Date.now() < 10 * 60 * 1000) {
+      assertJobDeadline(deadlineAt, 'renovação do token');
       sendEvent(clientId, { progress: 15, message: `[${nickname}] Renovando token...`, type: 'info' });
       const refreshed = await refreshShopeeToken(account, partnerId, partnerKey);
       account.accessToken = refreshed.access_token;
       account.refreshToken = refreshed.refresh_token;
     }
 
-    // Primeira sincronização percorre pedidos por data de criação. As próximas
-    // usam update_time remoto a partir do instante da última gravação local,
-    // com 24h de sobreposição para absorver atrasos e diferenças de relógio.
-    /* `legacy_since` procura pedidos multi-item salvos antes da expansão por SKU
-     * (sem `synced_item`) para refazer a carga a partir deles.
-     *
-     * O problema: se esse pedido for ANTIGO demais para a API da Shopee ainda
-     * devolvê-lo, ele nunca recebe `synced_item` — e então TODA sincronização
-     * dessa loja voltava a varrer por create_time desde aquela data, em janelas
-     * de 15 dias, para sempre. Era exatamente o caso da loja que levava minutos
-     * enquanto as outras terminavam em segundos.
-     *
-     * `legacy_scan_done` marca o que já foi tentado e não pôde ser resolvido,
-     * então a loja volta ao caminho incremental.
-     */
-    const lastRes = await db.query(
+    const scanInfo = await db.query(
       `SELECT
-         MAX(updated_at) AS last_sync,
+         COUNT(*)::int AS sale_count,
          MIN(sale_date) FILTER (
            WHERE CASE
                    WHEN jsonb_typeof(raw_api_data->'item_list') = 'array'
@@ -741,152 +889,222 @@ router.post('/sync-account', authenticateToken, async (req, res) => {
        WHERE uid = $1 AND shop_id = $2`,
       [targetUid, shopId]
     );
-    const lastSync = lastRes.rows[0]?.last_sync ? new Date(lastRes.rows[0].last_sync) : null;
-    const legacySince = lastRes.rows[0]?.legacy_since ? new Date(lastRes.rows[0].legacy_since) : null;
+
+    const saleCount = Number(scanInfo.rows[0]?.sale_count || 0);
+    const legacySince = scanInfo.rows[0]?.legacy_since ? new Date(scanInfo.rows[0].legacy_since) : null;
+    const watermark = cursorState.update_time_scanned_through
+      ? new Date(cursorState.update_time_scanned_through)
+      : null;
+    const lookbackDays = configInt('SHOPEE_LEGACY_LOOKBACK_DAYS', 120, 1, 365);
+    const oldestUseful = new Date(Date.now() - lookbackDays * 86400000);
+    const upperBound = new Date(Math.floor(Date.now() / 1000) * 1000);
     let since;
     let timeRangeField;
     let ranLegacyScan = false;
-    if (force || !lastSync || legacySince) {
-      // A API da Shopee só devolve pedidos de um passado limitado, então varrer
-      // desde 2024 gastava dezenas de janelas de 15 dias sem retorno útil.
-      const LEGACY_LOOKBACK_DAYS = parseInt(process.env.SHOPEE_LEGACY_LOOKBACK_DAYS || '120', 10);
-      const oldestUseful = new Date(Date.now() - LEGACY_LOOKBACK_DAYS * 86400000);
 
-      if (legacySince) {
-        ranLegacyScan = true;
-        const desired = new Date(legacySince.getTime() - 24 * 60 * 60 * 1000);
-        since = desired > oldestUseful ? desired : oldestUseful;
-      } else {
-        since = oldestUseful;
-      }
+    if (force || legacySince) {
+      ranLegacyScan = Boolean(legacySince);
+      const desired = legacySince ? new Date(legacySince.getTime() - 86400000) : oldestUseful;
+      since = desired > oldestUseful ? desired : oldestUseful;
       timeRangeField = 'create_time';
-      const message = legacySince
-        ? `[${nickname}] Atualizando pedidos antigos com múltiplos itens...`
-        : `[${nickname}] Sincronização completa iniciada...`;
-      sendEvent(clientId, { progress: 20, message, type: 'info' });
-    } else {
-      since = new Date(lastSync.getTime() - 24 * 60 * 60 * 1000);
+    } else if (watermark) {
+      since = new Date(watermark.getTime() - 86400000);
       timeRangeField = 'update_time';
-      sendEvent(clientId, { progress: 20, message: `[${nickname}] Buscando pedidos novos e atualizados...`, type: 'info' });
+    } else if (saleCount > 0) {
+      // Primeira execução após esta migration: revisa alterações remotas dos
+      // últimos 120 dias, em vez de usar updated_at local como relógio remoto.
+      since = oldestUseful;
+      timeRangeField = 'update_time';
+    } else {
+      since = oldestUseful;
+      timeRangeField = 'create_time';
     }
 
-    /* Encerra o laço do backfill legado.
-     *
-     * Se a varredura terminou e ainda restam pedidos multi-item sem
-     * `synced_item`, é porque a API da Shopee não devolve mais aqueles pedidos
-     * (antigos demais). Marcá-los evita que a loja refaça a varredura completa
-     * em TODA sincronização — o motivo de uma loja levar minutos enquanto as
-     * outras terminavam em segundos. Nenhum dado de venda é alterado: só fica
-     * registrado que a tentativa já foi feita.
-     */
+    console.log(`[shopee-sync] ${nickname}: ${timeRangeField} ${since.toISOString()} -> ${upperBound.toISOString()}`);
+    sendEvent(clientId, {
+      progress: 20,
+      message: timeRangeField === 'update_time'
+        ? `[${nickname}] Buscando pedidos novos e atualizados...`
+        : `[${nickname}] Sincronização completa iniciada...`,
+      type: 'info',
+    });
+
     const finishLegacyScan = async () => {
       if (!ranLegacyScan) return;
       const marked = await db.query(
         `UPDATE public.shopee_sales
             SET raw_api_data = jsonb_set(raw_api_data, '{legacy_scan_done}', 'true'::jsonb, TRUE)
-          WHERE uid = $1
-            AND shop_id = $2
+          WHERE uid = $1 AND shop_id = $2
             AND jsonb_typeof(raw_api_data->'item_list') = 'array'
             AND jsonb_array_length(raw_api_data->'item_list') > 1
             AND NOT (raw_api_data ? 'synced_item')
             AND NOT COALESCE((raw_api_data->>'legacy_scan_done')::boolean, false)`,
         [targetUid, shopId]
       );
-      if (marked.rowCount > 0) {
-        console.log(`[shopee-sync] ${nickname}: ${marked.rowCount} pedido(s) legado(s) fora do alcance da API marcados; próximas sincronizações passam a ser incrementais.`);
-      }
+      if (marked.rowCount > 0) console.log(`[shopee-sync] ${nickname}: ${marked.rowCount} legado(s) marcados como verificados.`);
     };
 
-    const orders = await fetchOrdersSince(account, since, partnerId, partnerKey, (count) => {
-      sendEvent(clientId, { progress: Math.min(60, 20 + Math.floor(count / 10)), message: `[${nickname}] Lendo pedidos... ${count}`, type: 'info' });
-    }, timeRangeField);
-
-    if (orders.length === 0) {
-      await finishLegacyScan();
-      sendEvent(clientId, {
-        progress: 100,
-        message: `[${nickname}] Nenhum pedido novo encontrado.`,
-        type: 'success',
-        newSalesCount: 0,
-        updatedCount: 0,
-        skippedCount: 0,
-      });
-      return;
-    }
-
-    sendEvent(clientId, { progress: 65, message: `[${nickname}] Calculando custos e salvando ${orders.length} pedido(s)...`, type: 'info' });
-
-    // Consulta única evita N+1 e, principalmente, impede que a nova expansão
-    // multi-item crie linhas não processadas em pedidos históricos cujo estoque
-    // já foi abatido quando existia apenas a primeira linha.
-    const orderSns = [...new Set(orders.map((order) => String(order.order_sn)).filter(Boolean))];
-    const processedResult = await db.query(
-      `SELECT DISTINCT order_sn
-         FROM public.shopee_sales
-        WHERE uid = $1
-          AND shop_id = $2
-          AND processed_at IS NOT NULL
-          AND order_sn = ANY($3::text[])`,
-      [targetUid, shopId, orderSns]
+    const orders = await fetchOrdersSince(
+      account,
+      since,
+      upperBound,
+      partnerId,
+      partnerKey,
+      (count, windowsDone, scannedThrough) => {
+        ensureLease();
+        const elapsed = Math.round((Date.now() - startedAt) / 1000);
+        console.log(`[shopee-sync] ${nickname}: janela ${windowsDone}, ${count} pedido(s), até ${scannedThrough.toISOString()}, ${elapsed}s`);
+        sendEvent(clientId, {
+          progress: Math.min(60, 20 + windowsDone * 4),
+          message: `[${nickname}] ${windowsDone} janela(s), ${count} pedido(s) encontrados...`,
+          type: 'info',
+        });
+      },
+      timeRangeField,
+      deadlineAt
     );
-    const historicallyProcessed = new Set(processedResult.rows.map((row) => String(row.order_sn)));
 
     let insertedItems = 0;
     let updatedItems = 0;
     let skippedItems = 0;
     let savedOrders = 0;
 
-    for (let i = 0; i < orders.length; i++) {
-      try {
-        const rows = orderToRows(orders[i], account, nickname);
-        for (const row of rows) row.uid = targetUid;
+    if (orders.length > 0) {
+      assertJobDeadline(deadlineAt, 'preparação da gravação');
+      sendEvent(clientId, { progress: 65, message: `[${nickname}] Salvando ${orders.length} pedido(s)...`, type: 'info' });
 
-        if (historicallyProcessed.has(String(orders[i].order_sn))) {
-          // Nunca insere os SKUs recém-descobertos desse pedido. Só refresca
-          // status, rastreio e payload das linhas que já existem.
-          const affected = await updateProcessedOrder(String(orders[i].order_sn), targetUid, rows[0]);
-          updatedItems += affected;
-          skippedItems += Math.max(0, rows.length - affected);
-        } else {
-          for (const row of rows) {
-            const outcome = await upsertRow(row);
-            if (outcome === 'inserted') insertedItems += 1;
-            else if (outcome === 'updated') updatedItems += 1;
-            else skippedItems += 1;
+      const orderSns = [...new Set(orders.map((order) => String(order.order_sn)).filter(Boolean))];
+      const processedResult = await db.query(
+        `SELECT DISTINCT order_sn FROM public.shopee_sales
+          WHERE uid = $1 AND shop_id = $2 AND processed_at IS NOT NULL
+            AND order_sn = ANY($3::text[])`,
+        [targetUid, shopId, orderSns]
+      );
+      const historicallyProcessed = new Set(processedResult.rows.map((row) => String(row.order_sn)));
+
+      const SAVE_CONCURRENCY = configInt('SHOPEE_SAVE_CONCURRENCY', 6, 1, 10);
+      let saveIndex = 0;
+      const saveWorker = async () => {
+        while (saveIndex < orders.length) {
+          ensureLease();
+          assertJobDeadline(deadlineAt, 'gravação dos pedidos');
+          const index = saveIndex++;
+          const order = orders[index];
+          const rows = orderToRows(order, account, nickname);
+          for (const row of rows) row.uid = targetUid;
+
+          if (historicallyProcessed.has(String(order.order_sn))) {
+            const affected = await updateProcessedOrder(String(order.order_sn), targetUid, rows[0]);
+            updatedItems += affected;
+            skippedItems += Math.max(0, rows.length - affected);
+          } else {
+            for (const row of rows) {
+              const outcome = await upsertRow(row);
+              if (outcome === 'inserted') insertedItems += 1;
+              else if (outcome === 'updated') updatedItems += 1;
+              else skippedItems += 1;
+            }
+          }
+
+          savedOrders += 1;
+          if (savedOrders % 25 === 0 || savedOrders === orders.length) {
+            const pct = 65 + Math.floor((savedOrders / orders.length) * 30);
+            sendEvent(clientId, {
+              progress: Math.min(95, pct),
+              message: `[${nickname}] Salvando... ${savedOrders}/${orders.length}`,
+              type: 'info',
+              newSalesCount: insertedItems,
+              updatedCount: updatedItems,
+              skippedCount: skippedItems,
+            });
           }
         }
-        savedOrders += 1;
-      } catch (err) {
-        console.warn(`[shopee-sync] erro ao salvar pedido ${orders[i]?.order_sn}:`, err.message);
-        skippedItems += 1;
-      }
-
-      if (i % 25 === 0 || i === orders.length - 1) {
-        const pct = 65 + Math.floor(((i + 1) / orders.length) * 30);
-        sendEvent(clientId, {
-          progress: Math.min(95, pct),
-          message: `[${nickname}] Salvando... ${i + 1}/${orders.length}`,
-          type: 'info',
-          newSalesCount: insertedItems,
-          updatedCount: updatedItems,
-          skippedCount: skippedItems,
-        });
-      }
+      };
+      await Promise.all(Array.from({ length: Math.min(SAVE_CONCURRENCY, orders.length) }, () => saveWorker()));
     }
 
     await finishLegacyScan();
+    ensureLease();
+    assertJobDeadline(deadlineAt, 'finalização');
 
-    sendEvent(clientId, {
-      progress: 100,
-      message: `[${nickname}] Sincronização concluída. ${savedOrders} pedido(s), ${insertedItems} item(ns) novo(s) e ${updatedItems} atualizado(s).`,
+    const terminalPayload = {
+      message: orders.length === 0
+        ? `[${nickname}] Sincronização concluída; nenhum pedido novo ou atualizado.`
+        : `[${nickname}] Concluída: ${savedOrders} pedido(s), ${insertedItems} item(ns) novo(s) e ${updatedItems} atualizado(s).`,
       type: 'success',
       newSalesCount: insertedItems,
       updatedCount: updatedItems,
       skippedCount: skippedItems,
-    });
+    };
+
+    // Watermark e resultado terminal são confirmados na mesma transação. O
+    // UPDATE ... RETURNING é o fencing: sem a posse do job não existe sucesso.
+    clearInterval(leaseTimer);
+    leaseTimer = null;
+    const finishClient = await db.pool.connect();
+    try {
+      await finishClient.query('BEGIN');
+      const cursorUpdate = await finishClient.query(
+        `UPDATE public.shopee_sync_cursors
+            SET update_time_scanned_through = $1,
+                initial_backfill_completed_at = CASE
+                  WHEN $2 = 'create_time' THEN COALESCE(initial_backfill_completed_at, NOW())
+                  ELSE initial_backfill_completed_at
+                END,
+                last_success_at = NOW(), status = 'success', last_error = NULL,
+                last_result = $3::jsonb, locked_until = NULL, updated_at = NOW()
+          WHERE uid = $4 AND shop_id = $5 AND job_id = $6 AND status = 'running'
+        RETURNING job_id`,
+        [upperBound, timeRangeField, JSON.stringify(terminalPayload), targetUid, shopId, clientId]
+      );
+      if (cursorUpdate.rowCount !== 1) throw new Error('A sincronização perdeu a posse do lock antes da conclusão.');
+
+      const jobUpdate = await finishClient.query(
+        `UPDATE public.shopee_sync_jobs
+            SET status = 'success', result = $1::jsonb, error = NULL, updated_at = NOW()
+          WHERE client_id = $2 AND status = 'running'
+        RETURNING client_id`,
+        [JSON.stringify(terminalPayload), clientId]
+      );
+      if (jobUpdate.rowCount !== 1) throw new Error('O estado terminal do job Shopee não pôde ser persistido.');
+      await finishClient.query('COMMIT');
+    } catch (finishError) {
+      await finishClient.query('ROLLBACK');
+      throw finishError;
+    } finally {
+      finishClient.release();
+    }
+    lockAcquired = false;
+
+    const durationSeconds = Math.round((Date.now() - startedAt) / 1000);
+    console.log(`[shopee-sync] ${nickname}: concluído em ${durationSeconds}s; pedidos=${savedOrders}, novos=${insertedItems}, atualizados=${updatedItems}, ignorados=${skippedItems}`);
+    finalizeJob(clientId, terminalPayload);
   } catch (error) {
-    console.error('[shopee-sync] erro:', error);
-    sendEvent(clientId, { progress: 100, message: error.message || 'Erro na sincronização Shopee.', type: 'error' });
+    console.error(`[shopee-sync] ${nickname} falhou após ${Date.now() - startedAt}ms:`, error);
+    const errorPayload = { message: error.message || 'Erro na sincronização Shopee.', type: 'error' };
+    clearInterval(leaseTimer);
+    leaseTimer = null;
+    try {
+      if (lockAcquired) {
+        await db.query(
+          `UPDATE public.shopee_sync_cursors
+              SET status = 'error', last_error = $1, last_result = $2::jsonb,
+                  locked_until = NULL, updated_at = NOW()
+            WHERE uid = $3 AND shop_id = $4 AND job_id = $5`,
+          [String(error.message || error).slice(0, 2000), JSON.stringify(errorPayload), targetUid, shopId, clientId]
+        );
+      }
+      await db.query(
+        `UPDATE public.shopee_sync_jobs
+            SET status = 'error', result = $1::jsonb, error = $2, updated_at = NOW()
+          WHERE client_id = $3 AND status = 'running'`,
+        [JSON.stringify(errorPayload), String(error.message || error).slice(0, 2000), clientId]
+      );
+    } catch (stateError) {
+      console.error('[shopee-sync] falha ao persistir estado do job:', stateError);
+    }
+    finalizeJob(clientId, errorPayload);
+    if (!res.headersSent) res.status(500).json({ error: error.message || 'Erro na sincronização Shopee.' });
   }
 });
 
@@ -901,11 +1119,23 @@ router.get('/last-sync/:shopId', authenticateToken, async (req, res) => {
     }
 
     const lastSyncRes = await db.query(
-      'SELECT MAX(updated_at) AS last_sale FROM public.shopee_sales WHERE uid = $1 AND shop_id = $2',
+      `SELECT last_success_at, update_time_scanned_through, status, last_error
+         FROM public.shopee_sync_cursors
+        WHERE uid = $1 AND shop_id = $2`,
       [targetUid, shopId]
     );
-    const lastSync = lastSyncRes.rows[0]?.last_sale;
-    res.json({ lastSync: lastSync ? lastSync.toISOString() : null, shopId, message: lastSync ? 'Última sincronização encontrada' : 'Nunca sincronizada' });
+    const cursor = lastSyncRes.rows[0] || null;
+    const lastSync = cursor?.last_success_at || null;
+    res.json({
+      lastSync: lastSync ? new Date(lastSync).toISOString() : null,
+      scannedThrough: cursor?.update_time_scanned_through
+        ? new Date(cursor.update_time_scanned_through).toISOString()
+        : null,
+      status: cursor?.status || 'never',
+      lastError: cursor?.last_error || null,
+      shopId,
+      message: lastSync ? 'Última sincronização encontrada' : 'Nunca sincronizada',
+    });
   } catch (error) {
     res.status(500).json({ error: 'Erro interno do servidor' });
   }
