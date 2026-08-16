@@ -418,6 +418,151 @@ async function applyPerformanceIndexes() {
     }
 }
 
+/* ---------------------------------------------------------------------------
+ * Correções retroativas de dado histórico.
+ *
+ * São três: preencher `date_last_updated` e `sync_signature` em public.sales
+ * (colunas criadas depois das linhas) e recalcular `sale_date` em
+ * public.shopee_sales (o sync antigo gravava "wall clock" numa coluna que
+ * guarda instante absoluto).
+ *
+ * Rodavam DENTRO da transação de esquema, filtradas por `coluna IS NULL`. Não
+ * existe índice que responda isso, então o Postgres varria as duas tabelas
+ * inteiras em TODO boot — medido em produção: 17 dos 19 segundos, numa etapa
+ * que já não tinha nada para fazer. E a varredura acontecia com
+ * AccessExclusiveLock nas tabelas (dos ALTER TABLE), travando qualquer
+ * requisição de vendas durante o deploy.
+ *
+ * Agora: em segundo plano, depois que o servidor já responde, EM LOTES com uma
+ * transação curta por lote. O sistema nunca espera por isso, e nenhum lote
+ * segura lock por mais que alguns milissegundos. Terminou tudo, grava o
+ * marcador e nunca mais roda.
+ *
+ * Interromper no meio é seguro: o marcador só é gravado no fim, e cada lote já
+ * confirmado não volta a aparecer no filtro.
+ * ------------------------------------------------------------------------- */
+const BACKFILL_BATCH = 5000;
+
+const LEGACY_BACKFILLS = [
+    {
+        key: 'sales_sync_columns_backfilled',
+        label: 'date_last_updated e sync_signature em public.sales',
+        steps: [
+            // ctid é o endereço físico da linha: o jeito mais barato de recortar
+            // um lote sem depender de índice na condição do filtro.
+            `WITH lote AS (
+                 SELECT ctid
+                   FROM public.sales
+                  WHERE date_last_updated IS NULL
+                    AND raw_api_data ? 'date_last_updated'
+                    AND (raw_api_data->>'date_last_updated') ~ '^[0-9]{4}-'
+                  LIMIT ${BACKFILL_BATCH}
+             )
+             UPDATE public.sales s
+                SET date_last_updated = (s.raw_api_data->>'date_last_updated')::timestamptz
+               FROM lote
+              WHERE s.ctid = lote.ctid`,
+
+            `WITH lote AS (
+                 SELECT ctid
+                   FROM public.sales
+                  WHERE sync_signature IS NULL
+                    AND raw_api_data IS NOT NULL
+                  LIMIT ${BACKFILL_BATCH}
+             )
+             UPDATE public.sales s
+                SET sync_signature =
+                      COALESCE(s.raw_api_data->>'status','') || '|' ||
+                      COALESCE(s.raw_api_data->'shipping'->>'status','') || '|' ||
+                      COALESCE(s.raw_api_data->'shipping'->>'substatus','') || '|' ||
+                      COALESCE(
+                        CASE
+                          WHEN jsonb_typeof(s.raw_api_data->'tags') = 'array'
+                          THEN (SELECT string_agg(t, ',' ORDER BY t)
+                                  FROM jsonb_array_elements_text(s.raw_api_data->'tags') t)
+                          ELSE ''
+                        END,
+                        ''
+                      )
+               FROM lote
+              WHERE s.ctid = lote.ctid`,
+        ],
+    },
+    {
+        key: 'shopee_sale_date_tz_fixed',
+        label: 'fuso da data de venda em public.shopee_sales',
+        steps: [
+            `WITH lote AS (
+                 SELECT ctid
+                   FROM public.shopee_sales
+                  WHERE raw_api_data ? 'create_time'
+                    AND (raw_api_data->>'create_time') ~ '^[0-9]+$'
+                    AND (raw_api_data->>'create_time')::double precision > 0
+                    AND sale_date IS DISTINCT FROM
+                        to_timestamp((raw_api_data->>'create_time')::double precision)
+                  LIMIT ${BACKFILL_BATCH}
+             )
+             UPDATE public.shopee_sales s
+                SET sale_date = to_timestamp((s.raw_api_data->>'create_time')::double precision)
+               FROM lote
+              WHERE s.ctid = lote.ctid`,
+        ],
+    },
+];
+
+async function applyLegacyBackfills() {
+    for (const { key, label, steps } of LEGACY_BACKFILLS) {
+        try {
+            const done = await db.query(
+                `SELECT 1 FROM public.system_settings WHERE key = $1`,
+                [key]
+            );
+            if (done.rowCount > 0) continue;
+
+            console.log(`   -> Preenchimento retroativo em segundo plano: ${label}...`);
+            let total = 0;
+
+            for (const step of steps) {
+                for (;;) {
+                    const client = await db.pool.connect();
+                    let affected = 0;
+                    try {
+                        await client.query('BEGIN');
+                        // Só neste lote: o pool corta em 30s e um lote de 5.000
+                        // linhas com detoast de JSONB pode passar disso.
+                        await client.query('SET LOCAL statement_timeout = 0');
+                        const result = await client.query(step);
+                        affected = result.rowCount || 0;
+                        await client.query('COMMIT');
+                    } catch (error) {
+                        try { await client.query('ROLLBACK'); } catch { /* já encerrada */ }
+                        throw error;
+                    } finally {
+                        client.release();
+                    }
+
+                    total += affected;
+                    if (affected < BACKFILL_BATCH) break;
+                    // Devolve a vez para as requisições entre lotes.
+                    await new Promise((resolve) => setTimeout(resolve, 250));
+                }
+            }
+
+            await db.query(
+                `INSERT INTO public.system_settings (key, value, updated_at)
+                 VALUES ($1, to_jsonb(NOW()::text), NOW())
+                 ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value, updated_at = NOW()`,
+                [key]
+            );
+            console.log(`   -> Concluído: ${label} (${total} linha(s) ajustada(s)).`);
+        } catch (error) {
+            // Nunca fatal: o marcador não é gravado e a próxima subida retoma de
+            // onde parou. Correção de dado histórico não derruba o sistema.
+            console.warn(`   -> Preenchimento retroativo "${label}" não concluído agora: ${error.message}`);
+        }
+    }
+}
+
 async function applyUnifiedSalesView() {
     const desiredHash = crypto.createHash('md5').update(UNIFIED_SALES_VIEW_SQL).digest('hex');
     const client = await db.pool.connect();
@@ -656,77 +801,22 @@ async function syncDatabaseSchema() {
         }
         
         console.log('   -> Verificando índices de performance em public.sales...');
-        // SET LOCAL remove o statement_timeout do pool só nesta transação, pois
-        // criar índice/backfill em tabela grande pode levar mais que o timeout.
+        // SET LOCAL remove o statement_timeout do pool só nesta transação:
+        // criar índice em tabela grande pode levar mais que o timeout de 30s.
         await client.query('SET LOCAL statement_timeout = 0;');
 
         // Coluna dedicada com o date_last_updated do pedido (cursor confiável de
-        // mudança). Extraída no momento de salvar; o backfill abaixo cobre os
-        // registros que já existiam antes da coluna.
+        // mudança). Preenchida no momento de salvar; as linhas antigas são
+        // cobertas em segundo plano por applyLegacyBackfills().
         await client.query('ALTER TABLE public.sales ADD COLUMN IF NOT EXISTS date_last_updated TIMESTAMPTZ;');
         // Assinatura de mudança relevante: status | shipping.status |
         // shipping.substatus | tags(ordenadas). Se não muda, o pedido não teve
         // mudança real (só "bump" interno do ML) e pode ser pulado sem baixar.
         await client.query('ALTER TABLE public.sales ADD COLUMN IF NOT EXISTS sync_signature TEXT;');
 
-        /* Os dois backfills abaixo rodam UMA VEZ na vida do banco.
-         *
-         * Eles são filtrados por `coluna IS NULL`, e não existe índice que
-         * responda isso: o Postgres varria public.sales inteira em TODO boot.
-         * Medido em produção: 17 dos 19 segundos da sincronização de esquema,
-         * em uma etapa que já não tinha nada para fazer.
-         *
-         * Pior que o tempo: a varredura acontece DENTRO da transação que acabou
-         * de pegar AccessExclusiveLock em `sales` pelos ALTER TABLE acima. Toda
-         * requisição que tocasse vendas ficava parada esses 17 segundos a cada
-         * deploy — a mesma forma do deadlock que já derrubou o boot antes.
-         *
-         * Linha que continue nula depois disso é fail-safe: `date_last_updated`
-         * nulo apenas não entra no MAX do cursor (que tem ml_sync_cursors como
-         * fonte primária), e `sync_signature` nula conta como "diferente" e
-         * força a atualização. A sincronização preenche as duas no primeiro
-         * ciclo em que tocar o pedido.
-         */
-        const BACKFILL_KEY = 'sales_sync_columns_backfilled';
-        const backfillDone = await client.query(
-            `SELECT 1 FROM public.system_settings WHERE key = $1`,
-            [BACKFILL_KEY]
-        );
-
-        if (backfillDone.rowCount === 0) {
-            console.log('      -> Backfill único de date_last_updated e sync_signature...');
-            await client.query(`
-                UPDATE public.sales
-                   SET date_last_updated = (raw_api_data->>'date_last_updated')::timestamptz
-                 WHERE date_last_updated IS NULL
-                   AND raw_api_data ? 'date_last_updated'
-                   AND (raw_api_data->>'date_last_updated') ~ '^[0-9]{4}-';
-            `);
-            await client.query(`
-                UPDATE public.sales
-                   SET sync_signature =
-                         COALESCE(raw_api_data->>'status','') || '|' ||
-                         COALESCE(raw_api_data->'shipping'->>'status','') || '|' ||
-                         COALESCE(raw_api_data->'shipping'->>'substatus','') || '|' ||
-                         COALESCE(
-                           CASE
-                             WHEN jsonb_typeof(raw_api_data->'tags') = 'array'
-                             THEN (SELECT string_agg(t, ',' ORDER BY t)
-                                     FROM jsonb_array_elements_text(raw_api_data->'tags') t)
-                             ELSE ''
-                           END,
-                           ''
-                         )
-                 WHERE sync_signature IS NULL
-                   AND raw_api_data IS NOT NULL;
-            `);
-            await client.query(
-                `INSERT INTO public.system_settings (key, value, updated_at)
-                 VALUES ($1, to_jsonb(NOW()::text), NOW())
-                 ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value, updated_at = NOW()`,
-                [BACKFILL_KEY]
-            );
-        }
+        // O preenchimento retroativo destas colunas NÃO acontece aqui: ele roda
+        // em segundo plano, em lotes, depois que o servidor já está atendendo.
+        // Ver applyLegacyBackfills(). Aqui só garantimos que a coluna exista.
 
         /* Estado remoto comparável do pedido: date_last_updated | status | tags.
          *
@@ -834,41 +924,8 @@ async function syncDatabaseSchema() {
         // ship_by_date NÃO entra aqui: sempre foi gravado como instante real
         // (new Date(epoch * 1000)) e já exibe o prazo correto.
         // ------------------------------------------------------------------
-        /* Correção de legado, também UMA VEZ na vida do banco.
-         *
-         * `raw_api_data ? 'create_time'` obriga a ler o JSONB (TOAST) de TODA
-         * linha de shopee_sales só para descobrir que não há nada a corrigir,
-         * dentro da mesma transação que mantém lock em shopee_sales. O caminho
-         * de gravação já usa toSaleInstant(create_time) e o upsert sempre grava
-         * sale_date, então nenhuma linha nova precisa desta correção.
-         */
-        const SHOPEE_TZ_KEY = 'shopee_sale_date_tz_fixed';
-        const shopeeTzDone = await client.query(
-            `SELECT 1 FROM public.system_settings WHERE key = $1`,
-            [SHOPEE_TZ_KEY]
-        );
-
-        if (shopeeTzDone.rowCount === 0) {
-            console.log('   -> Corrigindo fuso da data de venda da Shopee (uma vez)...');
-            const shopeeTzFix = await client.query(`
-                UPDATE public.shopee_sales
-                   SET sale_date = to_timestamp((raw_api_data->>'create_time')::double precision)
-                 WHERE raw_api_data ? 'create_time'
-                   AND (raw_api_data->>'create_time') ~ '^[0-9]+$'
-                   AND (raw_api_data->>'create_time')::double precision > 0
-                   AND sale_date IS DISTINCT FROM
-                       to_timestamp((raw_api_data->>'create_time')::double precision);
-            `);
-            if (shopeeTzFix.rowCount > 0) {
-                console.log(`   -> ${shopeeTzFix.rowCount} venda(s) Shopee com data corrigida.`);
-            }
-            await client.query(
-                `INSERT INTO public.system_settings (key, value, updated_at)
-                 VALUES ($1, to_jsonb(NOW()::text), NOW())
-                 ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value, updated_at = NOW()`,
-                [SHOPEE_TZ_KEY]
-            );
-        }
+        // A correção de fuso do sale_date da Shopee também saiu daqui: é uma
+        // correção de dado histórico, não parte do esquema. Ver applyLegacyBackfills().
 
         await client.query('COMMIT');
         console.log('✅ Esquema do banco de dados está atualizado.');
@@ -981,9 +1038,15 @@ async function initializeDatabase() {
          * esperar por otimização para começar a atender. Falha aqui é logada,
          * nunca derruba a aplicação.
          */
-        applyPerformanceIndexes().catch((error) => {
-            console.warn('Índices de performance não concluídos:', error.message);
-        });
+        applyPerformanceIndexes()
+            .catch((error) => {
+                console.warn('Índices de performance não concluídos:', error.message);
+            })
+            /* Correções de dado histórico DEPOIS dos índices, e nunca em
+             * paralelo com eles: as duas coisas escrevem nas mesmas tabelas e
+             * disputariam I/O justamente enquanto as telas começam a ser usadas.
+             * Cada uma já é tolerante a falha por conta própria. */
+            .then(() => applyLegacyBackfills());
     } catch (error) {
         console.error('Falha crítica ao inicializar o banco de dados. A aplicação não pode continuar.');
         process.exit(1);
