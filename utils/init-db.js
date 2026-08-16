@@ -95,6 +95,8 @@ const schema = {
             uid VARCHAR(255) NOT NULL,
             shop_id BIGINT NOT NULL,
             update_time_scanned_through TIMESTAMP WITH TIME ZONE,
+            backfill_scanned_through TIMESTAMP WITH TIME ZONE,
+            backfill_started_at TIMESTAMP WITH TIME ZONE,
             initial_backfill_completed_at TIMESTAMP WITH TIME ZONE,
             last_attempt_at TIMESTAMP WITH TIME ZONE,
             last_success_at TIMESTAMP WITH TIME ZONE,
@@ -261,6 +263,8 @@ async function syncDatabaseSchema() {
                 // Lógica de migração para tabelas existentes
                 if (tableName === 'shopee_sync_cursors') {
                     await client.query('ALTER TABLE public.shopee_sync_cursors ADD COLUMN IF NOT EXISTS last_result JSONB;');
+                    await client.query('ALTER TABLE public.shopee_sync_cursors ADD COLUMN IF NOT EXISTS backfill_scanned_through TIMESTAMP WITH TIME ZONE;');
+                    await client.query('ALTER TABLE public.shopee_sync_cursors ADD COLUMN IF NOT EXISTS backfill_started_at TIMESTAMP WITH TIME ZONE;');
                 }
                 if (tableName === 'users') {
                     // Verifica e adiciona a coluna 'name' se não existir
@@ -461,6 +465,52 @@ async function syncDatabaseSchema() {
              WHERE sync_signature IS NULL
                AND raw_api_data IS NOT NULL;
         `);
+
+        /* Estado remoto comparável do pedido: date_last_updated | status | tags.
+         *
+         * `sync_signature` não servia para decidir o que pular, porque era
+         * gravada a partir do pedido JÁ enriquecido (shipping.status vindo de
+         * /shipments) e comparada com o resumo de /orders/search, que traz
+         * shipping apenas com o id. As duas nunca batiam e o sync refazia
+         * detalhe + shipment + SLA de todos os pedidos em cada execução.
+         */
+        await client.query('ALTER TABLE public.sales ADD COLUMN IF NOT EXISTS remote_state TEXT;');
+        /* Roda UMA única vez.
+         *
+         * Depois da carga inicial, `remote_state` nulo passa a ter significado:
+         * é a marca de "enriquecimento incompleto, precisa tentar de novo".
+         * Se esta migração rodasse em todo boot, ela preencheria essa marca a
+         * partir de um raw_api_data incompleto e o pedido seria pulado para
+         * sempre com dado faltando.
+         */
+        const remoteStateSeeded = await client.query(
+            `SELECT 1 FROM public.system_settings WHERE key = 'sales_remote_state_backfilled'`
+        );
+        if (remoteStateSeeded.rowCount === 0) {
+        await client.query(`
+            UPDATE public.sales
+               SET remote_state =
+                     COALESCE(raw_api_data->>'date_last_updated','') || '|' ||
+                     COALESCE(raw_api_data->>'status','') || '|' ||
+                     COALESCE(
+                       CASE
+                         WHEN jsonb_typeof(raw_api_data->'tags') = 'array'
+                         THEN (SELECT string_agg(t, ',' ORDER BY t)
+                                 FROM jsonb_array_elements_text(raw_api_data->'tags') t)
+                         ELSE ''
+                       END,
+                       ''
+                     )
+             WHERE remote_state IS NULL
+               AND raw_api_data IS NOT NULL;
+        `);
+            await client.query(
+                `INSERT INTO public.system_settings (key, value, updated_at)
+                 VALUES ('sales_remote_state_backfilled', 'true'::jsonb, NOW())
+                 ON CONFLICT (key) DO NOTHING`
+            );
+            console.log('   -> remote_state preenchido para vendas existentes (uma única vez).');
+        }
 
         await client.query('CREATE UNIQUE INDEX IF NOT EXISTS idx_sales_id_sku_uid_unique ON public.sales(id, sku, uid);');
         await client.query('CREATE INDEX IF NOT EXISTS idx_sales_seller_id ON public.sales(seller_id);');

@@ -21,6 +21,12 @@ CREATE TABLE IF NOT EXISTS public.shopee_sync_cursors (
 ALTER TABLE public.shopee_sync_cursors
   ADD COLUMN IF NOT EXISTS last_result JSONB;
 
+ALTER TABLE public.shopee_sync_cursors
+  ADD COLUMN IF NOT EXISTS backfill_scanned_through TIMESTAMP WITH TIME ZONE;
+
+ALTER TABLE public.shopee_sync_cursors
+  ADD COLUMN IF NOT EXISTS backfill_started_at TIMESTAMP WITH TIME ZONE;
+
 CREATE INDEX IF NOT EXISTS idx_shopee_sync_cursors_status
   ON public.shopee_sync_cursors (status, locked_until);
 

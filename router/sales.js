@@ -208,6 +208,24 @@ function computeSyncSignature(o) {
   return `${st}|${shp}|${sub}|${tags}`;
 }
 
+/* Assinatura COMPARÁVEL entre execuções.
+ *
+ * A assinatura acima só serve depois do enriquecimento: `/shipments` preenche
+ * shipping.status/substatus, que o resumo de /orders/search não traz (lá vem
+ * apenas shipping.id). Guardar a versão enriquecida e comparar com o resumo
+ * fazia as duas NUNCA baterem — por isso o log mostrava `pulados=0` em todas as
+ * contas e cada clique refazia detalhe + shipment + SLA de tudo.
+ *
+ * `date_last_updated` é o carimbo que o próprio ML move quando algo muda no
+ * pedido, e está presente nas duas pontas. É o sinal correto de comparação.
+ */
+function computeRemoteState(o) {
+  const updated = o?.date_last_updated || '';
+  const st = o?.status || '';
+  const tags = Array.isArray(o?.tags) ? o.tags.slice().sort().join(',') : '';
+  return `${updated}|${st}|${tags}`;
+}
+
 async function mapWithConcurrency(items, limit, mapper) {
   const ret = new Array(items.length);
   let i = 0;
@@ -318,6 +336,9 @@ function buildInsertBatchRows(orders, targetUid, nickname) {
         packages: packages,
         date_last_updated: order?.date_last_updated || null,
         sync_signature: computeSyncSignature(order),
+        // Sem marcador: enriquecimento incompleto ou outro fluxo de gravação.
+        // Fica nulo de propósito para o pedido ser reavaliado na próxima vez.
+        remote_state: order?.__remoteState || null,
         raw_api_data: order
       });
     }
@@ -329,7 +350,7 @@ function buildMultiInsertQuery_DoUpdate(rows) {
   const cols = [
     'id', 'sku', 'uid', 'seller_id', 'channel', 'account_nickname',
     'sale_date', 'product_title', 'quantity', 'shipping_mode',
-    'shipping_limit_date', 'packages', 'date_last_updated', 'sync_signature', 'raw_api_data', 'updated_at'
+    'shipping_limit_date', 'packages', 'date_last_updated', 'sync_signature', 'remote_state', 'raw_api_data', 'updated_at'
   ];
   const values = [];
   const params = [];
@@ -376,17 +397,27 @@ function buildMultiInsertQuery_DoUpdate(rows) {
     params.push(
       id, r.sku, r.uid, sellerId, 'ML', r.account_nickname,
       r.sale_date, r.product_title, quantity, r.shipping_mode,
-      r.shipping_limit_date, packages, r.date_last_updated || null, r.sync_signature || null, r.raw_api_data,
+      r.shipping_limit_date, packages, r.date_last_updated || null, r.sync_signature || null,
+      r.remote_state || null, r.raw_api_data,
       new Date()
     );
     const placeholders = cols.map(() => `$${p++}`).join(', ');
     values.push(`(${placeholders})`);
   }
 
-  // RETURNING (xmax = 0) distingue INSERT de UPDATE (inserido: xmax=0).
-  // O DO UPDATE só ocorre quando ALGO relevante mudou (IS DISTINCT FROM):
-  // assim "atualizada" significa mudança real, e vendas tocadas mas iguais
-  // não são regravadas nem contadas (nem geram escrita à toa no banco).
+  /* RETURNING (xmax = 0) distingue INSERT de UPDATE (inserido: xmax=0).
+   * O DO UPDATE só ocorre quando ALGO relevante mudou (IS DISTINCT FROM).
+   *
+   * A condição `processed_at IS NULL` foi REMOVIDA de propósito. Ela criava
+   * dois problemas: a venda já processada nunca recebia status novo (ficava
+   * congelada em "enviado" e nunca mostrava entregue/cancelado) e, sobretudo,
+   * `remote_state` jamais era atualizado nela — então o pedido era rebaixado
+   * com 3 chamadas à API em TODA sincronização, para sempre.
+   *
+   * O SET não toca em quantity, sku, sale_date, processed_at nem
+   * shipping_status: baixa de estoque e status operacional interno seguem
+   * intactos. Só metadados vindos do ML são atualizados.
+   */
   const query = `
     INSERT INTO public.sales (${cols.join(', ')})
     VALUES ${values.join(', ')}
@@ -396,11 +427,12 @@ function buildMultiInsertQuery_DoUpdate(rows) {
       packages = EXCLUDED.packages,
       date_last_updated = EXCLUDED.date_last_updated,
       sync_signature = EXCLUDED.sync_signature,
+      remote_state = EXCLUDED.remote_state,
       raw_api_data = EXCLUDED.raw_api_data,
       updated_at = EXCLUDED.updated_at
-    WHERE public.sales.processed_at IS NULL
-      AND (
-        public.sales.sync_signature IS DISTINCT FROM EXCLUDED.sync_signature
+    WHERE (
+        public.sales.remote_state IS DISTINCT FROM EXCLUDED.remote_state
+        OR public.sales.sync_signature IS DISTINCT FROM EXCLUDED.sync_signature
         OR public.sales.shipping_mode IS DISTINCT FROM EXCLUDED.shipping_mode
         OR public.sales.shipping_limit_date IS DISTINCT FROM EXCLUDED.shipping_limit_date
         OR public.sales.packages IS DISTINCT FROM EXCLUDED.packages
@@ -2935,15 +2967,22 @@ router.post('/sync-account', authenticateToken, async (req, res) => {
     if (orderIdList.length > 0) {
       const stateRes = await db.query(
         `SELECT id,
-                MAX(sync_signature) AS sig,
-                bool_or(shipping_mode IS NULL OR shipping_mode = 'Outros') AS needs_fix
+                MAX(remote_state) AS remote_state,
+                bool_or(
+                  shipping_mode IS NULL
+                  OR shipping_mode = 'Outros'
+                  OR remote_state IS NULL
+                ) AS needs_fix
            FROM public.sales
           WHERE uid = $1 AND id = ANY($2::bigint[])
           GROUP BY id`,
         [targetUid, orderIdList]
       );
       for (const r of stateRes.rows) {
-        savedState.set(String(r.id), { sig: r.sig, needsFix: r.needs_fix === true });
+        savedState.set(String(r.id), {
+          remoteState: r.remote_state,
+          needsFix: r.needs_fix === true,
+        });
       }
     }
 
@@ -2951,12 +2990,12 @@ router.post('/sync-account', authenticateToken, async (req, res) => {
     let skippedCount = 0;
     for (const summary of orderSummaries) {
       const st = savedState.get(String(summary.id));
-      const remoteSig = computeSyncSignature(summary);
-      // Pula ANTES de baixar quando a assinatura (status/envio/substatus/tags) é
-      // idêntica à salva: nada relevante mudou, foi só "bump" interno do ML.
-      // EXCEÇÃO: se a venda ficou com modalidade "Outros"/nula (efeito do header
-      // antigo), reprocessa uma vez para corrigir a modalidade.
-      if (st && st.sig != null && st.sig === remoteSig && !st.needsFix) {
+      const remoteState = computeRemoteState(summary);
+      // Pula ANTES de baixar quando o pedido não mudou no ML desde a última
+      // gravação. Isso evita detalhe + shipment + SLA (3 chamadas por pedido).
+      // Se o pedido não mudou no ML, rebaixá-lo não traria dado novo.
+      // EXCEÇÃO: modalidade "Outros"/nula é reprocessada para se corrigir.
+      if (st && st.remoteState != null && st.remoteState === remoteState && !st.needsFix) {
         skippedCount++;
         continue;
       }
@@ -2994,12 +3033,21 @@ router.post('/sync-account', authenticateToken, async (req, res) => {
     let processedCount = 0;
     const enrichedOrders = await mapWithConcurrency(toProcess, SLA_CONCURRENCY, async (summary) => {
       let order = summary;
+      // Estado medido no RESUMO da busca, que é a mesma fonte usada na
+      // comparação da próxima execução. Guardar o valor do detalhe faria as
+      // duas pontas divergirem de novo.
+      const remoteStateFromSearch = computeRemoteState(summary);
+      let fullyEnriched = true;
+
       try {
         const orderDetailsRes = await mlFetch(`https://api.mercadolibre.com/orders/${summary.id}`, { headers: mlHeaders(access_token) });
         if (orderDetailsRes.ok) {
           order = await orderDetailsRes.json();
+        } else {
+          fullyEnriched = false;
         }
       } catch (e) {
+        fullyEnriched = false;
         console.error(`Falha ao buscar detalhes do pedido ${summary.id}:`, e);
       }
 
@@ -3013,14 +3061,33 @@ router.post('/sync-account', authenticateToken, async (req, res) => {
           if (shipRes.ok) {
             const shipmentDetails = await safeJson(shipRes);
             if (shipmentDetails) order.shipping = { ...order.shipping, ...shipmentDetails };
+            else fullyEnriched = false;
+          } else {
+            fullyEnriched = false;
           }
           if (slaRes.ok) {
             const slaData = await safeJson(slaRes);
             if (slaData) order.sla_data = slaData;
+          } else if (slaRes.status !== 404) {
+            // 404 é resposta legítima (envio sem SLA). Outros erros são falha.
+            fullyEnriched = false;
           }
         } catch (e) {
+          fullyEnriched = false;
           console.error(`Falha ao enriquecer envio ${shipmentId}:`, e);
         }
+      }
+
+      /* Só marca o pedido como "já visto neste estado" se o enriquecimento
+       * completou. Marcar após falha parcial gravaria dado incompleto e o
+       * pedido nunca seria retentado. enumerable:false mantém o marcador fora
+       * de raw_api_data. */
+      if (fullyEnriched) {
+        Object.defineProperty(order, '__remoteState', {
+          value: remoteStateFromSearch,
+          enumerable: false,
+          configurable: true,
+        });
       }
 
       processedCount++;

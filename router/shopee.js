@@ -396,6 +396,41 @@ function configInt(name, fallback, min, max) {
 
 const SHOPEE_JOB_TIMEOUT_MS = configInt('SHOPEE_JOB_TIMEOUT_MS', 900000, 60000, 3600000);
 
+/* O escrow da Shopee só é definitivo depois do repasse. Antes disso os valores
+ * ainda mudam (comissão, reconciliação de frete) sem necessariamente mexer no
+ * update_time do pedido, então reaproveitar seria congelar financeiro errado. */
+const TERMINAL_SHOPEE_STATUS = new Set(['COMPLETED', 'CANCELLED']);
+
+function isEscrowSettled(escrow, status) {
+  // Pedido cancelado não gera repasse: o financeiro dele já é definitivo.
+  // Sem isto, todo cancelado custava 1 consulta de escrow em cada execução.
+  if (status === 'CANCELLED') return true;
+  if (!escrow || typeof escrow !== 'object') return false;
+  const releaseTime = Number(escrow.escrow_release_time || escrow.order_income?.escrow_release_time || 0);
+  if (Number.isFinite(releaseTime) && releaseTime > 0) return true;
+  const amount = Number(escrow.order_income?.escrow_amount ?? escrow.escrow_amount);
+  return Number.isFinite(amount) && amount !== 0;
+}
+
+/**
+ * Decide se um pedido pode ser reaproveitado sem nova consulta financeira e sem
+ * reescrita. `expectedRows` só é informado na gravação, onde já sabemos quantas
+ * linhas o pedido gera: sem essa checagem, uma gravação parcial anterior (uma
+ * linha de um pedido de 3 SKUs) seria considerada completa para sempre.
+ */
+function canReuseSavedOrder(previous, order, expectedRows = null) {
+  if (!previous || !previous.hasEscrow || !previous.hasSyncedItem) return false;
+  if (previous.updateTime === null) return false;
+  if (String(previous.updateTime) !== String(order.update_time ?? '')) return false;
+
+  const status = String(order.order_status || '');
+  if (String(previous.orderStatus || '') !== status) return false;
+  if (!TERMINAL_SHOPEE_STATUS.has(status)) return false;
+  if (!isEscrowSettled(previous.escrow, status)) return false;
+  if (expectedRows !== null && previous.rowCount !== expectedRows) return false;
+  return true;
+}
+
 function assertJobDeadline(deadlineAt, phase) {
   if (Date.now() >= deadlineAt) {
     const error = new Error(`Sincronização Shopee excedeu o limite durante ${phase}. Tente novamente; o próximo ciclo continuará do último checkpoint.`);
@@ -404,8 +439,15 @@ function assertJobDeadline(deadlineAt, phase) {
   }
 }
 
-/** Busca + enriquece pedidos de uma janela (list -> detail -> escrow). */
-async function fetchWindowOrders(account, from, to, partnerId, partnerKey, timeRangeField = 'create_time', deadlineAt = Infinity) {
+/**
+ * Busca + enriquece pedidos de uma janela (list -> detail -> escrow).
+ *
+ * `resolveSavedState` devolve o que já está gravado para os pedidos da janela.
+ * Pedido cujo `update_time` e status não mudaram e que já tem financeiro salvo
+ * NÃO gasta nova chamada de escrow — era 1 chamada por pedido e dominava o
+ * tempo total (2.370 chamadas para encontrar 9 vendas novas).
+ */
+async function fetchWindowOrders(account, from, to, partnerId, partnerKey, timeRangeField = 'create_time', deadlineAt = Infinity, resolveSavedState = null) {
   const orderSnList = [];
   const seenCursors = new Set();
   let cursor;
@@ -436,7 +478,9 @@ async function fetchWindowOrders(account, from, to, partnerId, partnerKey, timeR
     cursor = nextCursor;
   } while (cursor);
 
-  if (orderSnList.length === 0) return [];
+  if (orderSnList.length === 0) {
+    return { orders: [], savedState: new Map(), escrowCalls: 0, escrowReused: 0 };
+  }
 
   assertJobDeadline(deadlineAt, 'detalhamento de pedidos');
   const batches = [];
@@ -457,14 +501,27 @@ async function fetchWindowOrders(account, from, to, partnerId, partnerKey, timeR
     throw new Error(`A Shopee retornou detalhes incompletos (${detailed.length}/${orderSnList.length}); o cursor não será avançado.`);
   }
 
+  // Estado salvo da janela: define quem ainda precisa de consulta financeira.
+  // O Map é devolvido para a gravação reutilizar, evitando repetir a consulta.
+  const saved = resolveSavedState ? await resolveSavedState(detailed.map((o) => String(o.order_sn))) : new Map();
+  const pendingEscrow = [];
+  for (const order of detailed) {
+    const previous = saved.get(String(order.order_sn));
+    if (canReuseSavedOrder(previous, order)) {
+      order.escrow_details = previous.escrow;
+    } else {
+      pendingEscrow.push(order);
+    }
+  }
+
   // Escrow com concorrência limitada. Qualquer falha interrompe a janela:
   // financeiro incompleto nunca pode ser consolidado junto com o watermark.
   const ESCROW_CONCURRENCY = 8;
   let index = 0;
   async function escrowWorker() {
-    while (index < detailed.length) {
+    while (index < pendingEscrow.length) {
       assertJobDeadline(deadlineAt, 'consulta financeira');
-      const order = detailed[index++];
+      const order = pendingEscrow[index++];
       order.escrow_details = await withTokenRetry(
         account,
         (accessToken) => getShopeeEscrowDetail({ partnerId, partnerKey, accessToken, shopId: account.shopId, orderSn: String(order.order_sn), deadlineAt }),
@@ -473,31 +530,54 @@ async function fetchWindowOrders(account, from, to, partnerId, partnerKey, timeR
       );
     }
   }
-  await Promise.all(Array.from({ length: Math.min(ESCROW_CONCURRENCY, detailed.length) }, () => escrowWorker()));
+  await Promise.all(Array.from({ length: Math.min(ESCROW_CONCURRENCY, pendingEscrow.length) }, () => escrowWorker()));
 
-  return detailed;
+  return {
+    orders: detailed,
+    savedState: saved,
+    escrowCalls: pendingEscrow.length,
+    escrowReused: detailed.length - pendingEscrow.length,
+  };
 }
 
-/** Percorre janelas até o limite superior capturado no início do job. */
-async function fetchOrdersSince(account, since, upperBound, partnerId, partnerKey, onProgress, timeRangeField, deadlineAt) {
-  const all = [];
-  const MAX_ORDERS_PER_SHOP = 10000;
+/**
+ * Percorre janelas até o limite capturado no início do job.
+ *
+ * Cada janela é gravada e confirmada por `onWindow` ANTES de seguir para a
+ * próxima. Assim uma execução interrompida retoma do último checkpoint em vez
+ * de recomeçar os 120 dias, e não acumulamos milhares de pedidos em memória.
+ */
+async function processWindows({
+  account, since, upperBound, partnerId, partnerKey,
+  timeRangeField, deadlineAt, resolveSavedState, onWindow,
+}) {
   let windowStart = since;
   let windowsDone = 0;
+  let totalOrders = 0;
 
   while (windowStart < upperBound) {
     assertJobDeadline(deadlineAt, 'varredura das janelas');
     const windowEnd = new Date(Math.min(windowStart.getTime() + MAX_WINDOW_DAYS * 86400000, upperBound.getTime()));
-    const orders = await fetchWindowOrders(account, windowStart, windowEnd, partnerId, partnerKey, timeRangeField, deadlineAt);
-    if (all.length + orders.length > MAX_ORDERS_PER_SHOP) {
-      throw new Error(`A sincronização encontrou mais de ${MAX_ORDERS_PER_SHOP} pedidos. O cursor não foi avançado; reduza a janela e tente novamente.`);
-    }
-    all.push(...orders);
+    const window = await fetchWindowOrders(
+      account, windowStart, windowEnd, partnerId, partnerKey, timeRangeField, deadlineAt, resolveSavedState
+    );
+
+    totalOrders += window.orders.length;
     windowsDone += 1;
-    if (onProgress) onProgress(all.length, windowsDone, windowEnd);
+    await onWindow({
+      orders: window.orders,
+      savedState: window.savedState,
+      windowEnd,
+      windowsDone,
+      totalOrders,
+      escrowCalls: window.escrowCalls,
+      escrowReused: window.escrowReused,
+    });
+
     windowStart = new Date(windowEnd.getTime() + 1);
   }
-  return all;
+
+  return { windowsDone, totalOrders };
 }
 
 function roundCurrency(value) {
@@ -673,8 +753,8 @@ const UPSERT_QUERY = `
   RETURNING (xmax = 0) AS inserted;
 `;
 
-async function upsertRow(row) {
-  const result = await db.query(UPSERT_QUERY, [
+async function upsertRow(row, executor = db) {
+  const result = await executor.query(UPSERT_QUERY, [
     row.orderSn,
     row.sku,
     row.uid,
@@ -706,8 +786,8 @@ async function upsertRow(row) {
  * Atualizamos apenas metadados operacionais das linhas existentes e mantemos o
  * item originalmente associado a cada linha no payload.
  */
-async function updateProcessedOrder(orderSn, uid, row) {
-  const result = await db.query(
+async function updateProcessedOrder(orderSn, uid, row, executor = db) {
+  const result = await executor.query(
     `UPDATE public.shopee_sales
         SET account_nickname = $3,
             order_status = $4,
@@ -901,11 +981,23 @@ router.post('/sync-account', authenticateToken, async (req, res) => {
     let since;
     let timeRangeField;
     let ranLegacyScan = false;
+    let checkpointEnabled = true;
+
+    const backfillProgress = cursorState.backfill_scanned_through
+      ? new Date(cursorState.backfill_scanned_through)
+      : null;
+    const backfillPending =
+      !cursorState.initial_backfill_completed_at && (saleCount === 0 || backfillProgress !== null);
 
     if (force || legacySince) {
       ranLegacyScan = Boolean(legacySince);
+      checkpointEnabled = false;
       const desired = legacySince ? new Date(legacySince.getTime() - 86400000) : oldestUseful;
       since = desired > oldestUseful ? desired : oldestUseful;
+      timeRangeField = 'create_time';
+    } else if (backfillPending) {
+      // Retoma a carga inicial do último checkpoint em vez de recomeçar.
+      since = backfillProgress && backfillProgress > oldestUseful ? backfillProgress : oldestUseful;
       timeRangeField = 'create_time';
     } else if (watermark) {
       since = new Date(watermark.getTime() - 86400000);
@@ -929,6 +1021,37 @@ router.post('/sync-account', authenticateToken, async (req, res) => {
       type: 'info',
     });
 
+    /* Grava o avanço de UMA janela já concluída.
+     *
+     * No backfill por create_time o progresso vai para `backfill_scanned_through`:
+     * usar o watermark incremental aqui faria a próxima execução pular pedidos
+     * antigos que ainda não foram carregados.
+     */
+    const saveWindowCheckpoint = async (windowEnd) => {
+      // Varredura force/legado começa num ponto arbitrário do passado. Marcar
+      // progresso ali abriria um intervalo de create_time nunca varrido, então
+      // esses modos continuam confirmando tudo só no fim.
+      if (!checkpointEnabled) return;
+
+      const column = timeRangeField === 'create_time' ? 'backfill_scanned_through' : 'update_time_scanned_through';
+      const result = await db.query(
+        `UPDATE public.shopee_sync_cursors
+            SET ${column} = GREATEST(COALESCE(${column}, $1), $1),
+                backfill_started_at = CASE
+                  WHEN $2 = 'create_time' THEN COALESCE(backfill_started_at, $3)
+                  ELSE backfill_started_at
+                END,
+                updated_at = NOW()
+          WHERE uid = $4 AND shop_id = $5 AND job_id = $6 AND status = 'running'
+        RETURNING job_id`,
+        [windowEnd, timeRangeField, new Date(startedAt), targetUid, shopId, clientId]
+      );
+      if (result.rowCount !== 1) {
+        leaseLost = true;
+        ensureLease();
+      }
+    };
+
     const finishLegacyScan = async () => {
       if (!ranLegacyScan) return;
       const marked = await db.query(
@@ -944,91 +1067,151 @@ router.post('/sync-account', authenticateToken, async (req, res) => {
       if (marked.rowCount > 0) console.log(`[shopee-sync] ${nickname}: ${marked.rowCount} legado(s) marcados como verificados.`);
     };
 
-    const orders = await fetchOrdersSince(
+    let insertedItems = 0;
+    let updatedItems = 0;
+    let skippedItems = 0;
+    let savedOrders = 0;
+    let escrowCallsTotal = 0;
+    let escrowReusedTotal = 0;
+
+    /** Estado gravado dos pedidos da janela, usado para evitar trabalho inútil. */
+    const resolveSavedState = async (orderSns) => {
+      const state = new Map();
+      if (orderSns.length === 0) return state;
+      const { rows } = await db.query(
+        `SELECT order_sn,
+                COUNT(*)::int                            AS row_count,
+                MIN(raw_api_data->>'update_time')        AS update_time,
+                MIN(raw_api_data->>'order_status')       AS order_status,
+                (array_agg(raw_api_data->'escrow_details'
+                           ORDER BY updated_at DESC NULLS LAST))[1] AS escrow,
+                bool_and(raw_api_data ? 'synced_item')   AS has_synced_item,
+                bool_or(processed_at IS NOT NULL)        AS processed
+           FROM public.shopee_sales
+          WHERE uid = $1 AND shop_id = $2 AND order_sn = ANY($3::text[])
+          GROUP BY order_sn`,
+        [targetUid, shopId, orderSns]
+      );
+      for (const row of rows) {
+        const escrow = row.escrow && typeof row.escrow === 'object' ? row.escrow : null;
+        state.set(String(row.order_sn), {
+          rowCount: row.row_count,
+          updateTime: row.update_time,
+          orderStatus: row.order_status,
+          escrow,
+          hasEscrow: Boolean(escrow) && Object.keys(escrow).length > 0,
+          hasSyncedItem: row.has_synced_item === true,
+          processed: row.processed === true,
+        });
+      }
+      return state;
+    };
+
+    const saveWindow = async ({ orders, savedState, windowEnd, windowsDone, totalOrders, escrowCalls, escrowReused }) => {
+      ensureLease();
+      escrowCallsTotal += escrowCalls;
+      escrowReusedTotal += escrowReused;
+
+      if (orders.length > 0) {
+        assertJobDeadline(deadlineAt, 'gravação dos pedidos');
+        /* Cada worker mantém uma conexão do pool durante a transação do pedido.
+         * O pool tem 15 conexões e o botão global sincroniza 2 lojas Shopee com
+         * 3 contas ML ao mesmo tempo, então 6 por loja esgotaria o pool e
+         * derrubaria requisições da própria tela. 3 deixa folga. */
+        const SAVE_CONCURRENCY = configInt('SHOPEE_SAVE_CONCURRENCY', 3, 1, 8);
+        let saveIndex = 0;
+        let aborted = false;
+
+        const saveWorker = async () => {
+          while (saveIndex < orders.length) {
+            // Um erro em qualquer worker para todos os demais. Sem isso, os
+            // outros seguiriam gravando depois do job já ter falhado.
+            if (aborted) return;
+            const order = orders[saveIndex++];
+            try {
+              ensureLease();
+              assertJobDeadline(deadlineAt, 'gravação dos pedidos');
+
+              const orderSn = String(order.order_sn);
+              const previous = savedState.get(orderSn);
+              const rows = orderToRows(order, account, nickname);
+              for (const row of rows) row.uid = targetUid;
+
+              // Nada mudou, o financeiro está liquidado e TODAS as linhas do
+              // pedido já existem: não reescreve.
+              if (canReuseSavedOrder(previous, order, rows.length)) {
+                skippedItems += rows.length;
+                savedOrders += 1;
+                continue;
+              }
+
+              // Transação por pedido: um pedido multi-SKU nunca fica com parte
+              // das linhas gravadas, o que o faria ser pulado para sempre.
+              const orderClient = await db.pool.connect();
+              try {
+                await orderClient.query('BEGIN');
+                if (previous?.processed) {
+                  const affected = await updateProcessedOrder(orderSn, targetUid, rows[0], orderClient);
+                  updatedItems += affected;
+                  skippedItems += Math.max(0, rows.length - affected);
+                } else {
+                  for (const row of rows) {
+                    const outcome = await upsertRow(row, orderClient);
+                    if (outcome === 'inserted') insertedItems += 1;
+                    else if (outcome === 'updated') updatedItems += 1;
+                    else skippedItems += 1;
+                  }
+                }
+                await orderClient.query('COMMIT');
+              } catch (orderError) {
+                try { await orderClient.query('ROLLBACK'); } catch { /* já encerrada */ }
+                throw orderError;
+              } finally {
+                orderClient.release();
+              }
+              savedOrders += 1;
+            } catch (error) {
+              aborted = true;
+              throw error;
+            }
+          }
+        };
+        await Promise.all(Array.from({ length: Math.min(SAVE_CONCURRENCY, orders.length) }, () => saveWorker()));
+      }
+
+      // Checkpoint: a janela foi listada, detalhada e gravada por completo.
+      await saveWindowCheckpoint(windowEnd);
+
+      const elapsed = Math.round((Date.now() - startedAt) / 1000);
+      console.log(`[shopee-sync] ${nickname}: janela ${windowsDone} ok, ${orders.length} pedido(s), escrow=${escrowCalls} reaproveitado=${escrowReused}, até ${windowEnd.toISOString()}, ${elapsed}s`);
+      sendEvent(clientId, {
+        progress: Math.min(95, 20 + windowsDone * 8),
+        message: `[${nickname}] ${windowsDone} janela(s) concluída(s), ${totalOrders} pedido(s) verificados...`,
+        type: 'info',
+        newSalesCount: insertedItems,
+        updatedCount: updatedItems,
+        skippedCount: skippedItems,
+      });
+    };
+
+    const { totalOrders } = await processWindows({
       account,
       since,
       upperBound,
       partnerId,
       partnerKey,
-      (count, windowsDone, scannedThrough) => {
-        ensureLease();
-        const elapsed = Math.round((Date.now() - startedAt) / 1000);
-        console.log(`[shopee-sync] ${nickname}: janela ${windowsDone}, ${count} pedido(s), até ${scannedThrough.toISOString()}, ${elapsed}s`);
-        sendEvent(clientId, {
-          progress: Math.min(60, 20 + windowsDone * 4),
-          message: `[${nickname}] ${windowsDone} janela(s), ${count} pedido(s) encontrados...`,
-          type: 'info',
-        });
-      },
       timeRangeField,
-      deadlineAt
-    );
-
-    let insertedItems = 0;
-    let updatedItems = 0;
-    let skippedItems = 0;
-    let savedOrders = 0;
-
-    if (orders.length > 0) {
-      assertJobDeadline(deadlineAt, 'preparação da gravação');
-      sendEvent(clientId, { progress: 65, message: `[${nickname}] Salvando ${orders.length} pedido(s)...`, type: 'info' });
-
-      const orderSns = [...new Set(orders.map((order) => String(order.order_sn)).filter(Boolean))];
-      const processedResult = await db.query(
-        `SELECT DISTINCT order_sn FROM public.shopee_sales
-          WHERE uid = $1 AND shop_id = $2 AND processed_at IS NOT NULL
-            AND order_sn = ANY($3::text[])`,
-        [targetUid, shopId, orderSns]
-      );
-      const historicallyProcessed = new Set(processedResult.rows.map((row) => String(row.order_sn)));
-
-      const SAVE_CONCURRENCY = configInt('SHOPEE_SAVE_CONCURRENCY', 6, 1, 10);
-      let saveIndex = 0;
-      const saveWorker = async () => {
-        while (saveIndex < orders.length) {
-          ensureLease();
-          assertJobDeadline(deadlineAt, 'gravação dos pedidos');
-          const index = saveIndex++;
-          const order = orders[index];
-          const rows = orderToRows(order, account, nickname);
-          for (const row of rows) row.uid = targetUid;
-
-          if (historicallyProcessed.has(String(order.order_sn))) {
-            const affected = await updateProcessedOrder(String(order.order_sn), targetUid, rows[0]);
-            updatedItems += affected;
-            skippedItems += Math.max(0, rows.length - affected);
-          } else {
-            for (const row of rows) {
-              const outcome = await upsertRow(row);
-              if (outcome === 'inserted') insertedItems += 1;
-              else if (outcome === 'updated') updatedItems += 1;
-              else skippedItems += 1;
-            }
-          }
-
-          savedOrders += 1;
-          if (savedOrders % 25 === 0 || savedOrders === orders.length) {
-            const pct = 65 + Math.floor((savedOrders / orders.length) * 30);
-            sendEvent(clientId, {
-              progress: Math.min(95, pct),
-              message: `[${nickname}] Salvando... ${savedOrders}/${orders.length}`,
-              type: 'info',
-              newSalesCount: insertedItems,
-              updatedCount: updatedItems,
-              skippedCount: skippedItems,
-            });
-          }
-        }
-      };
-      await Promise.all(Array.from({ length: Math.min(SAVE_CONCURRENCY, orders.length) }, () => saveWorker()));
-    }
+      deadlineAt,
+      resolveSavedState,
+      onWindow: saveWindow,
+    });
 
     await finishLegacyScan();
     ensureLease();
     assertJobDeadline(deadlineAt, 'finalização');
 
     const terminalPayload = {
-      message: orders.length === 0
+      message: totalOrders === 0
         ? `[${nickname}] Sincronização concluída; nenhum pedido novo ou atualizado.`
         : `[${nickname}] Concluída: ${savedOrders} pedido(s), ${insertedItems} item(ns) novo(s) e ${updatedItems} atualizado(s).`,
       type: 'success',
@@ -1045,13 +1228,22 @@ router.post('/sync-account', authenticateToken, async (req, res) => {
     try {
       await finishClient.query('BEGIN');
       const cursorUpdate = await finishClient.query(
+        /* O watermark incremental nunca pode passar do INÍCIO do backfill.
+         *
+         * Um backfill retomado em vários dias termina com upperBound de hoje;
+         * usar esse valor faria o primeiro incremental ignorar tudo que mudou
+         * enquanto a carga estava em andamento. */
         `UPDATE public.shopee_sync_cursors
-            SET update_time_scanned_through = $1,
+            SET update_time_scanned_through = GREATEST(
+                  COALESCE(update_time_scanned_through, TIMESTAMPTZ '-infinity'),
+                  LEAST($1::timestamptz, COALESCE(backfill_started_at, $1::timestamptz))
+                ),
                 initial_backfill_completed_at = CASE
                   WHEN $2 = 'create_time' THEN COALESCE(initial_backfill_completed_at, NOW())
                   ELSE initial_backfill_completed_at
                 END,
                 last_success_at = NOW(), status = 'success', last_error = NULL,
+                backfill_scanned_through = NULL, backfill_started_at = NULL,
                 last_result = $3::jsonb, locked_until = NULL, updated_at = NOW()
           WHERE uid = $4 AND shop_id = $5 AND job_id = $6 AND status = 'running'
         RETURNING job_id`,
@@ -1077,7 +1269,7 @@ router.post('/sync-account', authenticateToken, async (req, res) => {
     lockAcquired = false;
 
     const durationSeconds = Math.round((Date.now() - startedAt) / 1000);
-    console.log(`[shopee-sync] ${nickname}: concluído em ${durationSeconds}s; pedidos=${savedOrders}, novos=${insertedItems}, atualizados=${updatedItems}, ignorados=${skippedItems}`);
+    console.log(`[shopee-sync] ${nickname}: concluído em ${durationSeconds}s; pedidos=${savedOrders}, novos=${insertedItems}, atualizados=${updatedItems}, sem mudança=${skippedItems}, escrow=${escrowCallsTotal}, escrow reaproveitado=${escrowReusedTotal}`);
     finalizeJob(clientId, terminalPayload);
   } catch (error) {
     console.error(`[shopee-sync] ${nickname} falhou após ${Date.now() - startedAt}ms:`, error);

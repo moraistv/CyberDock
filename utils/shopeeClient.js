@@ -277,7 +277,10 @@ async function getShopeeOrderDetail(p) {
   url.searchParams.append(
     'response_optional_fields',
     p.responseOptionalFields ||
-      'buyer_user_id,buyer_username,recipient_address,estimated_shipping_fee,actual_shipping_fee,item_list,total_amount,package_list,shipping_carrier,create_time,order_status,ship_by_date,days_to_ship'
+      // `update_time` é obrigatório aqui: é o carimbo usado para decidir se o
+      // pedido mudou e, portanto, se vale gastar uma consulta de escrow (que é
+      // 1 chamada por pedido e domina o tempo da sincronização).
+      'buyer_user_id,buyer_username,recipient_address,estimated_shipping_fee,actual_shipping_fee,item_list,total_amount,package_list,shipping_carrier,create_time,update_time,order_status,ship_by_date,days_to_ship'
   );
 
   const data = assertShopeeSuccess(
