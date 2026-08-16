@@ -41,6 +41,23 @@ const UPSERT_BATCH_SIZE = 300;
 
 const MAX_PROCESS_BATCH = 500;
 
+/* Processamento de despacho em lote.
+ *
+ * Cada venda precisa da PRÓPRIA transação (uma falha de estoque não pode
+ * desfazer as outras), e cada transação faz de 6 a 8 idas ao banco. Em série,
+ * um lote de 500 vendas somava milhares de idas e voltas numa única conexão.
+ *
+ * A concorrência é modesta de propósito: o pool tem 15 conexões e o mesmo
+ * banco atende as telas. Disputa de lock entre duas vendas do mesmo SKU é
+ * tratada com repetição em série, não evitada por serializar tudo.
+ */
+const PROCESS_CONCURRENCY = configInt('SALES_PROCESS_CONCURRENCY', 4, 1, 8);
+const LOCK_CONFLICT_CODES = new Set([
+  '40P01', // deadlock_detected
+  '40001', // serialization_failure
+  '55P03', // lock_not_available
+]);
+
 /** Lê um inteiro de ambiente com limites, tolerando valor inválido. */
 function configInt(name, fallback, min, max) {
   const parsed = Number.parseInt(process.env[name] || '', 10);
@@ -56,8 +73,55 @@ function configInt(name, fallback, min, max) {
  */
 const salesCountCache = new Map();
 const salesCountInFlight = new Map();
-const SALES_COUNT_TTL_MS = 20000;
+// 20s era pouco: paginar, abrir um filtro e voltar já estourava o TTL e pagava
+// a contagem de novo. Uma sincronização leva minutos para rodar, então o total
+// não muda com essa frequência.
+const SALES_COUNT_TTL_MS = configInt('SALES_COUNT_TTL_MS', 90000, 5000, 600000);
 const SALES_COUNT_CACHE_MAX = 500;
+
+/* ---------------------- Cache curto de resposta agregada -------------------
+ * Dashboard, facetas de filtro e opções do tabelão rodam de 5 a 7 agregações
+ * cada, sobre as mesmas linhas, e a tela dispara todas juntas ao abrir — além
+ * de repetir tudo a cada volta ao painel. O resultado é idêntico dentro de uma
+ * janela de segundos, então vale guardar a resposta pronta.
+ *
+ * `inFlight` é tão importante quanto o TTL: sem ele, dois cliques rápidos (ou o
+ * dashboard e a tabela abrindo juntos) disparam a mesma bateria de agregações
+ * em paralelo e ocupam metade do pool de 15 conexões.
+ */
+const responseCache = new Map();
+const responseInFlight = new Map();
+const RESPONSE_CACHE_MAX = 400;
+
+function withResponseCache(key, ttlMs, producer) {
+  const hit = responseCache.get(key);
+  if (hit && Date.now() - hit.at < ttlMs) return Promise.resolve(hit.payload);
+  if (hit) responseCache.delete(key);
+
+  const running = responseInFlight.get(key);
+  if (running) return running;
+
+  const promise = Promise.resolve()
+    .then(producer)
+    .then((payload) => {
+      if (responseCache.size >= RESPONSE_CACHE_MAX) {
+        const oldest = responseCache.keys().next().value;
+        if (oldest !== undefined) responseCache.delete(oldest);
+      }
+      responseCache.set(key, { payload, at: Date.now() });
+      return payload;
+    })
+    .finally(() => responseInFlight.delete(key));
+
+  responseInFlight.set(key, promise);
+  return promise;
+}
+
+/** Chave estável a partir dos parâmetros que realmente afetam o resultado. */
+function cacheKeyFromQuery(prefix, query, fields) {
+  const parts = fields.map((f) => `${f}=${String(query[f] ?? '').trim()}`);
+  return `${prefix}|${parts.join('&')}`;
+}
 
 /* Teto da contagem exata.
  *
@@ -156,6 +220,126 @@ function buildBoundedCountQuery(whereClause) {
           ${whereClause}
          LIMIT ${SALES_COUNT_MAX + 1}
       ) bounded`;
+}
+
+/* --------------------- Contagem direto nas tabelas base -------------------
+ * O gargalo do COUNT não era ler as linhas: era a view.
+ *
+ * `public.unified_sales` é um UNION ALL, e o Postgres NÃO elimina colunas não
+ * usadas da lista de saída de um set operation. Mesmo em `SELECT 1 FROM
+ * unified_sales`, cada linha do lado do ML pagava a extração de raw_api_data
+ * (status, shipping, thumbnail, permalink, item_id, comprador) e o regex + cast
+ * do prazo — e raw_api_data é TOAST, ou seja, leitura fora da página em TODA
+ * linha só para contar.
+ *
+ * A solução é contar em cada tabela de origem separadamente e somar. Aí a lista
+ * de saída é literalmente `1`, e uma expressão de JSONB só é avaliada se o
+ * PRÓPRIO FILTRO precisar dela.
+ *
+ * Para não duplicar os construtores de filtro (que já são grandes e vivem em
+ * duas rotas), o WHERE continua sendo escrito UMA vez em cima dos nomes da
+ * view; o mapa abaixo reescreve cada referência `s.<coluna>` para a expressão
+ * equivalente na tabela real. Os mapas são o espelho exato do SELECT da view em
+ * utils/init-db.js (UNIFIED_SALES_VIEW_SQL) — se a view mudar, mudar aqui.
+ */
+const ML_SLA_TEXT = `s.raw_api_data->'sla_data'->>'expected_date'`;
+const SHOPEE_ITEM = `COALESCE(s.raw_api_data->'synced_item', s.raw_api_data->'item_list'->0)`;
+
+const COUNT_SOURCES = [
+  {
+    from: 'public.sales s',
+    cols: {
+      marketplace: `'ML'::text`,
+      id: 's.id::text',
+      sku: 's.sku',
+      uid: 's.uid',
+      account_id: 's.seller_id::text',
+      account_nickname: 's.account_nickname',
+      sale_date: 's.sale_date',
+      product_title: 's.product_title',
+      quantity: 's.quantity',
+      shipping_mode: 's.shipping_mode',
+      shipping_deadline: `COALESCE(CASE WHEN ${ML_SLA_TEXT} ~ '^\\d{4}-\\d{2}-\\d{2}' THEN (${ML_SLA_TEXT})::timestamptz END, s.shipping_limit_date)`,
+      shipping_status: 's.shipping_status',
+      processed_at: 's.processed_at',
+      updated_at: 's.updated_at',
+      order_status: `s.raw_api_data->>'status'`,
+      shipping_id: `s.raw_api_data->'shipping'->>'id'`,
+      product_thumbnail: `s.raw_api_data->'order_items'->0->'item'->>'thumbnail'`,
+      product_permalink: `s.raw_api_data->'order_items'->0->'item'->>'permalink'`,
+      item_id: `s.raw_api_data->'order_items'->0->'item'->>'id'`,
+      buyer_name: `TRIM(CONCAT_WS(' ', s.raw_api_data->'buyer'->>'first_name', s.raw_api_data->'buyer'->>'last_name'))`,
+      buyer_nickname: `s.raw_api_data->'buyer'->>'nickname'`,
+      raw_api_data: 's.raw_api_data',
+    },
+  },
+  {
+    from: 'public.shopee_sales s',
+    cols: {
+      marketplace: `'Shopee'::text`,
+      id: 's.order_sn',
+      sku: 's.sku',
+      uid: 's.uid',
+      account_id: 's.shop_id::text',
+      account_nickname: 's.account_nickname',
+      sale_date: 's.sale_date',
+      product_title: 's.product_title',
+      quantity: 's.quantity',
+      shipping_mode: `COALESCE(NULLIF(s.shipping_carrier, ''), 'Shopee')`,
+      shipping_deadline: 's.ship_by_date',
+      shipping_status: 's.shipping_status',
+      processed_at: 's.processed_at',
+      updated_at: 's.updated_at',
+      order_status: 's.order_status',
+      shipping_id: 'NULL::text',
+      product_thumbnail: `${SHOPEE_ITEM}->'image_info'->>'image_url'`,
+      product_permalink: `CASE WHEN ${SHOPEE_ITEM}->>'item_id' IS NOT NULL
+        THEN 'https://shopee.com.br/product/' || s.shop_id::text || '/' || (${SHOPEE_ITEM}->>'item_id') END`,
+      item_id: `${SHOPEE_ITEM}->>'item_id'`,
+      buyer_name: 's.recipient_name',
+      buyer_nickname: 's.buyer_username',
+      raw_api_data: 's.raw_api_data',
+    },
+  },
+];
+
+/**
+ * Reescreve `s.<coluna>` (nomes da view) para a expressão da tabela de origem.
+ * Lança se encontrar coluna fora do mapa — assim uma coluna nova na view nunca
+ * produz contagem silenciosamente errada; o chamador cai de volta na view.
+ * Aliases diferentes de `s` (o `sk` de public.skus, por exemplo) não casam.
+ */
+function translateWhereToSource(whereClause, cols) {
+  return whereClause.replace(/\bs\.([a-z_][a-z0-9_]*)/gi, (_match, col) => {
+    const mapped = cols[String(col).toLowerCase()];
+    if (mapped === undefined) throw new Error(`coluna não mapeada para contagem: ${col}`);
+    return mapped;
+  });
+}
+
+/**
+ * Contagem preferencial: soma de COUNT(*) limitado em cada tabela de origem.
+ * Equivale ao COUNT da view (que é um UNION ALL sem filtro próprio), mas sem
+ * pagar as expressões da view por linha.
+ */
+function buildCountQuery(whereClause) {
+  try {
+    const parts = COUNT_SOURCES.map(({ from, cols }) => `(
+      SELECT COUNT(*)::int
+        FROM (
+          SELECT 1
+            FROM ${from}
+            ${translateWhereToSource(whereClause, cols)}
+           LIMIT ${SALES_COUNT_MAX + 1}
+        ) b
+    )`);
+    return `SELECT (${parts.join(' + ')})::int AS total`;
+  } catch (error) {
+    // Filtro usa algo que ainda não sabemos traduzir: melhor contar devagar do
+    // que contar errado.
+    console.warn(`[sales] contagem caiu para a view unificada: ${error.message}`);
+    return buildBoundedCountQuery(whereClause);
+  }
 }
 
 /** Traduz a contagem limitada no par (total exibido, é exato?). */
@@ -853,32 +1037,38 @@ router.get('/sync-status/:clientId', (req, res) => {
 
 router.get('/filter-options', authenticateToken, requireMaster, async (req, res) => {
   try {
-    // Contas dos DOIS marketplaces. `accounts` continua sendo uma lista de
-    // nicknames (compatibilidade com o filtro atual) e `accountsDetailed`
-    // traz o marketplace de cada uma, para a tela exibir o logo correto.
-    const [mlResult, shopeeResult, userResult] = await Promise.all([
-      db.query("SELECT DISTINCT nickname FROM public.ml_accounts WHERE nickname IS NOT NULL AND status = 'active' ORDER BY nickname"),
-      db.query("SELECT DISTINCT shop_id, shop_name FROM public.shopee_accounts WHERE status = 'active' ORDER BY shop_name"),
-      db.query("SELECT DISTINCT name FROM public.users WHERE name IS NOT NULL AND active = true ORDER BY name"),
-    ]);
+    // Contas e clientes mudam quando alguém conecta uma loja ou cadastra um
+    // usuário — algo raro. A tela, porém, pede esta lista em cada abertura.
+    const payload = await withResponseCache('filter-options', 5 * 60 * 1000, async () => {
+      // Contas dos DOIS marketplaces. `accounts` continua sendo uma lista de
+      // nicknames (compatibilidade com o filtro atual) e `accountsDetailed`
+      // traz o marketplace de cada uma, para a tela exibir o logo correto.
+      const [mlResult, shopeeResult, userResult] = await Promise.all([
+        db.query("SELECT DISTINCT nickname FROM public.ml_accounts WHERE nickname IS NOT NULL AND status = 'active' ORDER BY nickname"),
+        db.query("SELECT DISTINCT shop_id, shop_name FROM public.shopee_accounts WHERE status = 'active' ORDER BY shop_name"),
+        db.query("SELECT DISTINCT name FROM public.users WHERE name IS NOT NULL AND active = true ORDER BY name"),
+      ]);
 
-    const mlAccounts = mlResult.rows.map((r) => ({
-      marketplace: 'ML',
-      label: r.nickname,
-      value: r.nickname,
-    }));
-    const shopeeAccounts = shopeeResult.rows.map((r) => ({
-      marketplace: 'Shopee',
-      label: r.shop_name || String(r.shop_id),
-      value: r.shop_name || String(r.shop_id),
-    }));
+      const mlAccounts = mlResult.rows.map((r) => ({
+        marketplace: 'ML',
+        label: r.nickname,
+        value: r.nickname,
+      }));
+      const shopeeAccounts = shopeeResult.rows.map((r) => ({
+        marketplace: 'Shopee',
+        label: r.shop_name || String(r.shop_id),
+        value: r.shop_name || String(r.shop_id),
+      }));
 
-    res.json({
-      accounts: [...mlAccounts, ...shopeeAccounts].map((a) => a.label),
-      accountsDetailed: [...mlAccounts, ...shopeeAccounts],
-      marketplaces: ['ML', 'Shopee'],
-      users: userResult.rows.map(r => r.name)
+      return {
+        accounts: [...mlAccounts, ...shopeeAccounts].map((a) => a.label),
+        accountsDetailed: [...mlAccounts, ...shopeeAccounts],
+        marketplaces: ['ML', 'Shopee'],
+        users: userResult.rows.map(r => r.name),
+      };
     });
+
+    res.json(payload);
   } catch (err) {
     console.error('Erro ao buscar filter options:', err);
     res.status(500).json({ error: 'Falha ao buscar opções de filtro' });
@@ -1405,8 +1595,9 @@ router.get('/all', authenticateToken, requireMaster, async (req, res) => {
 
     const whereClause = conditions.length > 0 ? 'WHERE ' + conditions.join(' AND ') : '';
 
-    // Sem JOIN e com teto: os filtros agora vivem todos nas tabelas de venda.
-    const countQuery = buildBoundedCountQuery(whereClause);
+    // Sem JOIN, com teto e contando nas tabelas de origem (a view faria o
+    // Postgres avaliar JSONB linha por linha só para contar).
+    const countQuery = buildCountQuery(whereClause);
 
     // Mesma estratégia da tela do usuário: recorta a página primeiro e só
     // depois resolve SKU/JSON, para o custo por linha valer apenas 1 página.
@@ -1729,9 +1920,32 @@ function buildUnifiedFilters(query, uid, options = {}) {
  * ativos. Cada faceta ignora apenas o próprio campo, de modo que o usuário
  * nunca veja uma combinação que resultaria em lista vazia.
  */
+/* Campos que alteram o resultado de facetas e dashboard. Usados para montar a
+ * chave de cache: qualquer outro parâmetro (page, limit, _t) não muda a
+ * agregação e não deve gerar uma entrada nova. */
+const UNIFIED_FILTER_FIELDS = [
+  'from', 'to', 'shipFrom', 'shipTo', 'window',
+  'marketplace', 'account', 'shippingStatus', 'shippingMode', 'saleStatus',
+  'processed', 'skuMapped', 'queue',
+];
+
+const FACETS_TTL_MS = configInt('SALES_FACETS_TTL_MS', 60000, 5000, 600000);
+const DASHBOARD_TTL_MS = configInt('SALES_DASHBOARD_TTL_MS', 60000, 5000, 600000);
+
 router.get('/filter-facets', authenticateToken, async (req, res) => {
   const { uid } = req.user;
   try {
+    const cacheKey = cacheKeyFromQuery(`facets|${uid}`, req.query, UNIFIED_FILTER_FIELDS);
+    const payload = await withResponseCache(cacheKey, FACETS_TTL_MS, () => buildFacets(req, uid));
+    res.json(payload);
+  } catch (error) {
+    console.error('Erro ao montar opções de filtro:', error);
+    res.status(500).json({ error: 'Erro interno ao carregar opções de filtro.' });
+  }
+});
+
+async function buildFacets(req, uid) {
+  {
     const facet = (skipName, keyExpr, extraSelect = '') => {
       const { where, params } = buildUnifiedFilters(req.query, uid, { skip: [skipName] });
       return db.query(
@@ -1755,7 +1969,7 @@ router.get('/filter-facets', authenticateToken, async (req, res) => {
     ]);
 
     const MK_LABEL = { ML: 'Mercado Livre', Shopee: 'Shopee' };
-    res.json({
+    return {
       marketplaces: marketplaces.rows.map((r) => ({
         value: r.value, label: MK_LABEL[r.value] || r.value, count: r.count,
       })),
@@ -1768,19 +1982,27 @@ router.get('/filter-facets', authenticateToken, async (req, res) => {
       shippingStatuses: statuses.rows.map((r) => ({ value: r.value, label: r.value, count: r.count })),
       shippingModes: modes.rows.map((r) => ({ value: r.value, label: r.value, count: r.count })),
       saleStatuses: saleStatuses.rows.map((r) => ({ value: r.value, label: r.value, count: r.count })),
-    });
-  } catch (error) {
-    console.error('Erro ao montar opções de filtro:', error);
-    res.status(500).json({ error: 'Erro interno ao carregar opções de filtro.' });
+    };
   }
-});
+}
 
 router.get('/dashboard-stats', authenticateToken, async (req, res) => {
   const { uid } = req.user;
+  try {
+    const cacheKey = cacheKeyFromQuery(`dashboard|${uid}`, req.query, UNIFIED_FILTER_FIELDS);
+    const payload = await withResponseCache(cacheKey, DASHBOARD_TTL_MS, () => buildDashboardStats(req, uid));
+    res.json(payload);
+  } catch (error) {
+    console.error('Erro ao montar métricas do dashboard:', error);
+    res.status(500).json({ error: 'Erro interno ao carregar métricas.' });
+  }
+});
+
+async function buildDashboardStats(req, uid) {
   const from = (req.query.from || '').trim();
   const to = (req.query.to || '').trim();
 
-  try {
+  {
     // Mesmo construtor usado por /filter-facets: garante que o número do card
     // e a opção clicada no filtro venham exatamente da mesma regra.
     const current = buildUnifiedFilters(req.query, uid);
@@ -1883,7 +2105,7 @@ router.get('/dashboard-stats', authenticateToken, async (req, res) => {
         : Promise.resolve({ rows: [] }),
     ]);
 
-    res.json({
+    return {
       totals: totals.rows[0] || {
         orders: 0, sales: 0, units: 0, pending_orders: 0, pending: 0,
         valid_orders: 0, cancelled_orders: 0, cancelled: 0,
@@ -1898,12 +2120,9 @@ router.get('/dashboard-stats', authenticateToken, async (req, res) => {
       byMarketplace: byMarketplace.rows,
       byShippingMode: byShippingMode.rows,
       topSkus: topSkus.rows,
-    });
-  } catch (error) {
-    console.error('Erro ao montar métricas do dashboard:', error);
-    res.status(500).json({ error: 'Erro interno ao carregar métricas.' });
+    };
   }
-});
+}
 
 /**
  * Payload bruto e completo de UMA venda, sob demanda.
@@ -2219,9 +2438,8 @@ router.get('/my-sales', authenticateToken, async (req, res) => {
 
     const whereClause = 'WHERE ' + conditions.join(' AND ');
 
-    // Contagem com teto, pelo mesmo motivo do tabelão: COUNT(*) sobre a view
-    // avalia as expressões do UNION ALL linha por linha.
-    const countQuery = buildBoundedCountQuery(whereClause);
+    // Contagem com teto e nas tabelas de origem, pelo mesmo motivo do tabelão.
+    const countQuery = buildCountQuery(whereClause);
     // Primeiro recorta somente a página pedida. O MATERIALIZED é intencional:
     // garante que lookup de SKU, expansão de JSON e montagem do payload sejam
     // executados para no máximo limit + 1 linhas, nunca para todo o histórico.
@@ -2594,15 +2812,16 @@ router.post('/process', authenticateToken, requireMaster, async (req, res) => {
   }
 
   const results = { success: [], failed: [] };
-  const client = await db.pool.connect();
 
-  try {
-    for (const requestedSale of sanitized) {
+  /** Processa UMA venda, na própria conexão e na própria transação. */
+  const runOne = async (requestedSale) => {
+    if (!requestedSale.id || !requestedSale.sku || !requestedSale.uid) {
+      throw new Error('Dados da venda incompletos (id, sku, uid).');
+    }
+
+    const client = await db.pool.connect();
+    try {
       try {
-        if (!requestedSale.id || !requestedSale.sku || !requestedSale.uid) {
-          throw new Error('Dados da venda incompletos (id, sku, uid).');
-        }
-
         await client.query('BEGIN');
 
         // A venda é bloqueada antes do estoque. Chamadas simultâneas ficam em
@@ -2622,8 +2841,7 @@ router.post('/process', authenticateToken, requireMaster, async (req, res) => {
         const sale = saleResult.rows[0];
         if (sale.processed_at) {
           await client.query('COMMIT');
-          results.success.push({ saleId: sale.id, sku: sale.sku, alreadyProcessed: true });
-          continue;
+          return { saleId: sale.id, sku: sale.sku, alreadyProcessed: true };
         }
 
         sale.quantity = Number(sale.quantity);
@@ -2737,14 +2955,50 @@ router.post('/process', authenticateToken, requireMaster, async (req, res) => {
         if (updatedSale.rowCount === 0) throw new Error('Venda já processada por outra operação.');
 
         await client.query('COMMIT');
-        results.success.push({ saleId: sale.id, sku: sale.sku, quantity: sale.quantity });
+        return { saleId: sale.id, sku: sale.sku, quantity: sale.quantity };
       } catch (error) {
         try { await client.query('ROLLBACK'); } catch { /* ignore */ }
-        results.failed.push({
-          saleId: requestedSale.id,
-          sku: requestedSale.sku,
-          reason: error.message,
-        });
+        throw error;
+      }
+    } finally {
+      client.release();
+    }
+  };
+
+  try {
+    const outcomes = await mapWithConcurrency(sanitized, PROCESS_CONCURRENCY, async (sale) => {
+      try {
+        return { ok: true, value: await runOne(sale) };
+      } catch (error) {
+        return { ok: false, sale, error };
+      }
+    });
+
+    // Duas vendas do mesmo lote podem disputar o mesmo SKU (ou o mesmo filho de
+    // kit) e o Postgres aborta uma das transações. Isso não é erro do operador,
+    // é só ordem de execução: esses casos voltam em série, onde não há disputa.
+    const contended = [];
+    for (const outcome of outcomes) {
+      if (outcome?.ok) {
+        results.success.push(outcome.value);
+        continue;
+      }
+      if (outcome && LOCK_CONFLICT_CODES.has(outcome.error?.code)) {
+        contended.push(outcome.sale);
+        continue;
+      }
+      results.failed.push({
+        saleId: outcome?.sale?.id ?? null,
+        sku: outcome?.sale?.sku ?? null,
+        reason: outcome?.error?.message || 'Falha inesperada ao processar a venda.',
+      });
+    }
+
+    for (const sale of contended) {
+      try {
+        results.success.push(await runOne(sale));
+      } catch (error) {
+        results.failed.push({ saleId: sale.id, sku: sale.sku, reason: error.message });
       }
     }
 
@@ -2752,8 +3006,6 @@ router.post('/process', authenticateToken, requireMaster, async (req, res) => {
   } catch (error) {
     console.error('Erro crítico no processamento em lote:', error);
     return res.status(500).json({ error: 'Erro crítico no processamento em lote.' });
-  } finally {
-    client.release();
   }
 });
 

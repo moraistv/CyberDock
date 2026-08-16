@@ -396,6 +396,36 @@ function configInt(name, fallback, min, max) {
 
 const SHOPEE_JOB_TIMEOUT_MS = configInt('SHOPEE_JOB_TIMEOUT_MS', 900000, 60000, 3600000);
 
+/* Concorrência do abatimento de estoque em lote. Igual à do ML: o pool tem 15
+ * conexões e o mesmo banco atende as telas, então 4 é folga, não teto. */
+const PROCESS_CONCURRENCY = configInt('SALES_PROCESS_CONCURRENCY', 4, 1, 8);
+const LOCK_CONFLICT_CODES = new Set([
+  '40P01', // deadlock_detected
+  '40001', // serialization_failure
+  '55P03', // lock_not_available
+]);
+
+/** Executa `mapper` sobre `items` com no máximo `limit` em voo. */
+async function mapWithConcurrency(items, limit, mapper) {
+  const out = new Array(items.length);
+  let index = 0;
+
+  const worker = async () => {
+    for (;;) {
+      const current = index++;
+      if (current >= items.length) return;
+      try {
+        out[current] = await mapper(items[current], current);
+      } catch {
+        out[current] = null;
+      }
+    }
+  };
+
+  await Promise.all(Array.from({ length: Math.min(limit, items.length) }, worker));
+  return out;
+}
+
 /* O escrow da Shopee só é definitivo depois do repasse. Antes disso os valores
  * ainda mudam (comissão, reconciliação de frete) sem necessariamente mexer no
  * update_time do pedido, então reaproveitar seria congelar financeiro errado. */
@@ -1455,15 +1485,16 @@ router.post('/process', authenticateToken, requireMaster, async (req, res) => {
   }));
 
   const results = { success: [], failed: [] };
-  const client = await db.pool.connect();
 
-  try {
-    for (const requestedSale of sanitized) {
+  /** Processa UM pedido, na própria conexão e na própria transação. */
+  const runOne = async (requestedSale) => {
+    if (!requestedSale.orderSn || !requestedSale.sku || !requestedSale.uid) {
+      throw new Error('Dados da venda incompletos (orderSn, sku e uid).');
+    }
+
+    const client = await db.pool.connect();
+    try {
       try {
-        if (!requestedSale.orderSn || !requestedSale.sku || !requestedSale.uid) {
-          throw new Error('Dados da venda incompletos (orderSn, sku e uid).');
-        }
-
         await client.query('BEGIN');
 
         // O lock da venda vem antes do estoque. Duas requisições concorrentes
@@ -1483,12 +1514,11 @@ router.post('/process', authenticateToken, requireMaster, async (req, res) => {
         const sale = saleResult.rows[0];
         if (sale.processed_at) {
           await client.query('COMMIT');
-          results.success.push({
+          return {
             orderSn: sale.order_sn,
             sku: sale.sku,
             alreadyProcessed: true,
-          });
-          continue;
+          };
         }
 
         const quantity = Number(sale.quantity);
@@ -1585,14 +1615,53 @@ router.post('/process', authenticateToken, requireMaster, async (req, res) => {
         if (updateResult.rowCount !== 1) throw new Error('Venda não pôde ser marcada como processada.');
 
         await client.query('COMMIT');
-        results.success.push({ orderSn: sale.order_sn, sku: sale.sku, alreadyProcessed: false });
+        return { orderSn: sale.order_sn, sku: sale.sku, alreadyProcessed: false };
       } catch (error) {
         try { await client.query('ROLLBACK'); } catch { /* transação já encerrada */ }
-        results.failed.push({
-          orderSn: requestedSale.orderSn,
-          sku: requestedSale.sku,
-          reason: error.message,
-        });
+        throw error;
+      }
+    } finally {
+      client.release();
+    }
+  };
+
+  try {
+    /* Antes o lote inteiro rodava em UMA conexão, um pedido depois do outro, e
+     * cada pedido faz de 6 a 8 idas ao banco. A concorrência é baixa de
+     * propósito: o pool tem 15 conexões e atende as telas ao mesmo tempo. */
+    const outcomes = await mapWithConcurrency(sanitized, PROCESS_CONCURRENCY, async (sale) => {
+      try {
+        return { ok: true, value: await runOne(sale) };
+      } catch (error) {
+        return { ok: false, sale, error };
+      }
+    });
+
+    // Dois pedidos do lote podem disputar o mesmo SKU (ou o mesmo filho de kit)
+    // e o Postgres aborta uma das transações. Não é erro do operador: é ordem.
+    // Esses casos voltam em série, onde não existe disputa.
+    const contended = [];
+    for (const outcome of outcomes) {
+      if (outcome?.ok) {
+        results.success.push(outcome.value);
+        continue;
+      }
+      if (outcome && LOCK_CONFLICT_CODES.has(outcome.error?.code)) {
+        contended.push(outcome.sale);
+        continue;
+      }
+      results.failed.push({
+        orderSn: outcome?.sale?.orderSn ?? null,
+        sku: outcome?.sale?.sku ?? null,
+        reason: outcome?.error?.message || 'Falha inesperada ao processar a venda.',
+      });
+    }
+
+    for (const sale of contended) {
+      try {
+        results.success.push(await runOne(sale));
+      } catch (error) {
+        results.failed.push({ orderSn: sale.orderSn, sku: sale.sku, reason: error.message });
       }
     }
 
@@ -1600,8 +1669,6 @@ router.post('/process', authenticateToken, requireMaster, async (req, res) => {
   } catch (error) {
     console.error('Erro crítico no processamento em lote (Shopee):', error);
     return res.status(500).json({ error: 'Erro crítico no processamento em lote.' });
-  } finally {
-    client.release();
   }
 });
 
