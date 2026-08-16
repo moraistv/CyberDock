@@ -3015,6 +3015,58 @@ router.post('/sync-account', authenticateToken, async (req, res) => {
 
   if (!userId || !clientId) return res.status(400).json({ error: 'ID usuário e clientId obrigatórios.' });
 
+  /* Clique repetido não vale uma varredura nova.
+   *
+   * Mesmo com o skip funcionando (o log mostra `pulados` alto), cada clique
+   * ainda pergunta ao Mercado Livre "mudou algo?" para CADA conta. Com 32
+   * contas isso é uma rodada inteira de chamadas e de orçamento de rate limit
+   * para descobrir o que já sabíamos: em poucos segundos nada mudou.
+   *
+   * `ml_sync_cursors.updated_at` avança em toda execução bem-sucedida — mesmo
+   * nas que não acharam nada — então serve como carimbo do último "está em dia".
+   * Chave por seller_id: o id do vendedor é único por conta ML e evita depender
+   * de resolver o dono antes de decidir.
+   *
+   * force, backfill e daysToSync passam direto: são os caminhos de quem quer,
+   * explicitamente, varrer de novo agora ou olhar mais para trás.
+   */
+  if (!force && !backfill && !daysToSync) {
+    const cooldownSeconds = configInt('ML_SYNC_COOLDOWN_SECONDS', 60, 0, 3600);
+    if (cooldownSeconds > 0) {
+      try {
+        const recent = await db.query(
+          `SELECT EXTRACT(EPOCH FROM (NOW() - updated_at))::int AS age_seconds
+             FROM public.ml_sync_cursors
+            WHERE seller_id = $1
+              AND updated_at > NOW() - ($2::int * interval '1 second')
+            ORDER BY updated_at DESC
+            LIMIT 1`,
+          [userId, cooldownSeconds]
+        );
+
+        if (recent.rowCount > 0) {
+          const age = recent.rows[0].age_seconds ?? 0;
+          res.status(200).json({ message: 'Conta já estava atualizada.', fromCooldown: true });
+          sendEvent(clientId, {
+            progress: 100,
+            message: `[${nickname}] Já estava atualizada (sincronizada há ${age}s).`,
+            type: 'success',
+            newSalesCount: 0,
+            updatedCount: 0,
+            skippedCount: 0,
+            workCompleted: 1,
+            workTotal: 1,
+            fromCooldown: true,
+          });
+          return;
+        }
+      } catch (cooldownError) {
+        // Carência é otimização. Se a consulta falhar, sincroniza normalmente.
+        console.warn(`[SYNC] ${nickname}: carência não verificada (${cooldownError.message}).`);
+      }
+    }
+  }
+
   res.status(202).json({ message: 'Sincronização iniciada. Acompanhe status.' });
 
   try {

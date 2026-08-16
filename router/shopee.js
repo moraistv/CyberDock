@@ -887,6 +887,47 @@ router.post('/sync-account', authenticateToken, async (req, res) => {
     targetUid = accRow.uid;
     nickname = accRow.shop_name || String(accRow.shop_id);
 
+    /* Clique repetido não vale uma varredura nova.
+     *
+     * Sincronizar de novo poucos segundos depois de um sucesso não pode
+     * encontrar nada: a Shopee não teria tido tempo de mudar nada. Ainda assim,
+     * cada clique gastava a rodada completa de chamadas (lista + detalhe +
+     * escrow de cada pedido da janela) e o orçamento de rate limit da loja.
+     *
+     * Dentro da janela de carência a resposta é o resultado da última execução,
+     * devolvido na hora. `force` continua ignorando a carência: é justamente o
+     * caminho para quem quer varrer de novo agora.
+     */
+    if (!force) {
+      const cooldownSeconds = configInt('SHOPEE_SYNC_COOLDOWN_SECONDS', 60, 0, 3600);
+      if (cooldownSeconds > 0) {
+        const recent = await db.query(
+          `SELECT last_success_at, last_result,
+                  EXTRACT(EPOCH FROM (NOW() - last_success_at))::int AS age_seconds
+             FROM public.shopee_sync_cursors
+            WHERE uid = $1 AND shop_id = $2
+              AND status = 'success'
+              AND last_success_at > NOW() - ($3::int * interval '1 second')`,
+          [targetUid, shopId, cooldownSeconds]
+        );
+
+        if (recent.rowCount > 0) {
+          const age = recent.rows[0].age_seconds ?? 0;
+          const payload = {
+            ...(recent.rows[0].last_result || {}),
+            message: `[${nickname}] Já estava atualizada (sincronizada há ${age}s).`,
+            type: 'success',
+            newSalesCount: 0,
+            updatedCount: 0,
+            skippedCount: 0,
+            fromCooldown: true,
+          };
+          finalizeJob(clientId, payload);
+          return res.status(200).json({ message: payload.message, status: 'success', fromCooldown: true });
+        }
+      }
+    }
+
     // POST idempotente por clientId: uma resposta 202 perdida pode ser repetida
     // sem iniciar outro job ou transformar o próprio job em conflito.
     const existingJob = await db.query(
@@ -1012,6 +1053,9 @@ router.post('/sync-account', authenticateToken, async (req, res) => {
     let timeRangeField;
     let ranLegacyScan = false;
     let checkpointEnabled = true;
+    // Marca a execução que fez a varredura profunda periódica, para o carimbo
+    // só avançar quando a janela larga realmente foi percorrida.
+    let isDeepSweep = false;
 
     const backfillProgress = cursorState.backfill_scanned_through
       ? new Date(cursorState.backfill_scanned_through)
@@ -1030,7 +1074,32 @@ router.post('/sync-account', authenticateToken, async (req, res) => {
       since = backfillProgress && backfillProgress > oldestUseful ? backfillProgress : oldestUseful;
       timeRangeField = 'create_time';
     } else if (watermark) {
-      since = new Date(watermark.getTime() - 86400000);
+      /* Sobreposição CURTA, não 24 horas.
+       *
+       * Era `watermark - 86400000`: toda sincronização incremental relia um dia
+       * inteiro de pedidos da loja, buscava o detalhe de cada um e chamava o
+       * escrow de cada um. Era isso que fazia um clique repetido custar o mesmo
+       * que o primeiro, mesmo sem nada ter mudado — e o que explica dezenas de
+       * "atualizados" num intervalo em que nada podia ter acontecido.
+       *
+       * A sobreposição existe para cobrir corrida de fronteira: um pedido cujo
+       * update_time cai exatamente no limite da última janela. Minutos bastam
+       * para isso; um dia era margem sem critério.
+       *
+       * A rede de segurança continua, mas com o preço certo: de tempo em tempo
+       * (SHOPEE_DEEP_SWEEP_HOURS) uma execução volta a olhar 24h, para pegar
+       * qualquer coisa que a API tenha revelado fora de ordem.
+       */
+      const overlapMinutes = configInt('SHOPEE_OVERLAP_MINUTES', 15, 1, 1440);
+      const deepSweepHours = configInt('SHOPEE_DEEP_SWEEP_HOURS', 12, 1, 168);
+      const lastDeepSweep = cursorState.last_deep_sweep_at
+        ? new Date(cursorState.last_deep_sweep_at)
+        : null;
+      isDeepSweep = !lastDeepSweep
+        || (Date.now() - lastDeepSweep.getTime()) > deepSweepHours * 3600000;
+
+      const overlapMs = isDeepSweep ? 86400000 : overlapMinutes * 60000;
+      since = new Date(watermark.getTime() - overlapMs);
       timeRangeField = 'update_time';
     } else if (saleCount > 0) {
       // Primeira execução após esta migration: revisa alterações remotas dos
@@ -1274,10 +1343,16 @@ router.post('/sync-account', authenticateToken, async (req, res) => {
                 END,
                 last_success_at = NOW(), status = 'success', last_error = NULL,
                 backfill_scanned_through = NULL, backfill_started_at = NULL,
+                -- Só a execução que percorreu a janela larga reinicia o relógio
+                -- da varredura profunda. Uma incremental curta não conta.
+                last_deep_sweep_at = CASE
+                  WHEN $7::boolean THEN NOW() ELSE last_deep_sweep_at
+                END,
                 last_result = $3::jsonb, locked_until = NULL, updated_at = NOW()
           WHERE uid = $4 AND shop_id = $5 AND job_id = $6 AND status = 'running'
         RETURNING job_id`,
-        [upperBound, timeRangeField, JSON.stringify(terminalPayload), targetUid, shopId, clientId]
+        [upperBound, timeRangeField, JSON.stringify(terminalPayload), targetUid, shopId, clientId,
+          isDeepSweep || timeRangeField === 'create_time']
       );
       if (cursorUpdate.rowCount !== 1) throw new Error('A sincronização perdeu a posse do lock antes da conclusão.');
 

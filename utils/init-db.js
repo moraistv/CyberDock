@@ -99,6 +99,7 @@ const schema = {
             backfill_scanned_through TIMESTAMP WITH TIME ZONE,
             backfill_started_at TIMESTAMP WITH TIME ZONE,
             initial_backfill_completed_at TIMESTAMP WITH TIME ZONE,
+            last_deep_sweep_at TIMESTAMP WITH TIME ZONE,
             last_attempt_at TIMESTAMP WITH TIME ZONE,
             last_success_at TIMESTAMP WITH TIME ZONE,
             status VARCHAR(20) NOT NULL DEFAULT 'idle',
@@ -639,6 +640,9 @@ async function syncDatabaseSchema() {
                     await client.query('ALTER TABLE public.shopee_sync_cursors ADD COLUMN IF NOT EXISTS last_result JSONB;');
                     await client.query('ALTER TABLE public.shopee_sync_cursors ADD COLUMN IF NOT EXISTS backfill_scanned_through TIMESTAMP WITH TIME ZONE;');
                     await client.query('ALTER TABLE public.shopee_sync_cursors ADD COLUMN IF NOT EXISTS backfill_started_at TIMESTAMP WITH TIME ZONE;');
+                    // Quando a loja fez por último a varredura profunda de 24h.
+                    // Nulo = nunca fez, então a próxima execução já faz.
+                    await client.query('ALTER TABLE public.shopee_sync_cursors ADD COLUMN IF NOT EXISTS last_deep_sweep_at TIMESTAMP WITH TIME ZONE;');
                 }
                 if (tableName === 'users') {
                     // Verifica e adiciona a coluna 'name' se não existir
