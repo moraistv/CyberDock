@@ -155,13 +155,10 @@ router.get('/user/:userId/billing-summary', authenticateToken, requireOwnerOrMas
     let totalCost = 0;
 
     totalCost = baseCost + additionalCost;
-    
-    // === DEBUG: Log dos valores calculados ===
-    console.log('🔍 DEBUG - Valores calculados:');
-    console.log(`• baseCost: R$ ${baseCost.toFixed(2)}`);
-    console.log(`• additionalCost: R$ ${additionalCost.toFixed(2)}`);
-    console.log(`• totalCost: R$ ${totalCost.toFixed(2)}`);
-    console.log(`• additionalVolume: ${additionalVolume} m³`);
+
+    // Logs de depuração desta rota foram removidos: ela é chamada em toda
+    // abertura de tela de armazenamento e do resumo, e despejava um bloco de
+    // linhas por requisição no log de produção.
 
     // === Armazenamento mensal por SKU (proporcional no mês de entrada) ===
     const now = new Date();

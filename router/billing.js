@@ -56,14 +56,10 @@ async function calculateAndSaveInvoice(client, uid, period) {
   });
   let autoTotal = autoItems.reduce((sum, item) => sum + item.total_price, 0);
 
-  // === 3) Expedições por período (QUERY CORRIGIDA) ===
-  console.log(`[BILLING-FIX] Buscando expedições para ${uid}, período ${period}`);
-  
-  // Usar query corrigida que filtra por processed_at ao invés de created_at
+  // === 3) Expedições do período, filtradas por processed_at (data real da
+  // expedição) e não por sale_date, que colocava a venda no mês errado. ===
   const salesQuery = billingQueryBuilder.buildSalesQuery(uid, year, month);
   const shipmentsRes = await client.query(salesQuery.query, salesQuery.params);
-  
-  console.log(`[BILLING-FIX] Encontradas ${shipmentsRes.rows.length} vendas expedidas no período correto`);
 
   const shipmentSummary = shipmentsRes.rows.reduce((acc, sale) => {
     if (sale.package_type_name && sale.package_type_price) {
