@@ -1008,29 +1008,30 @@ router.get('/separacao', authenticateToken, requireMaster, async (req, res) => {
 
     const prazoDateExpr = `(k.shipping_deadline AT TIME ZONE 'America/Sao_Paulo')::date`;
     const hojeExpr = `(now() AT TIME ZONE 'America/Sao_Paulo')::date`;
-    // Resumo e modalidades numa única consulta: antes eram duas varreduras.
-    const summaryQuery = `
-      WITH ${packageKeysCte}
-      SELECT
-        COUNT(DISTINCT k.package_key) AS total_pacotes,
-        COUNT(*) AS total_itens,
-        COALESCE(SUM(k.quantity), 0) AS total_unidades,
-        COUNT(DISTINCT k.package_key) FILTER (WHERE ${prazoDateExpr} < ${hojeExpr}) AS atrasados,
-        COUNT(DISTINCT k.package_key) FILTER (WHERE ${prazoDateExpr} = ${hojeExpr}) AS despachar_hoje,
-        COUNT(DISTINCT k.uid) AS usuarios_ativos,
-        (
-          SELECT COALESCE(jsonb_object_agg(m.shipping_mode, m.pacotes), '{}'::jsonb)
-            FROM (
-              SELECT k2.shipping_mode, COUNT(DISTINCT k2.package_key) AS pacotes
-                FROM package_keys k2
-               GROUP BY k2.shipping_mode
-            ) m
-        ) AS por_modalidade
-      FROM package_keys k
-    `;
 
-    const dataQuery = `
+    // OTIMIZAÇÃO: Query unificada evita duplo scan de unified_sales
+    // Em vez de Promise.all com 2 queries materializando package_keys separadamente,
+    // fazemos 1 query que retorna summary + dados paginados usando window functions
+    const unifiedQuery = `
       WITH ${packageKeysCte},
+      aggregated_summary AS (
+        SELECT
+          COUNT(DISTINCT k.package_key) AS total_pacotes,
+          COUNT(*) AS total_itens,
+          COALESCE(SUM(k.quantity), 0) AS total_unidades,
+          COUNT(DISTINCT k.package_key) FILTER (WHERE ${prazoDateExpr} < ${hojeExpr}) AS atrasados,
+          COUNT(DISTINCT k.package_key) FILTER (WHERE ${prazoDateExpr} = ${hojeExpr}) AS despachar_hoje,
+          COUNT(DISTINCT k.uid) AS usuarios_ativos,
+          (
+            SELECT COALESCE(jsonb_object_agg(m.shipping_mode, m.pacotes), '{}'::jsonb)
+              FROM (
+                SELECT k2.shipping_mode, COUNT(DISTINCT k2.package_key) AS pacotes
+                  FROM package_keys k2
+                 GROUP BY k2.shipping_mode
+              ) m
+          ) AS por_modalidade
+        FROM package_keys k
+      ),
       selected_packages AS (
         SELECT f.package_key, ${sortAggregate} AS sort_value
           FROM package_keys f
@@ -1038,7 +1039,9 @@ router.get('/separacao', authenticateToken, requireMaster, async (req, res) => {
          ORDER BY sort_value ${sortDirection}, f.package_key
          LIMIT $${paramIdx} OFFSET $${paramIdx + 1}
       )
-      SELECT s.id, s.sku, s.uid, s.account_nickname, s.quantity,
+      SELECT 
+        -- Dados da linha
+        s.id, s.sku, s.uid, s.account_nickname, s.quantity,
         s.marketplace,
         s.marketplace AS channel,
         s.shipping_id,
@@ -1052,13 +1055,9 @@ router.get('/separacao', authenticateToken, requireMaster, async (req, res) => {
         s.shipping_deadline AS shipping_limit_date,
         s.shipping_status,
         s.product_thumbnail,
-        u.name AS user_nickname,
-        (SELECT sk.descricao FROM public.skus sk
-          WHERE sk.user_id = s.uid
-            AND UPPER(TRIM(sk.sku)) = UPPER(TRIM(s.sku))
-            AND sk.descricao IS NOT NULL AND TRIM(sk.descricao) <> ''
-          ORDER BY sk.ativo DESC
-          LIMIT 1) AS sku_descricao,
+        -- Mesmo fallback da tabela de vendas: sem nome no cadastro, usa o e-mail.
+        COALESCE(NULLIF(TRIM(u.name), ''), u.email) AS user_nickname,
+        sk.descricao AS sku_descricao,
         CASE WHEN s.marketplace = 'ML' THEN COALESCE(
           (SELECT oi->'item'->'variation_attributes'
              FROM jsonb_array_elements(COALESCE(s.raw_api_data->'order_items', '[]'::jsonb)) oi
@@ -1072,39 +1071,67 @@ router.get('/separacao', authenticateToken, requireMaster, async (req, res) => {
         ${U_OPERATIONAL_STATUS} AS shipping_status_live,
         s.buyer_name AS buyer_first_name,
         NULL::text AS buyer_last_name,
-        s.buyer_nickname
+        s.buyer_nickname,
+        -- Summary (mesmos valores em todas as linhas via CROSS JOIN)
+        agg.total_pacotes,
+        agg.total_itens,
+        agg.total_unidades,
+        agg.atrasados,
+        agg.despachar_hoje,
+        agg.usuarios_ativos,
+        agg.por_modalidade
       FROM public.unified_sales s
       LEFT JOIN public.users u ON s.uid = u.uid
+      LEFT JOIN LATERAL (
+        SELECT sk_inner.descricao
+        FROM public.skus sk_inner
+        WHERE sk_inner.user_id = s.uid
+          AND UPPER(TRIM(sk_inner.sku)) = UPPER(TRIM(s.sku))
+          AND sk_inner.descricao IS NOT NULL AND TRIM(sk_inner.descricao) <> ''
+        ORDER BY sk_inner.ativo DESC
+        LIMIT 1
+      ) sk ON true
       JOIN selected_packages sp ON sp.package_key = ${packageKeyExpr}
+      CROSS JOIN aggregated_summary agg
       ${whereClause}
       ORDER BY sp.sort_value ${sortDirection}, sp.package_key, s.id, s.sku;
     `;
 
-    const [summaryResult, dataResult] = await Promise.all([
-      db.query(summaryQuery, params),
-      db.query(dataQuery, [...params, limit, offset]),
-    ]);
+    const result = await db.query(unifiedQuery, [...params, limit, offset]);
 
-    const sRow = summaryResult.rows[0] || {};
-    const totalPacotes = parseInt(sRow.total_pacotes, 10) || 0;
-    const totalItens = parseInt(sRow.total_itens, 10) || 0;
-    const porModalidade = {};
-    for (const [mode, count] of Object.entries(sRow.por_modalidade || {})) {
-      porModalidade[mode] = parseInt(count, 10) || 0;
+    // Extrair summary da primeira linha (ou valores padrão se vazio)
+    let summary;
+    if (result.rows.length > 0) {
+      const firstRow = result.rows[0];
+      const porModalidade = {};
+      for (const [mode, count] of Object.entries(firstRow.por_modalidade || {})) {
+        porModalidade[mode] = parseInt(count, 10) || 0;
+      }
+      summary = {
+        totalPacotes: parseInt(firstRow.total_pacotes, 10) || 0,
+        totalItens: parseInt(firstRow.total_itens, 10) || 0,
+        totalUnidades: parseInt(firstRow.total_unidades, 10) || 0,
+        atrasados: parseInt(firstRow.atrasados, 10) || 0,
+        despacharHoje: parseInt(firstRow.despachar_hoje, 10) || 0,
+        usuariosAtivos: parseInt(firstRow.usuarios_ativos, 10) || 0,
+        porModalidade,
+      };
+    } else {
+      summary = {
+        totalPacotes: 0,
+        totalItens: 0,
+        totalUnidades: 0,
+        atrasados: 0,
+        despacharHoje: 0,
+        usuariosAtivos: 0,
+        porModalidade: {},
+      };
     }
 
-    const summary = {
-      totalPacotes,
-      totalItens,
-      totalUnidades: parseInt(sRow.total_unidades, 10) || 0,
-      atrasados: parseInt(sRow.atrasados, 10) || 0,
-      despacharHoje: parseInt(sRow.despachar_hoje, 10) || 0,
-      usuariosAtivos: parseInt(sRow.usuarios_ativos, 10) || 0,
-      porModalidade,
-    };
+    const totalPacotes = summary.totalPacotes;
 
     res.json({
-      items: dataResult.rows,
+      items: result.rows,
       total: totalPacotes,
       page,
       limit,
@@ -1350,7 +1377,10 @@ router.get('/all', authenticateToken, requireMaster, async (req, res) => {
         s.shipping_status, s.updated_at, s.processed_at,
         -- Nome do cliente resolvido DEPOIS do LIMIT: 50 buscas por chave
         -- primária, em vez de juntar a base inteira antes de ordenar.
-        u.name AS user_nickname,
+        -- Cai no e-mail quando o cadastro não tem nome: antes a tela mostrava
+        -- "N/A" como se a venda não tivesse dono, o que aparecia principalmente
+        -- nas lojas Shopee cujo usuário foi criado sem nome.
+        COALESCE(NULLIF(TRIM(u.name), ''), u.email) AS user_nickname,
         -- raw_api_data enxuto: o payload cheio chega a dezenas de KB por linha.
         jsonb_build_object(
           'status', s.order_status,
@@ -1847,16 +1877,40 @@ router.get('/raw/:marketplace/:id/:sku', authenticateToken, async (req, res) => 
 router.get('/user/:uid/stats', authenticateToken, requireOwnerOrMaster, async (req, res) => {
   const { uid } = req.params;
   try {
+    /* Conta nas TABELAS DE ORIGEM, não na view.
+     *
+     * Era o único COUNT(*) do sistema sem teto nem janela sobre
+     * public.unified_sales. O Postgres não elimina colunas não usadas de um
+     * UNION ALL, então mesmo contando linhas ele avaliava a lista de saída da
+     * view para cada linha das duas tabelas: extração de JSONB, regex e cast do
+     * prazo, montagem do nome do comprador. Somando direto nas tabelas, a
+     * contagem usa os índices por uid e não toca em JSON nenhum.
+     */
     const { rows } = await db.query(`
+      WITH ml AS (
+        SELECT
+          COUNT(*)::int AS total,
+          COUNT(*) FILTER (
+            WHERE LOWER(COALESCE(shipping_status, '')) IN
+              ('custom_06_despachado', 'expedited', 'despachado', 'shipped')
+          )::int AS expedited,
+          COUNT(*) FILTER (WHERE processed_at IS NOT NULL)::int AS processed
+        FROM public.sales WHERE uid = $1
+      ), sp AS (
+        SELECT
+          COUNT(*)::int AS total,
+          COUNT(*) FILTER (
+            WHERE LOWER(COALESCE(shipping_status, '')) IN
+              ('custom_06_despachado', 'expedited', 'despachado', 'shipped')
+          )::int AS expedited,
+          COUNT(*) FILTER (WHERE processed_at IS NOT NULL)::int AS processed
+        FROM public.shopee_sales WHERE uid = $1
+      )
       SELECT
-        COUNT(*)::int AS total_sales,
-        COUNT(*) FILTER (
-          WHERE LOWER(COALESCE(shipping_status, '')) IN
-            ('custom_06_despachado', 'expedited', 'despachado', 'shipped')
-        )::int AS expedited_count,
-        COUNT(*) FILTER (WHERE processed_at IS NOT NULL)::int AS processed_count
-      FROM public.unified_sales
-      WHERE uid = $1
+        (ml.total + sp.total)         AS total_sales,
+        (ml.expedited + sp.expedited) AS expedited_count,
+        (ml.processed + sp.processed) AS processed_count
+      FROM ml, sp
     `, [uid]);
     res.json(rows[0] || { total_sales: 0, expedited_count: 0, processed_count: 0 });
   } catch (error) {
@@ -1881,6 +1935,14 @@ router.get('/user/:uid', authenticateToken, requireOwnerOrMaster, async (req, re
   const { uid } = req.params;
   if (!uid) return res.status(400).json({ error: 'O UID do usuário é obrigatório.' });
   try {
+    /* raw_api_data ENXUTO.
+     *
+     * Esta rota devolvia o payload cru do pedido para 250 linhas. O payload
+     * completo do ML passa de dezenas de KB por venda, então a resposta chegava
+     * a vários MB — baixados e parseados a cada abertura da tela, para exibir
+     * meia dúzia de campos. Aqui vão apenas os caminhos que as telas usam, no
+     * mesmo formato de /sales/all e /sales/my-sales.
+     */
     const query = `
       SELECT s.id, s.sku, s.uid,
              s.account_id            AS seller_id,
@@ -1890,7 +1952,25 @@ router.get('/user/:uid', authenticateToken, requireOwnerOrMaster, async (req, re
              s.shipping_mode,
              s.shipping_deadline     AS shipping_limit_date,
              s.shipping_status, s.order_status, s.product_thumbnail,
-             s.raw_api_data, s.updated_at, s.processed_at
+             jsonb_build_object(
+               'status', s.order_status,
+               'tags', COALESCE(s.raw_api_data->'tags', '[]'::jsonb),
+               'sla_data', jsonb_build_object('expected_date', s.shipping_deadline),
+               'shipping', jsonb_build_object(
+                 'id', s.shipping_id,
+                 'logistic_type', s.raw_api_data->'shipping'->>'logistic_type'
+               ),
+               'seller', jsonb_build_object('id', s.account_id),
+               'buyer', jsonb_build_object(
+                 'first_name', s.buyer_name,
+                 'last_name', NULL,
+                 'nickname', s.buyer_nickname
+               )
+             )                       AS raw_api_data,
+             s.buyer_name            AS buyer_first_name,
+             NULL::text              AS buyer_last_name,
+             s.buyer_nickname,
+             s.updated_at, s.processed_at
       FROM public.unified_sales s
       WHERE s.uid = $1
       ORDER BY s.sale_date DESC
@@ -2815,6 +2895,30 @@ router.post('/sync-account', authenticateToken, async (req, res) => {
     };
 
     if (orderSummaries.length === 0) {
+      /* Marca o ponto até onde já procuramos, mesmo sem ter achado nada.
+       *
+       * Sem isto, uma conta sem vendas na janela ficava presa em modo completo
+       * PARA SEMPRE: não havia linha em `sales`, então /last-sync devolvia null,
+       * o frontend mandava force=true e a sincronização varria 180 dias de novo
+       * em TODO clique. Com 32 contas, algumas nessa situação, era a maior
+       * parcela do tempo do botão Sincronizar.
+       *
+       * A marca é o instante da varredura: a próxima execução parte daqui e
+       * passa a ser incremental.
+       */
+      if (searchFullyConsumed) {
+        await db.query(
+          `INSERT INTO public.ml_sync_cursors (uid, seller_id, last_remote_updated_at, updated_at)
+           VALUES ($1, $2, $3, NOW())
+           ON CONFLICT (uid, seller_id) DO UPDATE
+               SET last_remote_updated_at = GREATEST(
+                     public.ml_sync_cursors.last_remote_updated_at,
+                     EXCLUDED.last_remote_updated_at
+                   ),
+                   updated_at = NOW()`,
+          [targetUid, userId, new Date()]
+        );
+      }
       sendEvent(clientId, { progress: 100, message: `[${nickname}] Nenhuma venda nova encontrada. Tudo atualizado!`, type: 'success', newSalesCount: 0, updatedCount: 0, skippedCount: 0, workCompleted: 1, workTotal: 1 });
       return;
     }
@@ -3227,14 +3331,35 @@ router.get('/last-sync/:mlAccountId', authenticateToken, async (req, res) => {
       }
     }
 
-    // Busca a última venda sincronizada para esta conta
+    /* Considera o CURSOR, não apenas a existência de vendas.
+     *
+     * O frontend usa esta resposta para decidir `force` (e `backfill`): sem
+     * lastSync, ele pede sincronização completa de 180 dias. Olhar só
+     * MAX(updated_at) em `sales` fazia com que TODA conta sem vendas salvas
+     * — loja nova, conta sem pedidos na janela, conta cujo dono foi remapeado —
+     * caísse no modo completo em cada clique, para sempre.
+     *
+     * O cursor em ml_sync_cursors é a marca de "já varri até aqui", e é gravado
+     * mesmo quando a busca não devolve nenhum pedido. Com ele, essas contas
+     * passam a ser incrementais a partir da segunda execução.
+     */
     const lastSyncRes = await db.query(
-      `SELECT MAX(updated_at) AS last_sale FROM public.sales WHERE uid = $1 AND seller_id = $2`,
+      `SELECT GREATEST(
+                COALESCE((SELECT MAX(updated_at)
+                            FROM public.sales
+                           WHERE uid = $1 AND seller_id = $2), 'epoch'::timestamptz),
+                COALESCE((SELECT last_remote_updated_at
+                            FROM public.ml_sync_cursors
+                           WHERE uid = $1 AND seller_id = $2), 'epoch'::timestamptz)
+              ) AS last_sale`,
       [targetUid, mlAccountId]
     );
- 
-    const lastSync = lastSyncRes.rows[0]?.last_sale;
-    
+
+    const raw = lastSyncRes.rows[0]?.last_sale;
+    // GREATEST com o fallback 'epoch' nunca devolve null: epoch significa que
+    // não há nem venda nem cursor, ou seja, conta realmente nunca sincronizada.
+    const lastSync = raw && new Date(raw).getTime() > 0 ? new Date(raw) : null;
+
     res.json({
       lastSync: lastSync ? lastSync.toISOString() : null,
       accountId: mlAccountId,

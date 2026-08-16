@@ -370,15 +370,20 @@ router.patch('/invoices/:uid/:period/status', authenticateToken, requireMaster, 
       paidDate = parsed.toISOString().slice(0, 10);
     }
 
+    // O cast em $1 é obrigatório: o mesmo parâmetro alimenta uma coluna
+    // VARCHAR (status) e uma comparação com literal de texto no CASE. Sem ele o
+    // Postgres tenta deduzir dois tipos para o mesmo parâmetro e recusa a query
+    // com 42P08 ("inconsistent types deduced ... text versus character varying").
+    const isPaid = status === 'paid';
     const { rows, rowCount } = await db.query(`
       UPDATE public.invoices
-         SET status = $1,
-             payment_date = $2,
-             paid_at = CASE WHEN $1 = 'paid' THEN NOW() ELSE NULL END,
-             paid_by = CASE WHEN $1 = 'paid' THEN $3 ELSE NULL END
-       WHERE uid = $4 AND period = $5
+         SET status = $1::varchar,
+             payment_date = $2::date,
+             paid_at = CASE WHEN $3::boolean THEN NOW() ELSE NULL END,
+             paid_by = CASE WHEN $3::boolean THEN $4::varchar ELSE NULL END
+       WHERE uid = $5 AND period = $6
        RETURNING id, uid, period, status, payment_date, paid_at, paid_by, total_amount;
-    `, [status, paidDate, req.user.email || req.user.uid, uid, period]);
+    `, [status, paidDate, isPaid, req.user.email || req.user.uid, uid, period]);
 
     if (rowCount === 0) {
       return res.status(404).json({ error: 'Fatura não encontrada para este cliente e competência.' });
