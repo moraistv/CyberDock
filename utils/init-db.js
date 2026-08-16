@@ -661,39 +661,72 @@ async function syncDatabaseSchema() {
         await client.query('SET LOCAL statement_timeout = 0;');
 
         // Coluna dedicada com o date_last_updated do pedido (cursor confiável de
-        // mudança). Extraída no momento de salvar; aqui fazemos o backfill dos
-        // registros existentes a partir do raw_api_data (uma vez).
+        // mudança). Extraída no momento de salvar; o backfill abaixo cobre os
+        // registros que já existiam antes da coluna.
         await client.query('ALTER TABLE public.sales ADD COLUMN IF NOT EXISTS date_last_updated TIMESTAMPTZ;');
-        await client.query(`
-            UPDATE public.sales
-               SET date_last_updated = (raw_api_data->>'date_last_updated')::timestamptz
-             WHERE date_last_updated IS NULL
-               AND raw_api_data ? 'date_last_updated'
-               AND (raw_api_data->>'date_last_updated') ~ '^[0-9]{4}-';
-        `);
-
         // Assinatura de mudança relevante: status | shipping.status |
         // shipping.substatus | tags(ordenadas). Se não muda, o pedido não teve
         // mudança real (só "bump" interno do ML) e pode ser pulado sem baixar.
         await client.query('ALTER TABLE public.sales ADD COLUMN IF NOT EXISTS sync_signature TEXT;');
-        await client.query(`
-            UPDATE public.sales
-               SET sync_signature =
-                     COALESCE(raw_api_data->>'status','') || '|' ||
-                     COALESCE(raw_api_data->'shipping'->>'status','') || '|' ||
-                     COALESCE(raw_api_data->'shipping'->>'substatus','') || '|' ||
-                     COALESCE(
-                       CASE
-                         WHEN jsonb_typeof(raw_api_data->'tags') = 'array'
-                         THEN (SELECT string_agg(t, ',' ORDER BY t)
-                                 FROM jsonb_array_elements_text(raw_api_data->'tags') t)
-                         ELSE ''
-                       END,
-                       ''
-                     )
-             WHERE sync_signature IS NULL
-               AND raw_api_data IS NOT NULL;
-        `);
+
+        /* Os dois backfills abaixo rodam UMA VEZ na vida do banco.
+         *
+         * Eles são filtrados por `coluna IS NULL`, e não existe índice que
+         * responda isso: o Postgres varria public.sales inteira em TODO boot.
+         * Medido em produção: 17 dos 19 segundos da sincronização de esquema,
+         * em uma etapa que já não tinha nada para fazer.
+         *
+         * Pior que o tempo: a varredura acontece DENTRO da transação que acabou
+         * de pegar AccessExclusiveLock em `sales` pelos ALTER TABLE acima. Toda
+         * requisição que tocasse vendas ficava parada esses 17 segundos a cada
+         * deploy — a mesma forma do deadlock que já derrubou o boot antes.
+         *
+         * Linha que continue nula depois disso é fail-safe: `date_last_updated`
+         * nulo apenas não entra no MAX do cursor (que tem ml_sync_cursors como
+         * fonte primária), e `sync_signature` nula conta como "diferente" e
+         * força a atualização. A sincronização preenche as duas no primeiro
+         * ciclo em que tocar o pedido.
+         */
+        const BACKFILL_KEY = 'sales_sync_columns_backfilled';
+        const backfillDone = await client.query(
+            `SELECT 1 FROM public.system_settings WHERE key = $1`,
+            [BACKFILL_KEY]
+        );
+
+        if (backfillDone.rowCount === 0) {
+            console.log('      -> Backfill único de date_last_updated e sync_signature...');
+            await client.query(`
+                UPDATE public.sales
+                   SET date_last_updated = (raw_api_data->>'date_last_updated')::timestamptz
+                 WHERE date_last_updated IS NULL
+                   AND raw_api_data ? 'date_last_updated'
+                   AND (raw_api_data->>'date_last_updated') ~ '^[0-9]{4}-';
+            `);
+            await client.query(`
+                UPDATE public.sales
+                   SET sync_signature =
+                         COALESCE(raw_api_data->>'status','') || '|' ||
+                         COALESCE(raw_api_data->'shipping'->>'status','') || '|' ||
+                         COALESCE(raw_api_data->'shipping'->>'substatus','') || '|' ||
+                         COALESCE(
+                           CASE
+                             WHEN jsonb_typeof(raw_api_data->'tags') = 'array'
+                             THEN (SELECT string_agg(t, ',' ORDER BY t)
+                                     FROM jsonb_array_elements_text(raw_api_data->'tags') t)
+                             ELSE ''
+                           END,
+                           ''
+                         )
+                 WHERE sync_signature IS NULL
+                   AND raw_api_data IS NOT NULL;
+            `);
+            await client.query(
+                `INSERT INTO public.system_settings (key, value, updated_at)
+                 VALUES ($1, to_jsonb(NOW()::text), NOW())
+                 ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value, updated_at = NOW()`,
+                [BACKFILL_KEY]
+            );
+        }
 
         /* Estado remoto comparável do pedido: date_last_updated | status | tags.
          *
@@ -801,18 +834,40 @@ async function syncDatabaseSchema() {
         // ship_by_date NÃO entra aqui: sempre foi gravado como instante real
         // (new Date(epoch * 1000)) e já exibe o prazo correto.
         // ------------------------------------------------------------------
-        console.log('   -> Corrigindo fuso da data de venda da Shopee (se necessário)...');
-        const shopeeTzFix = await client.query(`
-            UPDATE public.shopee_sales
-               SET sale_date = to_timestamp((raw_api_data->>'create_time')::double precision)
-             WHERE raw_api_data ? 'create_time'
-               AND (raw_api_data->>'create_time') ~ '^[0-9]+$'
-               AND (raw_api_data->>'create_time')::double precision > 0
-               AND sale_date IS DISTINCT FROM
-                   to_timestamp((raw_api_data->>'create_time')::double precision);
-        `);
-        if (shopeeTzFix.rowCount > 0) {
-            console.log(`   -> ${shopeeTzFix.rowCount} venda(s) Shopee com data corrigida.`);
+        /* Correção de legado, também UMA VEZ na vida do banco.
+         *
+         * `raw_api_data ? 'create_time'` obriga a ler o JSONB (TOAST) de TODA
+         * linha de shopee_sales só para descobrir que não há nada a corrigir,
+         * dentro da mesma transação que mantém lock em shopee_sales. O caminho
+         * de gravação já usa toSaleInstant(create_time) e o upsert sempre grava
+         * sale_date, então nenhuma linha nova precisa desta correção.
+         */
+        const SHOPEE_TZ_KEY = 'shopee_sale_date_tz_fixed';
+        const shopeeTzDone = await client.query(
+            `SELECT 1 FROM public.system_settings WHERE key = $1`,
+            [SHOPEE_TZ_KEY]
+        );
+
+        if (shopeeTzDone.rowCount === 0) {
+            console.log('   -> Corrigindo fuso da data de venda da Shopee (uma vez)...');
+            const shopeeTzFix = await client.query(`
+                UPDATE public.shopee_sales
+                   SET sale_date = to_timestamp((raw_api_data->>'create_time')::double precision)
+                 WHERE raw_api_data ? 'create_time'
+                   AND (raw_api_data->>'create_time') ~ '^[0-9]+$'
+                   AND (raw_api_data->>'create_time')::double precision > 0
+                   AND sale_date IS DISTINCT FROM
+                       to_timestamp((raw_api_data->>'create_time')::double precision);
+            `);
+            if (shopeeTzFix.rowCount > 0) {
+                console.log(`   -> ${shopeeTzFix.rowCount} venda(s) Shopee com data corrigida.`);
+            }
+            await client.query(
+                `INSERT INTO public.system_settings (key, value, updated_at)
+                 VALUES ($1, to_jsonb(NOW()::text), NOW())
+                 ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value, updated_at = NOW()`,
+                [SHOPEE_TZ_KEY]
+            );
         }
 
         await client.query('COMMIT');
