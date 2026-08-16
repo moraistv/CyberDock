@@ -474,43 +474,19 @@ async function syncDatabaseSchema() {
          * shipping apenas com o id. As duas nunca batiam e o sync refazia
          * detalhe + shipment + SLA de todos os pedidos em cada execução.
          */
-        await client.query('ALTER TABLE public.sales ADD COLUMN IF NOT EXISTS remote_state TEXT;');
-        /* Roda UMA única vez.
+        /* Apenas cria a coluna. NÃO existe backfill em massa aqui.
          *
-         * Depois da carga inicial, `remote_state` nulo passa a ter significado:
-         * é a marca de "enriquecimento incompleto, precisa tentar de novo".
-         * Se esta migração rodasse em todo boot, ela preencheria essa marca a
-         * partir de um raw_api_data incompleto e o pedido seria pulado para
-         * sempre com dado faltando.
+         * A primeira versão desta migração fazia UPDATE em toda a tabela
+         * `sales` no boot. Com a base real isso passa dos 30s de
+         * `query_timeout`, a exceção abortava `syncDatabaseSchema` e o
+         * servidor entrava em loop de reinício ("Falha crítica ao inicializar
+         * o banco de dados"), derrubando o sistema inteiro.
+         *
+         * Backfill é desnecessário: `remote_state` nulo já significa "preciso
+         * reavaliar este pedido". A própria sincronização preenche o valor no
+         * primeiro ciclo, pedido por pedido, sem varrer a tabela.
          */
-        const remoteStateSeeded = await client.query(
-            `SELECT 1 FROM public.system_settings WHERE key = 'sales_remote_state_backfilled'`
-        );
-        if (remoteStateSeeded.rowCount === 0) {
-        await client.query(`
-            UPDATE public.sales
-               SET remote_state =
-                     COALESCE(raw_api_data->>'date_last_updated','') || '|' ||
-                     COALESCE(raw_api_data->>'status','') || '|' ||
-                     COALESCE(
-                       CASE
-                         WHEN jsonb_typeof(raw_api_data->'tags') = 'array'
-                         THEN (SELECT string_agg(t, ',' ORDER BY t)
-                                 FROM jsonb_array_elements_text(raw_api_data->'tags') t)
-                         ELSE ''
-                       END,
-                       ''
-                     )
-             WHERE remote_state IS NULL
-               AND raw_api_data IS NOT NULL;
-        `);
-            await client.query(
-                `INSERT INTO public.system_settings (key, value, updated_at)
-                 VALUES ('sales_remote_state_backfilled', 'true'::jsonb, NOW())
-                 ON CONFLICT (key) DO NOTHING`
-            );
-            console.log('   -> remote_state preenchido para vendas existentes (uma única vez).');
-        }
+        await client.query('ALTER TABLE public.sales ADD COLUMN IF NOT EXISTS remote_state TEXT;');
 
         await client.query('CREATE UNIQUE INDEX IF NOT EXISTS idx_sales_id_sku_uid_unique ON public.sales(id, sku, uid);');
         await client.query('CREATE INDEX IF NOT EXISTS idx_sales_seller_id ON public.sales(seller_id);');
