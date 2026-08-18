@@ -194,14 +194,36 @@ router.get('/auth', (req, res) => {
 
 /* ----------------------------- OAuth: Conclusão ---------------------------- */
 /**
+ * Registra a chegada da conclusão do OAuth ANTES da autenticação.
+ *
+ * `authenticateToken` devolve 401 sem logar quando o header Authorization não
+ * vem. Como o `code` da Shopee é de uso único, esse caso queimava a
+ * autorização sem deixar nenhum vestígio no servidor: a loja aparecia
+ * autorizada na Shopee e não existia em `shopee_accounts`, sem erro de banco
+ * nenhum para investigar. Aqui a tentativa fica registrada de qualquer forma.
+ */
+function logConnectAttempt(req, res, next) {
+  if (!req.headers['authorization']) {
+    console.warn(
+      `[Shopee Connect] Chegou SEM credencial (401): shop=${req.body?.shopId || 'desconhecida'}. ` +
+      'A autorização da Shopee foi perdida; o usuário precisa conectar novamente.'
+    );
+  }
+  next();
+}
+
+/**
  * Conclui a conexão da loja. Chamado pelo FRONTEND (página /shopee/callback)
  * com o `code` e o `shop_id` que a Shopee devolveu, autenticado por JWT.
  */
-router.post('/connect', authenticateToken, async (req, res) => {
+router.post('/connect', logConnectAttempt, authenticateToken, async (req, res) => {
   const { code, shopId } = req.body;
   const { uid } = req.user;
 
+  console.log(`[Shopee Connect] Tentativa: uid=${uid} shop=${shopId}`);
+
   if (!code || !shopId) {
+    console.warn(`[Shopee Connect] Recusado: uid=${uid} sem code ou shopId.`);
     return res.status(400).json({ error: 'Parâmetros code e shopId são obrigatórios.' });
   }
 
