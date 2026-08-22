@@ -49,7 +49,16 @@ app.use((err, req, res, next) => {
   });
 });
 
-app.listen(PORT, async () => {
+async function startServer() {
+  // O schema é parte da prontidão: não aceite OAuth nem marque /health como
+  // saudável antes de todas as tabelas obrigatórias estarem disponíveis.
   await initializeDatabase();
-  console.log(`🚀 Servidor backend rodando na porta ${PORT}`);
+  app.listen(PORT, () => {
+    console.log(`🚀 Servidor backend rodando na porta ${PORT}`);
+  });
+}
+
+startServer().catch((error) => {
+  console.error('Falha crítica ao iniciar o servidor:', error);
+  process.exit(1);
 });

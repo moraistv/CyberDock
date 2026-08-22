@@ -77,6 +77,19 @@ const schema = {
             value JSONB,
             updated_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
         );`,
+    shopee_oauth_attempts: `
+        CREATE TABLE IF NOT EXISTS public.shopee_oauth_attempts (
+            state_hash CHAR(64) PRIMARY KEY,
+            uid VARCHAR(255) NOT NULL REFERENCES public.users(uid) ON DELETE CASCADE,
+            expires_at TIMESTAMP WITH TIME ZONE NOT NULL,
+            claim_id UUID,
+            claimed_at TIMESTAMP WITH TIME ZONE,
+            consumed_at TIMESTAMP WITH TIME ZONE,
+            shop_id BIGINT,
+            created_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT CURRENT_TIMESTAMP
+        );
+        CREATE INDEX IF NOT EXISTS idx_shopee_oauth_attempts_expires
+            ON public.shopee_oauth_attempts (expires_at);`,
     shopee_accounts: `
         CREATE TABLE public.shopee_accounts (
             uid VARCHAR(255) NOT NULL,
@@ -626,7 +639,8 @@ async function syncDatabaseSchema() {
         const tablesInOrder = [
             'users', 'package_types', 'services', 'ml_accounts', 'ml_sync_cursors', 'system_settings',
             'user_statuses', 'user_contracts', 'skus', 'sku_kit_components', 'kit_parents', 'sales', 'stock_movements',
-            'invoices', 'invoice_items', 'shopee_accounts', 'shopee_sync_cursors', 'shopee_sync_jobs', 'shopee_sales'
+            'invoices', 'invoice_items', 'shopee_oauth_attempts', 'shopee_accounts',
+            'shopee_sync_cursors', 'shopee_sync_jobs', 'shopee_sales'
         ];
 
         await client.query('BEGIN');
@@ -636,6 +650,15 @@ async function syncDatabaseSchema() {
                 await client.query(schema[tableName]);
             } else {
                 // Lógica de migração para tabelas existentes
+                if (tableName === 'shopee_oauth_attempts') {
+                    await client.query('ALTER TABLE public.shopee_oauth_attempts ADD COLUMN IF NOT EXISTS claim_id UUID;');
+                    await client.query('ALTER TABLE public.shopee_oauth_attempts ADD COLUMN IF NOT EXISTS claimed_at TIMESTAMP WITH TIME ZONE;');
+                    await client.query('ALTER TABLE public.shopee_oauth_attempts ADD COLUMN IF NOT EXISTS shop_id BIGINT;');
+                    await client.query(`
+                        CREATE INDEX IF NOT EXISTS idx_shopee_oauth_attempts_expires
+                            ON public.shopee_oauth_attempts (expires_at)
+                    `);
+                }
                 if (tableName === 'shopee_sync_cursors') {
                     await client.query('ALTER TABLE public.shopee_sync_cursors ADD COLUMN IF NOT EXISTS last_result JSONB;');
                     await client.query('ALTER TABLE public.shopee_sync_cursors ADD COLUMN IF NOT EXISTS backfill_scanned_through TIMESTAMP WITH TIME ZONE;');
