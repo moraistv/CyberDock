@@ -521,6 +521,27 @@ async function persistShopeeAccount({ uid, code, shopId, attempt, requestId }) {
     }
     console.log(`[Shopee Connect ${requestId}] Token recebido para shop=${tokens.shop_id}.`);
 
+    /* A mesma loja já vinculada a outro usuário.
+     *
+     * A Shopee emite tokens por loja: autorizar de novo invalida o token de
+     * quem tinha antes, e a sincronização do outro usuário passa a falhar sem
+     * explicação. Não bloqueamos aqui para não impedir uma troca legítima de
+     * responsável, mas o registro deixa o caso visível no servidor. */
+    try {
+      const { rows } = await db.query(
+        `SELECT uid FROM public.shopee_accounts WHERE shop_id = $1 AND uid <> $2`,
+        [String(tokens.shop_id), uid]
+      );
+      if (rows.length) {
+        console.warn(
+          `[Shopee Connect ${requestId}] Loja ${tokens.shop_id} já estava vinculada a ` +
+          `${rows.map((r) => r.uid).join(', ')}; o token anterior deixa de valer.`
+        );
+      }
+    } catch (error) {
+      console.warn(`[Shopee Connect ${requestId}] Não foi possível checar vínculo anterior:`, error.message);
+    }
+
     const expiresAt = new Date(Date.now() + Math.max(30, expiresIn - 60) * 1000);
     const shopName = await getShopeeShopName(tokens.shop_id, tokens.access_token, partnerId, partnerKey);
     const upsertQuery = `
