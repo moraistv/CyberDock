@@ -896,8 +896,8 @@ function firstShopeeResult(payload) {
 /**
  * Conta da loja com token utilizável.
  *
- * Sempre escopada ao UID do token: um usuário nunca alcança a loja de outro,
- * nem passando shopId na query.
+ * Escopada ao UID dono da loja, resolvido por `readLabelQuery`: usuário comum
+ * fica preso ao próprio UID do token, só o master pode apontar outro dono.
  */
 async function loadShopeeAccountForLabel(uid, shopId) {
   const { rows } = await db.query(
@@ -942,7 +942,17 @@ async function findShopeeSaleForLabel(uid, shopId, orderSn) {
 }
 
 function readLabelQuery(req) {
+  /* Dono da loja.
+   *
+   * O tabelão master lista vendas de todos os clientes, então ele precisa
+   * imprimir em nome do dono. Só papel master pode indicar `ownerUid`; para
+   * qualquer outro usuário o parâmetro é ignorado e vale o UID do token, o que
+   * mantém o isolamento entre contas. */
+  const requestedOwner = String(req.query.ownerUid || req.query.owner_uid || '').trim();
+  const ownerUid = req.user.role === 'master' && requestedOwner ? requestedOwner : req.user.uid;
+
   return {
+    ownerUid,
     orderSn: String(req.query.orderSn || req.query.order_sn || '').trim(),
     shopId: String(req.query.shopId || req.query.shop_id || '').trim(),
     packageNumber: String(req.query.packageNumber || req.query.package_number || '').trim() || null,
@@ -955,13 +965,13 @@ function readLabelQuery(req) {
  * por quê — em português, para a tela mostrar direto ao operador.
  */
 router.get('/label-info', authenticateToken, async (req, res) => {
-  const { orderSn, shopId, packageNumber, documentType } = readLabelQuery(req);
+  const { ownerUid, orderSn, shopId, packageNumber, documentType } = readLabelQuery(req);
   if (!orderSn || !/^\d+$/.test(shopId)) {
     return res.status(400).json({ error: 'Informe orderSn e shopId válidos.' });
   }
 
   try {
-    const loaded = await loadShopeeAccountForLabel(req.user.uid, shopId);
+    const loaded = await loadShopeeAccountForLabel(ownerUid, shopId);
     if (loaded.error === 'account_not_found') {
       return res.status(404).json({ canPrint: false, reason: 'Loja Shopee não conectada nesta conta.' });
     }
@@ -969,7 +979,7 @@ router.get('/label-info', authenticateToken, async (req, res) => {
       return res.status(500).json({ canPrint: false, reason: 'Credenciais Shopee ausentes no servidor.' });
     }
     const { account, partnerId, partnerKey } = loaded;
-    const sale = await findShopeeSaleForLabel(req.user.uid, shopId, orderSn);
+    const sale = await findShopeeSaleForLabel(ownerUid, shopId, orderSn);
 
     // get_shipping_parameter é o que acusa nota fiscal pendente/recusada.
     const parameter = await withTokenRetry(
@@ -1057,7 +1067,7 @@ router.get('/label-info', authenticateToken, async (req, res) => {
  * `logistics.download_later`, então a espera é curta e limitada.
  */
 router.get('/download-label', authenticateToken, async (req, res) => {
-  const { orderSn, shopId, packageNumber, documentType } = readLabelQuery(req);
+  const { ownerUid, orderSn, shopId, packageNumber, documentType } = readLabelQuery(req);
   if (!orderSn || !/^\d+$/.test(shopId)) {
     return res.status(400).json({ error: 'Informe orderSn e shopId válidos.' });
   }
@@ -1070,12 +1080,12 @@ router.get('/download-label', authenticateToken, async (req, res) => {
   });
 
   try {
-    const loaded = await loadShopeeAccountForLabel(req.user.uid, shopId);
+    const loaded = await loadShopeeAccountForLabel(ownerUid, shopId);
     if (loaded.error === 'account_not_found') return fail(404, null, 'Loja Shopee não conectada nesta conta.');
     if (loaded.error === 'server_config') return fail(500, null, 'Credenciais Shopee ausentes no servidor.');
 
     const { account, partnerId, partnerKey } = loaded;
-    const sale = await findShopeeSaleForLabel(req.user.uid, shopId, orderSn);
+    const sale = await findShopeeSaleForLabel(ownerUid, shopId, orderSn);
 
     /* Se o documento já existe, o download funciona mesmo sem rastreio nosso.
      * Só quando ele não existe é que a falta de rastreio é impedimento real. */
