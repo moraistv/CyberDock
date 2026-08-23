@@ -847,7 +847,7 @@ router.delete('/contas/:shopId', authenticateToken, async (req, res) => {
 const SHOPEE_LABEL_MESSAGES = {
   'logistics.lack_of_invoice_data': 'A Shopee não liberou a etiqueta porque a nota fiscal não foi enviada, ou foi recusada pela SEFAZ. Emita ou corrija a NF e tente novamente.',
   'logistics.order_status_error': 'O status do pedido ainda não permite imprimir a etiqueta.',
-  'logistics.package_can_not_print': 'A Shopee ainda não liberou a impressão deste pacote.',
+  'logistics.package_can_not_print': 'A Shopee ainda não liberou a impressão deste pacote. Normalmente falta agendar o envio (coleta ou postagem) na Shopee, o que é o que gera o código de rastreio da etiqueta.',
   'logistics.tracking_number_invalid': 'O código de rastreio do pedido ainda não é válido para gerar a etiqueta.',
   'logistics.can_not_print_combine_order': 'Este pedido faz parte de um pacote combinado: a etiqueta só sai pelo Seller Center da Shopee.',
   'logistics.can_not_print_jit_order': 'Este canal de envio só permite imprimir pelo Seller Center da Shopee.',
@@ -870,6 +870,17 @@ const SHOPEE_LABEL_TYPES = {
 };
 
 const waitBeforeRetry = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+
+/* Sem rastreio não existe etiqueta.
+ *
+ * A documentação é explícita: create_shipping_document "is only available after
+ * retrieving the tracking number", e o rastreio só aparece depois que o envio é
+ * agendado (coleta ou postagem). Enquanto isso a Shopee recusa com
+ * `logistics.package_can_not_print`, que sozinho não diz o que fazer. Avisamos
+ * antes de gastar a chamada. */
+const SHOPEE_AWAITING_SHIPMENT_REASON = 'A Shopee ainda não gerou o código de rastreio deste pedido. '
+  + 'A etiqueta só é liberada depois que o envio é agendado (coleta ou postagem) na Shopee. '
+  + 'Agende o envio e sincronize as vendas para atualizar aqui.';
 
 /** Traduz o código da Shopee, mantendo o texto original como último recurso. */
 function shopeeLabelMessage(code, fallback) {
@@ -1004,6 +1015,18 @@ router.get('/label-info', authenticateToken, async (req, res) => {
       });
     }
 
+    // Documento pronto dispensa rastreio: a etiqueta já existe na Shopee.
+    if (item?.status !== 'READY' && !sale?.tracking_number) {
+      return res.json({
+        canPrint: false,
+        requiresInvoice: false,
+        awaitingShipment: true,
+        status: 'awaiting_shipment',
+        code: null,
+        reason: SHOPEE_AWAITING_SHIPMENT_REASON,
+      });
+    }
+
     return res.json({
       canPrint: true,
       status: item?.status === 'READY' ? 'ready' : 'pending_creation',
@@ -1039,10 +1062,11 @@ router.get('/download-label', authenticateToken, async (req, res) => {
     return res.status(400).json({ error: 'Informe orderSn e shopId válidos.' });
   }
 
-  const fail = (status, code, message) => res.status(status).json({
+  const fail = (status, code, message, extra = {}) => res.status(status).json({
     error: shopeeLabelMessage(code, message),
     code: code || null,
     requiresInvoice: code === 'logistics.lack_of_invoice_data',
+    ...extra,
   });
 
   try {
@@ -1052,6 +1076,23 @@ router.get('/download-label', authenticateToken, async (req, res) => {
 
     const { account, partnerId, partnerKey } = loaded;
     const sale = await findShopeeSaleForLabel(req.user.uid, shopId, orderSn);
+
+    /* Se o documento já existe, o download funciona mesmo sem rastreio nosso.
+     * Só quando ele não existe é que a falta de rastreio é impedimento real. */
+    if (!sale?.tracking_number) {
+      const existing = await withTokenRetry(
+        account,
+        (accessToken) => getShopeeShippingDocumentResult({
+          partnerId, partnerKey, accessToken, shopId: account.shopId, orderSn, packageNumber, documentType,
+        }),
+        partnerId,
+        partnerKey
+      );
+      if (firstShopeeResult(existing)?.status !== 'READY') {
+        console.warn(`[Shopee Label] Pedido ${orderSn} sem rastreio: envio ainda não agendado.`);
+        return fail(409, null, SHOPEE_AWAITING_SHIPMENT_REASON, { awaitingShipment: true });
+      }
+    }
 
     const creation = await withTokenRetry(
       account,
