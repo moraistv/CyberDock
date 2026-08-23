@@ -1080,7 +1080,10 @@ router.get('/filter-options', authenticateToken, requireMaster, async (req, res)
 // período de venda, prazo para despachar, modalidade, conta e usuário.
 // Retorna { items, total, summary } — o resumo é agregado sobre TODO o
 // conjunto filtrado (não apenas a página), para os cards e o relatório PDF.
-function buildSeparacaoWhere(req) {
+function buildSeparacaoWhere(req, skip = []) {
+  // `skip` deixa de fora um filtro específico: é o que permite montar as
+  // opções cruzadas (cada faceta aplica os outros filtros, menos ela mesma).
+  const uses = (name) => !skip.includes(name);
   const conditions = [];
   const params = [];
   let paramIdx = 1;
@@ -1117,7 +1120,7 @@ function buildSeparacaoWhere(req) {
   }
   // Canal: permite separar só ML, só Shopee, ou os dois (padrão).
   const marketplace = (req.query.marketplace || '').trim();
-  if (marketplace) {
+  if (uses('marketplace') && marketplace) {
     conditions.push(`s.marketplace = ANY($${paramIdx})`);
     params.push(marketplace.split(',').map((v) => v.trim()).filter(Boolean));
     paramIdx++;
@@ -1134,18 +1137,25 @@ function buildSeparacaoWhere(req) {
     params.push(shippingLimitEnd + 'T23:59:59.999-03:00');
     paramIdx++;
   }
-  if (shippingMode) {
+  if (uses('shippingMode') && shippingMode) {
     // Modalidade canônica: cobre logistic_type do ML e transportadora Shopee.
     conditions.push(`${U_SHIPPING_MODE} = ANY($${paramIdx})`);
     params.push(shippingMode.split(',').map((m) => m.trim()).filter(Boolean));
     paramIdx++;
   }
-  if (account) {
-    conditions.push(`(s.account_id = $${paramIdx} OR s.account_nickname ILIKE $${paramIdx + 1})`);
-    params.push(account, `%${account}%`);
-    paramIdx += 2;
+  if (uses('account') && account) {
+    // Chave com canal (ML:123 / Shopee:456) primeiro: contas de canais
+    // diferentes costumam usar o MESMO nome, e comparar por nome misturava as
+    // duas. Id e apelido seguem aceitos para links antigos.
+    conditions.push(`(
+      (s.marketplace || ':' || s.account_id) = ANY($${paramIdx})
+      OR s.account_id = ANY($${paramIdx})
+      OR s.account_nickname = ANY($${paramIdx})
+    )`);
+    params.push(account.split(',').map((v) => v.trim()).filter(Boolean));
+    paramIdx++;
   }
-  if (userNickname) {
+  if (uses('userNickname') && userNickname) {
     conditions.push(`u.name ILIKE $${paramIdx}`);
     params.push(`%${userNickname}%`);
     paramIdx++;
@@ -1189,6 +1199,72 @@ function buildSeparacaoWhere(req) {
   const whereClause = conditions.length > 0 ? 'WHERE ' + conditions.join(' AND ') : '';
   return { whereClause, params, paramIdx };
 }
+
+/**
+ * Opções de filtro da fila de separação, já cruzadas entre si.
+ *
+ * A tela oferecia modalidades fixas no código e todas as contas/clientes do
+ * sistema, então era comum escolher um valor e receber fila vazia. Aqui cada
+ * faceta aplica as MESMAS regras da listagem (janela de datas, sem FULL, sem
+ * cancelado, situação de despacho) e ignora apenas o próprio campo.
+ */
+router.get('/separacao-facets', authenticateToken, requireMaster, async (req, res) => {
+  try {
+    const cacheKey = cacheKeyFromQuery('separacao-facets', req.query, [
+      'saleDateStart', 'saleDateEnd', 'shippingLimitStart', 'shippingLimitEnd',
+      'shippingMode', 'marketplace', 'account', 'userNickname', 'despacho',
+      'search', 'window',
+    ]);
+
+    const payload = await withResponseCache(cacheKey, FACETS_TTL_MS, async () => {
+      const facet = (skipName, keyExpr, extraSelect = '') => {
+        const { whereClause, params } = buildSeparacaoWhere(req, [skipName]);
+        return db.query(
+          `SELECT ${keyExpr} AS value${extraSelect},
+                  COUNT(DISTINCT (s.marketplace, COALESCE(s.account_id, ''), s.id))::int AS count
+             FROM public.unified_sales s
+             LEFT JOIN public.users u ON s.uid = u.uid
+             ${whereClause}
+            GROUP BY 1${extraSelect ? ', 2' : ''}
+            ORDER BY count DESC
+            LIMIT 60`,
+          params
+        );
+      };
+
+      const [marketplaces, modes, accounts, owners] = await Promise.all([
+        facet('marketplace', 's.marketplace'),
+        facet('shippingMode', U_SHIPPING_MODE),
+        facet('account', U_ACCOUNT_KEY, `, COALESCE(NULLIF(s.account_nickname, ''), s.account_id) AS label`),
+        facet('userNickname', `COALESCE(NULLIF(TRIM(u.name), ''), u.email)`),
+      ]);
+
+      const MK_LABEL = { ML: 'Mercado Livre', Shopee: 'Shopee' };
+      return {
+        marketplaces: marketplaces.rows.map((r) => ({
+          value: r.value, label: MK_LABEL[r.value] || r.value, count: r.count,
+        })),
+        shippingModes: modes.rows.map((r) => ({ value: r.value, label: r.value, count: r.count })),
+        accounts: accounts.rows.map((r) => ({
+          value: r.value,
+          label: r.label || r.value,
+          marketplace: String(r.value || '').split(':')[0],
+          count: r.count,
+        })),
+        // O filtro de cliente da tela casa por nome, então a faceta já entrega
+        // o nome pronto e descarta cadastro sem nome nem e-mail.
+        users: owners.rows
+          .filter((r) => r.value)
+          .map((r) => ({ value: r.value, label: r.value, count: r.count })),
+      };
+    });
+
+    res.json(payload);
+  } catch (error) {
+    console.error('Erro ao montar opções da fila de separação:', error);
+    res.status(500).json({ error: 'Erro interno ao carregar opções de filtro.' });
+  }
+});
 
 router.get('/separacao', authenticateToken, requireMaster, async (req, res) => {
   try {
