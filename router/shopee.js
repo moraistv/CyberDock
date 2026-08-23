@@ -59,6 +59,62 @@ function hashShopeeOAuthState(state) {
   return crypto.createHash('sha256').update(state).digest('hex');
 }
 
+/* Cookie da tentativa OAuth.
+ *
+ * Guardar o identificador apenas no armazenamento da aba não bastou: o retorno
+ * da Shopee pode cair em outra aba (ou em contexto onde o armazenamento está
+ * indisponível), e aí a aba que iniciou a conexão não participa mais do fluxo —
+ * a conclusão simplesmente não acontecia. O cookie é HttpOnly, vale para o
+ * domínio pai (frontend e API) e serve só para o backend reencontrar a
+ * tentativa; a autoridade continua sendo a linha no PostgreSQL.
+ */
+const SHOPEE_OAUTH_COOKIE = 'cyberdock_shopee_oauth';
+
+function defaultShopeeCookieDomain() {
+  try {
+    const host = new URL(FRONTEND_URL).hostname;
+    if (!host || host === 'localhost' || /^[\d.]+$/.test(host)) return '';
+    const parts = host.split('.');
+    return parts.length >= 2 ? `.${parts.slice(-3).join('.')}` : '';
+  } catch {
+    return '';
+  }
+}
+
+const SHOPEE_COOKIE_DOMAIN = process.env.SHOPEE_COOKIE_DOMAIN || defaultShopeeCookieDomain();
+
+function shopeeCookieAttributes(maxAgeSeconds) {
+  const parts = ['Path=/', `Max-Age=${maxAgeSeconds}`, 'HttpOnly', 'SameSite=Lax'];
+  // Navegador descarta cookie Secure em http; em produção os dois domínios são
+  // https, então Secure só sai fora do desenvolvimento local.
+  if (!/^http:\/\/localhost/i.test(FRONTEND_URL)) parts.push('Secure');
+  if (SHOPEE_COOKIE_DOMAIN) parts.push(`Domain=${SHOPEE_COOKIE_DOMAIN}`);
+  return parts.join('; ');
+}
+
+function setShopeeOAuthCookie(res, oauthState) {
+  const ttl = Math.floor(SHOPEE_OAUTH_ATTEMPT_TTL_MS / 1000);
+  res.append('Set-Cookie', `${SHOPEE_OAUTH_COOKIE}=${oauthState}; ${shopeeCookieAttributes(ttl)}`);
+}
+
+function clearShopeeOAuthCookie(res) {
+  res.append('Set-Cookie', `${SHOPEE_OAUTH_COOKIE}=; ${shopeeCookieAttributes(0)}`);
+}
+
+function readShopeeOAuthCookie(req) {
+  const header = req.headers?.cookie;
+  if (!header) return null;
+  for (const chunk of header.split(';')) {
+    const [name, ...rest] = chunk.trim().split('=');
+    if (name === SHOPEE_OAUTH_COOKIE) return rest.join('=') || null;
+  }
+  return null;
+}
+
+function isValidShopeeOAuthState(value) {
+  return typeof value === 'string' && /^[A-Za-z0-9_-]{43}$/.test(value);
+}
+
 /* --------------------------- SSE (mesmo padrão de /sales) --------------------------- */
 const clients = {};
 const pendingEvents = {};
@@ -232,6 +288,9 @@ router.post('/auth', authenticateToken, async (req, res) => {
 
     const authUrl = getShopeeAuthUrl(partnerId, partnerKey, REDIRECT_URI);
     res.set('Cache-Control', 'no-store');
+    // O cookie acompanha a tentativa para o caso de o retorno da Shopee não
+    // voltar para a mesma aba.
+    setShopeeOAuthCookie(res, oauthState);
     console.log(`[Shopee Auth] Autorização autenticada iniciada para UID ${req.user.uid}.`);
     return res.json({
       authUrl,
@@ -268,11 +327,25 @@ async function releaseShopeeOAuthClaim(attempt, requestId) {
  */
 async function resolveShopeeConnectIdentity(req, res, next) {
   const requestId = crypto.randomUUID();
-  const oauthState = req.body?.oauthState;
+  // A tentativa chega pelo corpo (aba que iniciou o OAuth) ou pelo cookie, que
+  // continua valendo quando o retorno da Shopee cai em outra aba.
+  const stateFromBody = req.body?.oauthState;
+  const oauthState = stateFromBody || readShopeeOAuthCookie(req);
   const bearerToken = getBearerToken(req);
   const normalizedShopId = String(req.body?.shopId || '').trim();
   let sessionUser = null;
   let sessionError = null;
+
+  /* Log de entrada incondicional.
+   *
+   * Sem ele, uma chamada recusada já na validação não deixava rastro algum: o
+   * servidor só registrava "[Shopee Auth]" e a conclusão ficava invisível,
+   * impossível de distinguir de "o navegador nunca chamou". */
+  console.log(
+    `[Shopee Connect ${requestId}] Recebido: shop=${normalizedShopId || 'ausente'} ` +
+    `tentativa=${oauthState ? (stateFromBody ? 'corpo' : 'cookie') : 'nenhuma'} ` +
+    `jwt=${bearerToken ? 'presente' : 'ausente'}.`
+  );
 
   // Valida tudo que vem da Shopee antes de reivindicar a tentativa.
   if (
@@ -281,6 +354,7 @@ async function resolveShopeeConnectIdentity(req, res, next) {
     !/^\d+$/.test(normalizedShopId) ||
     !Number.isSafeInteger(Number(normalizedShopId))
   ) {
+    console.warn(`[Shopee Connect ${requestId}] code/shopId ausentes ou inválidos.`);
     return res.status(400).json({
       error: 'Parâmetros code e shopId são obrigatórios e devem ser válidos.',
       requestId,
@@ -296,7 +370,7 @@ async function resolveShopeeConnectIdentity(req, res, next) {
   }
 
   if (oauthState) {
-    if (typeof oauthState !== 'string' || !/^[A-Za-z0-9_-]{43}$/.test(oauthState)) {
+    if (!isValidShopeeOAuthState(oauthState)) {
       console.warn(`[Shopee Connect ${requestId}] Tentativa OAuth malformada.`);
       return res.status(400).json({
         error: 'A tentativa de conexão Shopee é inválida. Inicie novamente.',
@@ -421,33 +495,26 @@ function shopeeConnectResponse(account, req, res, replayed = false) {
   });
 }
 
-router.post('/connect', resolveShopeeConnectIdentity, async (req, res) => {
-  const { code, shopId } = req.body;
-  const { uid } = req.user;
-  const requestId = req.shopeeRequestId;
-  const normalizedShopId = String(shopId || '').trim();
-  let phase = 'configuration';
-
-  console.log(
-    `[Shopee Connect ${requestId}] Início: uid=${uid} shop=${normalizedShopId} ` +
-    `auth=${req.shopeeConnectAuth}.`
-  );
-
-  if (req.shopeeCompletedAccount) {
-    console.log(`[Shopee Connect ${requestId}] Resultado já persistido; resposta idempotente.`);
-    return shopeeConnectResponse(req.shopeeCompletedAccount, req, res, true);
+/**
+ * Troca o código pela credencial da loja e grava a conta.
+ *
+ * Fica fora do handler porque dois caminhos concluem a mesma conexão: o POST
+ * feito pelo frontend e o retorno tratado direto no backend, usado quando o
+ * navegador não consegue concluir sozinho. Os erros carregam a fase para o
+ * chamador escolher entre "tente de novo" e "refaça a autorização".
+ */
+async function persistShopeeAccount({ uid, code, shopId, attempt, requestId }) {
+  const { partnerId, partnerKey } = getShopeePartnerCredentials();
+  if (!partnerId || !partnerKey) {
+    const configError = new Error('Credenciais Shopee ausentes no servidor.');
+    configError.code = 'SHOPEE_SERVER_CONFIG';
+    configError.phase = 'configuration';
+    throw configError;
   }
 
+  let phase = 'token_exchange';
   try {
-    const { partnerId, partnerKey } = getShopeePartnerCredentials();
-    if (!partnerId || !partnerKey) {
-      const configError = new Error('Credenciais Shopee ausentes no servidor.');
-      configError.code = 'SHOPEE_SERVER_CONFIG';
-      throw configError;
-    }
-
-    phase = 'token_exchange';
-    const tokens = await exchangeShopeeCode(code, normalizedShopId, partnerId, partnerKey);
+    const tokens = await exchangeShopeeCode(code, shopId, partnerId, partnerKey);
     const expiresIn = Number(tokens.expire_in);
     if (!tokens.access_token || !tokens.refresh_token || !Number.isFinite(expiresIn) || expiresIn <= 0) {
       throw new Error('Shopee obter token: resposta incompleta; conecte a loja novamente.');
@@ -483,7 +550,7 @@ router.post('/connect', resolveShopeeConnectIdentity, async (req, res) => {
 
     phase = 'persistence';
     let account;
-    if (req.shopeeOAuthAttempt) {
+    if (attempt) {
       const client = await db.pool.connect();
       try {
         await client.query('BEGIN');
@@ -501,7 +568,7 @@ router.post('/connect', resolveShopeeConnectIdentity, async (req, res) => {
               AND claim_id = $2
               AND consumed_at IS NULL
           RETURNING state_hash`,
-          [req.shopeeOAuthAttempt.stateHash, req.shopeeOAuthAttempt.claimId, String(tokens.shop_id)]
+          [attempt.stateHash, attempt.claimId, String(tokens.shop_id)]
         );
         if (completion.rowCount !== 1) {
           throw new Error('A tentativa OAuth perdeu sua reserva antes da conclusão.');
@@ -521,11 +588,44 @@ router.post('/connect', resolveShopeeConnectIdentity, async (req, res) => {
       }
     }
 
-    phase = 'completed';
+    return account;
+  } catch (error) {
+    if (!error.phase) error.phase = phase;
+    throw error;
+  }
+}
+
+router.post('/connect', resolveShopeeConnectIdentity, async (req, res) => {
+  const { code, shopId } = req.body;
+  const { uid } = req.user;
+  const requestId = req.shopeeRequestId;
+  const normalizedShopId = String(shopId || '').trim();
+
+  console.log(
+    `[Shopee Connect ${requestId}] Início: uid=${uid} shop=${normalizedShopId} ` +
+    `auth=${req.shopeeConnectAuth}.`
+  );
+
+  if (req.shopeeCompletedAccount) {
+    clearShopeeOAuthCookie(res);
+    console.log(`[Shopee Connect ${requestId}] Resultado já persistido; resposta idempotente.`);
+    return shopeeConnectResponse(req.shopeeCompletedAccount, req, res, true);
+  }
+
+  try {
+    const account = await persistShopeeAccount({
+      uid,
+      code,
+      shopId: normalizedShopId,
+      attempt: req.shopeeOAuthAttempt,
+      requestId,
+    });
+    clearShopeeOAuthCookie(res);
     console.log(`[Shopee Connect ${requestId}] Persistido: loja=${account.shop_name || account.shop_id} uid=${uid}.`);
     return shopeeConnectResponse(account, req, res);
   } catch (error) {
     await releaseShopeeOAuthClaim(req.shopeeOAuthAttempt, requestId);
+    const phase = error.phase || 'unknown';
     console.error(`[Shopee Connect ${requestId}] Erro na fase ${phase}:`, error);
 
     const persistenceFailed = phase === 'persistence';
@@ -544,21 +644,98 @@ router.post('/connect', resolveShopeeConnectIdentity, async (req, res) => {
 });
 
 /**
- * Callback direto no backend. Mantido para o caso de o console da Shopee ser
- * configurado com o domínio da API; o fluxo padrão hoje passa pelo frontend.
+ * Conclusão da autorização direto no backend.
+ *
+ * Existe porque a etapa que grava a conta não pode depender de o navegador
+ * executar a página de retorno: se a aba mudar, o armazenamento estiver
+ * bloqueado ou o pacote do frontend estiver desatualizado, a loja era
+ * autorizada na Shopee e nunca aparecia no sistema. Aqui a identidade vem da
+ * tentativa (query ou cookie), então basta uma navegação comum do navegador.
  */
 router.get('/callback', async (req, res) => {
-  const { code, shop_id } = req.query;
-  const shopId = shop_id || req.query.shopid;
-  const target = `${FRONTEND_URL}/shopee/callback`;
-  if (!code || !shopId) {
-    return res.redirect(`${FRONTEND_URL}/contas?error=${encodeURIComponent('Autorização Shopee falhou: code ou shop_id ausente.')}`);
+  const requestId = crypto.randomUUID();
+  const code = String(req.query.code || '').trim();
+  const shopId = String(req.query.shop_id || req.query.shopid || '').trim();
+  const contas = `${FRONTEND_URL}/contas`;
+  const failure = (message) => res.redirect(`${contas}?error=${encodeURIComponent(message)}`);
+  const success = (label) =>
+    res.redirect(`${contas}?success=${encodeURIComponent(`Loja Shopee ${label} conectada com sucesso!`)}`);
+
+  const oauthState = String(req.query.state || '').trim() || readShopeeOAuthCookie(req);
+  console.log(
+    `[Shopee Callback ${requestId}] Retorno: shop=${shopId || 'ausente'} ` +
+    `tentativa=${oauthState ? 'presente' : 'nenhuma'}.`
+  );
+
+  if (!code || !/^\d+$/.test(shopId)) {
+    return failure('Autorização Shopee falhou: code ou shop_id ausente.');
   }
 
-  const frontendCallback = new URL(target);
-  frontendCallback.searchParams.set('code', code);
-  frontendCallback.searchParams.set('shop_id', shopId);
-  return res.redirect(frontendCallback.toString());
+  // Sem tentativa não há como saber de quem é a loja. O retorno então segue
+  // para o frontend, que ainda pode concluir usando a sessão aberta.
+  if (!isValidShopeeOAuthState(oauthState)) {
+    const frontendCallback = new URL(`${FRONTEND_URL}/shopee/callback`);
+    frontendCallback.searchParams.set('code', code);
+    frontendCallback.searchParams.set('shop_id', shopId);
+    // Marca de que o backend já tentou: evita os dois lados se empurrarem o
+    // mesmo retorno indefinidamente.
+    frontendCallback.searchParams.set('handoff', '1');
+    return res.redirect(frontendCallback.toString());
+  }
+
+  const stateHash = hashShopeeOAuthState(oauthState);
+  const claimId = crypto.randomUUID();
+  let attempt = null;
+  try {
+    const { rows } = await db.query(
+      `UPDATE public.shopee_oauth_attempts
+          SET claim_id = $2, claimed_at = NOW()
+        WHERE state_hash = $1
+          AND consumed_at IS NULL
+          AND expires_at > NOW()
+          AND (claim_id IS NULL OR claimed_at < NOW() - INTERVAL '5 minutes')
+      RETURNING uid`,
+      [stateHash, claimId]
+    );
+
+    if (!rows[0]) {
+      // Recarregar a página de retorno não pode reaproveitar o code, então a
+      // resposta vem do que já está gravado.
+      const probe = await db.query(
+        `SELECT a.consumed_at, a.shop_id, c.shop_name, (c.uid IS NOT NULL) AS has_account
+           FROM public.shopee_oauth_attempts a
+           LEFT JOIN public.shopee_accounts c
+             ON c.uid = a.uid AND c.shop_id = $2
+          WHERE a.state_hash = $1`,
+        [stateHash, shopId]
+      );
+      const done = probe.rows[0];
+      clearShopeeOAuthCookie(res);
+      if (done?.consumed_at && done.has_account && String(done.shop_id || '') === shopId) {
+        console.log(`[Shopee Callback ${requestId}] Conexão já concluída; resposta idempotente.`);
+        return success(done.shop_name || shopId);
+      }
+      console.warn(`[Shopee Callback ${requestId}] Tentativa expirada, em uso ou concluída sem conta.`);
+      return failure('A tentativa de conexão Shopee expirou. Clique em Conectar loja e autorize novamente.');
+    }
+
+    attempt = { stateHash, claimId };
+    const uid = rows[0].uid;
+    const account = await persistShopeeAccount({ uid, code, shopId, attempt, requestId });
+    clearShopeeOAuthCookie(res);
+    console.log(`[Shopee Callback ${requestId}] Persistido: loja=${account.shop_name || account.shop_id} uid=${uid}.`);
+    return success(account.shop_name || account.shop_id);
+  } catch (error) {
+    await releaseShopeeOAuthClaim(attempt, requestId);
+    const phase = error.phase || 'unknown';
+    console.error(`[Shopee Callback ${requestId}] Erro na fase ${phase}:`, error);
+    clearShopeeOAuthCookie(res);
+    return failure(
+      phase === 'persistence'
+        ? 'A Shopee autorizou a loja, mas o CyberDock não conseguiu gravá-la. Inicie uma nova conexão.'
+        : 'Não foi possível concluir a conexão com a Shopee. Tente novamente.'
+    );
+  }
 });
 
 /* -------------------------------- Contas -------------------------------- */
