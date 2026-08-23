@@ -1490,8 +1490,11 @@ router.get('/all', authenticateToken, requireMaster, async (req, res) => {
       if (parts.length) conditions.push(`(${parts.join(' OR ')})`);
     }
     if (saleStatus) {
-      conditions.push(`s.order_status = $${paramIdx}`);
-      params.push(saleStatus);
+      // Sem caixa e por lista: a Shopee grava o status do pedido em maiúsculas
+      // (COMPLETED, CANCELLED) e o ML em minúsculas, então a comparação exata
+      // deixava metade dos canais de fora da opção escolhida.
+      conditions.push(`LOWER(COALESCE(s.order_status, '')) = ANY($${paramIdx})`);
+      params.push(asList(saleStatus).map((v) => v.toLowerCase()));
       paramIdx++;
     }
     /* ------------------------ Janela padrão de datas -------------------------
@@ -1537,11 +1540,16 @@ router.get('/all', authenticateToken, requireMaster, async (req, res) => {
       paramIdx++;
     }
     if (account) {
-      // `/filter-options` devolve apelido do ML e nome da loja Shopee, mas
-      // links antigos ainda mandam o id numérico — os três formatos casam.
-      conditions.push(`(s.account_id = $${paramIdx} OR s.account_nickname ILIKE $${paramIdx + 1})`);
-      params.push(account, `%${account}%`);
-      paramIdx += 2;
+      // Aceita a chave com canal (ML:123 / Shopee:456), que é o valor devolvido
+      // pelas opções de filtro, e também id puro ou apelido, formatos usados por
+      // links antigos. Lista em CSV permite selecionar mais de uma conta.
+      conditions.push(`(
+        (s.marketplace || ':' || s.account_id) = ANY($${paramIdx})
+        OR s.account_id = ANY($${paramIdx})
+        OR s.account_nickname = ANY($${paramIdx})
+      )`);
+      params.push(asList(account));
+      paramIdx++;
     }
     if (buyer) {
       conditions.push(`(s.buyer_name ILIKE $${paramIdx} OR s.buyer_nickname ILIKE $${paramIdx})`);
@@ -1822,12 +1830,31 @@ const asFilterList = (value) =>
  * @param {{ skip?: string[], startIndex?: number, dateRange?: {from: string, to: string} }} options
  */
 function buildUnifiedFilters(query, uid, options = {}) {
-  const { skip = [], startIndex = 1, dateRange = null } = options;
+  const {
+    skip = [], startIndex = 1, dateRange = null,
+    includeUids = null, excludeUids = null,
+  } = options;
   const uses = (name) => !skip.includes(name);
 
-  const conditions = [`s.uid = $${startIndex}`];
-  const params = [uid];
-  let p = startIndex + 1;
+  const conditions = [];
+  const params = [];
+  let p = startIndex;
+
+  /* Escopo do dono.
+   *
+   * `uid` preenchido é a tela do cliente: um único dono, sem exceção. `uid`
+   * nulo existe só para a visão master global, que em vez de um dono fixo
+   * recorta por clientes ativos e, opcionalmente, pelo cliente escolhido no
+   * filtro. Usuário comum nunca chega aqui sem uid. */
+  if (uid) {
+    conditions.push(`s.uid = $${p}`); params.push(uid); p++;
+  }
+  if (uses('userNickname') && Array.isArray(includeUids)) {
+    conditions.push(`s.uid = ANY($${p})`); params.push(includeUids); p++;
+  }
+  if (Array.isArray(excludeUids) && excludeUids.length) {
+    conditions.push(`s.uid <> ALL($${p})`); params.push(excludeUids); p++;
+  }
 
   const from = dateRange ? dateRange.from : (query.from || '').trim();
   const to = dateRange ? dateRange.to : (query.to || '').trim();
@@ -1883,9 +1910,39 @@ function buildUnifiedFilters(query, uid, options = {}) {
     params.push(asFilterList(account)); p++;
   }
 
+  // Busca textual: o tabelão manda `search` junto dos filtros. Sem aplicá-la
+  // aqui, as opções ofereciam valores que o próprio termo digitado já havia
+  // descartado da listagem.
+  const search = (query.search || '').trim();
+  if (uses('search') && search) {
+    conditions.push(`(
+      s.product_title ILIKE $${p}
+      OR s.sku ILIKE $${p}
+      OR s.account_nickname ILIKE $${p}
+      OR s.id ILIKE $${p}
+    )`);
+    params.push(`%${search}%`); p++;
+  }
+
   const shippingStatus = (query.shippingStatus || '').trim();
   if (uses('shippingStatus') && shippingStatus) {
-    conditions.push(`${U_SHIPPING_STATUS} = ANY($${p})`); params.push(asFilterList(shippingStatus)); p++;
+    /* Mesma regra da listagem, porque a opção mostrada precisa prever a linha
+     * que a tabela vai trazer:
+     *  - comparação sem caixa, já que o status configurado pelo usuário e o
+     *    gravado na venda divergem em maiúsculas/minúsculas;
+     *  - "cancelled" é status do PEDIDO, não de expedição. Sem este desvio a
+     *    faceta ficava vazia justamente quando o usuário filtrava por
+     *    Cancelado, e os demais filtros zeravam junto. */
+    const wanted = asFilterList(shippingStatus).map((v) => v.toLowerCase());
+    const wantsCancelled = wanted.includes('cancelled');
+    const shippingWanted = wanted.filter((v) => v !== 'cancelled');
+    const parts = [];
+    if (shippingWanted.length) {
+      parts.push(`LOWER(${U_SHIPPING_STATUS}) = ANY($${p})`);
+      params.push(shippingWanted); p++;
+    }
+    if (wantsCancelled) parts.push(`LOWER(COALESCE(s.order_status, '')) = 'cancelled'`);
+    if (parts.length) conditions.push(`(${parts.join(' OR ')})`);
   }
 
   const shippingMode = (query.shippingMode || '').trim();
@@ -1912,7 +1969,13 @@ function buildUnifiedFilters(query, uid, options = {}) {
   if (uses('queue') && queue === 'cancelled') conditions.push(U_CANCELLED);
   if (uses('queue') && queue === 'valid') conditions.push(`NOT ${U_CANCELLED}`);
 
-  return { where: `WHERE ${conditions.join(' AND ')}`, params, nextIndex: p };
+  // A visão master global pode não ter nenhum predicado (por exemplo com
+  // `window=all` e sem cliente inativo), e `WHERE` sozinho seria SQL inválido.
+  return {
+    where: conditions.length ? `WHERE ${conditions.join(' AND ')}` : '',
+    params,
+    nextIndex: p,
+  };
 }
 
 /**
@@ -1926,17 +1989,31 @@ function buildUnifiedFilters(query, uid, options = {}) {
 const UNIFIED_FILTER_FIELDS = [
   'from', 'to', 'shipFrom', 'shipTo', 'window',
   'marketplace', 'account', 'shippingStatus', 'shippingMode', 'saleStatus',
-  'processed', 'skuMapped', 'queue',
+  'processed', 'skuMapped', 'queue', 'search',
+  // Escopo master: `scope=all` troca o dono fixo pela visão global e
+  // `userNickname` recorta por cliente. Ambos mudam a agregação, então precisam
+  // entrar na chave de cache.
+  'scope', 'userNickname',
 ];
 
 const FACETS_TTL_MS = configInt('SALES_FACETS_TTL_MS', 60000, 5000, 600000);
 const DASHBOARD_TTL_MS = configInt('SALES_DASHBOARD_TTL_MS', 60000, 5000, 600000);
 
 router.get('/filter-facets', authenticateToken, async (req, res) => {
-  const { uid } = req.user;
+  /* Escopo. Master pode pedir a visão global (`scope=all`), que é o que o
+   * tabelão do painel admin lista. Qualquer outro caso — inclusive um usuário
+   * comum tentando `scope=all` — permanece preso ao próprio uid do token. */
+  const isMaster = req.user.role === 'master';
+  const globalScope = isMaster && (req.query.scope || '').trim() === 'all';
+  const uid = globalScope ? null : req.user.uid;
+
   try {
-    const cacheKey = cacheKeyFromQuery(`facets|${uid}`, req.query, UNIFIED_FILTER_FIELDS);
-    const payload = await withResponseCache(cacheKey, FACETS_TTL_MS, () => buildFacets(req, uid));
+    const cacheKey = cacheKeyFromQuery(`facets|${req.user.uid}`, req.query, UNIFIED_FILTER_FIELDS);
+    const payload = await withResponseCache(
+      cacheKey,
+      FACETS_TTL_MS,
+      () => buildFacets(req, uid, { globalScope })
+    );
     res.json(payload);
   } catch (error) {
     console.error('Erro ao montar opções de filtro:', error);
@@ -1944,10 +2021,33 @@ router.get('/filter-facets', authenticateToken, async (req, res) => {
   }
 });
 
-async function buildFacets(req, uid) {
+async function buildFacets(req, uid, options = {}) {
   {
+    const { globalScope = false } = options;
+
+    /* Na visão global não existe dono fixo: o recorte por usuário é resolvido
+     * aqui, do mesmo modo que /sales/all faz — esconde cliente inativo e, se o
+     * filtro de cliente estiver preenchido, restringe aos uids daquele nome. */
+    let excludeUids = null;
+    let includeUids = null;
+    const userNickname = (req.query.userNickname || '').trim();
+    if (globalScope) {
+      const [inactive, byName] = await Promise.all([
+        db.query('SELECT uid FROM public.users WHERE active = false'),
+        userNickname
+          ? db.query('SELECT uid FROM public.users WHERE name ILIKE $1', [`%${userNickname}%`])
+          : Promise.resolve({ rows: [] }),
+      ]);
+      excludeUids = inactive.rows.map((r) => r.uid);
+      // Lista vazia é intencional: nome sem cliente correspondente não tem
+      // opção alguma, e é isso que a tela deve mostrar.
+      if (userNickname) includeUids = byName.rows.map((r) => r.uid);
+    }
+
     const facet = (skipName, keyExpr, extraSelect = '') => {
-      const { where, params } = buildUnifiedFilters(req.query, uid, { skip: [skipName] });
+      const { where, params } = buildUnifiedFilters(req.query, uid, {
+        skip: [skipName], includeUids, excludeUids,
+      });
       return db.query(
         `SELECT ${keyExpr} AS value${extraSelect},
                 COUNT(DISTINCT (s.marketplace, COALESCE(s.account_id, ''), s.id))::int AS count
@@ -1960,13 +2060,40 @@ async function buildFacets(req, uid) {
       );
     };
 
-    const [marketplaces, accounts, statuses, modes, saleStatuses] = await Promise.all([
+    const [marketplaces, accounts, statuses, modes, saleStatuses, owners] = await Promise.all([
       facet('marketplace', 's.marketplace'),
       facet('account', U_ACCOUNT_KEY, `, COALESCE(NULLIF(s.account_nickname, ''), s.account_id) AS label`),
       facet('shippingStatus', U_SHIPPING_STATUS),
       facet('shippingMode', U_SHIPPING_MODE),
       facet('saleStatus', `LOWER(COALESCE(NULLIF(s.order_status, ''), 'sem_status'))`),
+      // O filtro de cliente só existe na visão master.
+      globalScope ? facet('userNickname', 's.uid') : Promise.resolve({ rows: [] }),
     ]);
+
+    /* O filtro do painel admin casa o cliente por NOME, então a faceta traduz
+     * uid em nome e soma os totais de quem compartilha o mesmo nome. */
+    let users = [];
+    if (globalScope && owners.rows.length) {
+      const uids = owners.rows.map((r) => r.value).filter(Boolean);
+      const named = uids.length
+        ? await db.query(
+          `SELECT uid, COALESCE(NULLIF(TRIM(name), ''), email) AS label
+             FROM public.users
+            WHERE uid = ANY($1)`,
+          [uids]
+        )
+        : { rows: [] };
+      const labelByUid = new Map(named.rows.map((r) => [r.uid, r.label]));
+      const totals = new Map();
+      for (const row of owners.rows) {
+        const label = labelByUid.get(row.value);
+        if (!label) continue;
+        totals.set(label, (totals.get(label) || 0) + row.count);
+      }
+      users = [...totals.entries()]
+        .map(([label, count]) => ({ value: label, label, count }))
+        .sort((a, b) => b.count - a.count);
+    }
 
     const MK_LABEL = { ML: 'Mercado Livre', Shopee: 'Shopee' };
     return {
@@ -1982,6 +2109,7 @@ async function buildFacets(req, uid) {
       shippingStatuses: statuses.rows.map((r) => ({ value: r.value, label: r.value, count: r.count })),
       shippingModes: modes.rows.map((r) => ({ value: r.value, label: r.value, count: r.count })),
       saleStatuses: saleStatuses.rows.map((r) => ({ value: r.value, label: r.value, count: r.count })),
+      users,
     };
   }
 }
@@ -2345,8 +2473,10 @@ router.get('/my-sales', authenticateToken, async (req, res) => {
       if (parts.length) conditions.push(`(${parts.join(' OR ')})`);
     }
     if (saleStatus) {
-      conditions.push(`s.order_status = $${paramIdx}`);
-      params.push(saleStatus);
+      // Mesma regra do tabelão admin: sem caixa e por lista, para cobrir o
+      // status em maiúsculas da Shopee e o em minúsculas do Mercado Livre.
+      conditions.push(`LOWER(COALESCE(s.order_status, '')) = ANY($${paramIdx})`);
+      params.push(asList(saleStatus).map((v) => v.toLowerCase()));
       paramIdx++;
     }
     /* Janela padrão, igual à do tabelão admin.
@@ -2415,8 +2545,11 @@ router.get('/my-sales', authenticateToken, async (req, res) => {
       paramIdx++;
     }
     // Ao filtrar por PRAZO DE EXPEDIÇÃO, exclui FULL (vendedor não despacha FULL).
+    // Usa a modalidade canônica: um FULL cujo shipping_mode está vazio e só
+    // aparece no logistic_type passava por aqui, e as opções de filtro (que já
+    // usam a expressão canônica) não previam essa linha.
     if (shippingLimitStart || shippingLimitEnd) {
-      conditions.push(`s.shipping_mode IS DISTINCT FROM 'FULL'`);
+      conditions.push(`${U_SHIPPING_MODE} IS DISTINCT FROM 'FULL'`);
     }
     // Filtro de PROCESSADO / NÃO PROCESSADO (abatimento de estoque).
     if (processed === 'yes') {
