@@ -331,3 +331,151 @@ module.exports = {
   getShopeeOrderDetail,
   getShopeeEscrowDetail,
 };
+
+/* ------------------------------ Etiquetas (AWB) ------------------------------
+ *
+ * Fluxo oficial da Shopee, em três passos obrigatórios:
+ *   1. create_shipping_document  — pede a geração (só depois de haver rastreio)
+ *   2. get_shipping_document_result — espera o status virar READY
+ *   3. download_shipping_document — baixa o arquivo
+ *
+ * get_shipping_parameter entra antes como diagnóstico: é ele que devolve
+ * `logistics.lack_of_invoice_data` quando a nota fiscal não foi enviada ou foi
+ * recusada pela SEFAZ, que é o caso que precisa virar mensagem na tela.
+ *
+ * As três primeiras são batch (limite de 50 pedidos) e reportam falha POR ITEM
+ * em `response.result_list[].fail_error`, então aqui devolvemos o payload cru:
+ * quem chama precisa do código para escolher a mensagem certa.
+ */
+
+const SHOPEE_DOCUMENT_TYPES = new Set([
+  'NORMAL_AIR_WAYBILL',
+  'THERMAL_AIR_WAYBILL',
+  'NORMAL_JOB_AIR_WAYBILL',
+  'THERMAL_JOB_AIR_WAYBILL',
+  'THERMAL_UNPACKAGED_LABEL',
+]);
+
+/** URL assinada para uma chamada escopada à loja. */
+function shopScopedUrl({ path, partnerId, partnerKey, accessToken, shopId }) {
+  const timestamp = Math.floor(Date.now() / 1000);
+  const sign = generateShopeeSign(partnerId, partnerKey, path, accessToken, shopId, timestamp);
+  return `${SHOPEE_HOST}${path}?partner_id=${partnerId}&timestamp=${timestamp}`
+    + `&access_token=${accessToken}&shop_id=${shopId}&sign=${sign}`;
+}
+
+/** Um item de pedido no formato que as APIs de etiqueta esperam. */
+function shopeeOrderEntry({ orderSn, packageNumber, trackingNumber, documentType }) {
+  const entry = { order_sn: String(orderSn) };
+  // A doc é explícita: não enviar string vazia quando não há package_number.
+  if (packageNumber) entry.package_number = String(packageNumber);
+  if (trackingNumber) entry.tracking_number = String(trackingNumber);
+  if (documentType) entry.shipping_document_type = documentType;
+  return entry;
+}
+
+/**
+ * Parâmetros de expedição do pedido. Usado como diagnóstico antes de tentar a
+ * etiqueta: devolve o payload cru para o chamador ler `error`.
+ */
+async function getShopeeShippingParameter({ partnerId, partnerKey, accessToken, shopId, orderSn, packageNumber }) {
+  const path = '/api/v2/logistics/get_shipping_parameter';
+  let url = shopScopedUrl({ path, partnerId, partnerKey, accessToken, shopId });
+  url += `&order_sn=${encodeURIComponent(String(orderSn))}`;
+  if (packageNumber) url += `&package_number=${encodeURIComponent(String(packageNumber))}`;
+  return fetchShopee(url, {}, 'consultar parâmetros de envio', 0);
+}
+
+/** Passo 1: cria a tarefa de geração da etiqueta. */
+async function createShopeeShippingDocument({
+  partnerId, partnerKey, accessToken, shopId,
+  orderSn, packageNumber, trackingNumber, documentType = 'NORMAL_AIR_WAYBILL',
+}) {
+  const path = '/api/v2/logistics/create_shipping_document';
+  const url = shopScopedUrl({ path, partnerId, partnerKey, accessToken, shopId });
+  return fetchShopee(url, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      order_list: [shopeeOrderEntry({ orderSn, packageNumber, trackingNumber, documentType })],
+    }),
+  }, 'criar etiqueta', 0);
+}
+
+/** Passo 2: estado da tarefa (READY | PROCESSING | FAILED). */
+async function getShopeeShippingDocumentResult({
+  partnerId, partnerKey, accessToken, shopId,
+  orderSn, packageNumber, documentType = 'NORMAL_AIR_WAYBILL',
+}) {
+  const path = '/api/v2/logistics/get_shipping_document_result';
+  const url = shopScopedUrl({ path, partnerId, partnerKey, accessToken, shopId });
+  return fetchShopee(url, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      order_list: [shopeeOrderEntry({ orderSn, packageNumber, documentType })],
+    }),
+  }, 'consultar etiqueta', 0);
+}
+
+/**
+ * Passo 3: baixa o arquivo.
+ *
+ * Não passa por fetchShopee porque o retorno de sucesso é BINÁRIO; só o erro
+ * vem em JSON. Detectamos pelo content-type e devolvemos o buffer ou o código
+ * de erro para o chamador transformar em mensagem.
+ */
+async function downloadShopeeShippingDocument({
+  partnerId, partnerKey, accessToken, shopId,
+  orderSn, packageNumber, documentType = 'NORMAL_AIR_WAYBILL',
+}) {
+  const path = '/api/v2/logistics/download_shipping_document';
+  const url = shopScopedUrl({ path, partnerId, partnerKey, accessToken, shopId });
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), SHOPEE_HTTP_TIMEOUT_MS);
+
+  try {
+    const response = await fetch(url, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        shipping_document_type: documentType,
+        order_list: [shopeeOrderEntry({ orderSn, packageNumber })],
+      }),
+      signal: controller.signal,
+    });
+
+    const contentType = String(response.headers.get('content-type') || '').toLowerCase();
+    if (contentType.includes('application/json') || contentType.includes('text/')) {
+      const text = await response.text();
+      let payload = null;
+      try { payload = JSON.parse(text); } catch { /* corpo não-JSON */ }
+      return { ok: false, error: payload?.error || 'error_server', message: payload?.message || text };
+    }
+
+    if (!response.ok) {
+      return { ok: false, error: 'error_server', message: `HTTP ${response.status}` };
+    }
+
+    const buffer = Buffer.from(await response.arrayBuffer());
+    if (!buffer.length) {
+      return { ok: false, error: 'error_server', message: 'A Shopee devolveu um arquivo vazio.' };
+    }
+    return { ok: true, buffer, contentType: contentType || 'application/pdf' };
+  } catch (error) {
+    const timedOut = error?.name === 'AbortError';
+    return {
+      ok: false,
+      error: timedOut ? 'error_timeout' : 'error_network',
+      message: timedOut ? 'Tempo limite ao baixar a etiqueta na Shopee.' : error.message,
+    };
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+module.exports.SHOPEE_DOCUMENT_TYPES = SHOPEE_DOCUMENT_TYPES;
+module.exports.getShopeeShippingParameter = getShopeeShippingParameter;
+module.exports.createShopeeShippingDocument = createShopeeShippingDocument;
+module.exports.getShopeeShippingDocumentResult = getShopeeShippingDocumentResult;
+module.exports.downloadShopeeShippingDocument = downloadShopeeShippingDocument;

@@ -33,6 +33,10 @@ const {
   getShopeeOrderList,
   getShopeeOrderDetail,
   getShopeeEscrowDetail,
+  getShopeeShippingParameter,
+  createShopeeShippingDocument,
+  getShopeeShippingDocumentResult,
+  downloadShopeeShippingDocument,
 } = require('../utils/shopeeClient');
 const { calculateShopeeFinancials, SHOPEE_FINANCIAL_RULE_VERSION } = require('../utils/shopeeFinance');
 
@@ -827,6 +831,297 @@ router.delete('/contas/:shopId', authenticateToken, async (req, res) => {
     res.status(204).send();
   } catch (error) {
     res.status(500).json({ error: 'Erro interno ao excluir a loja.' });
+  }
+});
+
+/* ------------------------------- Etiquetas ------------------------------- */
+
+/**
+ * Mensagens para os códigos de erro da Shopee.
+ *
+ * Vêm da própria documentação de Logistics. O caso que o operador mais vê no
+ * Brasil é `logistics.lack_of_invoice_data`: a Shopee não libera a etiqueta
+ * enquanto a nota fiscal não é enviada (ou enquanto a SEFAZ recusa a que foi
+ * enviada). Sem traduzir isso, a tela mostrava só "erro".
+ */
+const SHOPEE_LABEL_MESSAGES = {
+  'logistics.lack_of_invoice_data': 'A Shopee não liberou a etiqueta porque a nota fiscal não foi enviada, ou foi recusada pela SEFAZ. Emita ou corrija a NF e tente novamente.',
+  'logistics.order_status_error': 'O status do pedido ainda não permite imprimir a etiqueta.',
+  'logistics.package_can_not_print': 'A Shopee ainda não liberou a impressão deste pacote.',
+  'logistics.tracking_number_invalid': 'O código de rastreio do pedido ainda não é válido para gerar a etiqueta.',
+  'logistics.can_not_print_combine_order': 'Este pedido faz parte de um pacote combinado: a etiqueta só sai pelo Seller Center da Shopee.',
+  'logistics.can_not_print_jit_order': 'Este canal de envio só permite imprimir pelo Seller Center da Shopee.',
+  'logistics.shipping_document_should_print_first': 'A etiqueta ainda está sendo gerada. Tente novamente em alguns segundos.',
+  'logistics.download_later': 'A etiqueta ainda está sendo gerada pela Shopee. Tente novamente em alguns segundos.',
+  'logistics.package_print_failed': 'A Shopee não conseguiu gerar a etiqueta. Tente novamente em alguns minutos.',
+  'logistics.packages_can_not_download_together': 'Estes pacotes não podem ser baixados juntos. Gere um por vez.',
+  'logistics.error_booking_order': 'Pedido vinculado a booking: a expedição não é feita pelo vendedor.',
+  'logistics.package_number_not_exist': 'Pedido dividido em pacotes: é preciso informar o pacote específico.',
+  'logistics.package_number_not_found': 'O pacote informado não existe mais na Shopee.',
+  'logistics.order_not_exist': 'A Shopee não encontrou este pedido.',
+  'logistics.invalid_address_version': 'O endereço deste pedido precisa ser atualizado na Shopee antes de gerar a etiqueta.',
+  'logistics.no_valid_shipping_parameters': 'A Shopee não retornou parâmetros de envio válidos para este pedido.',
+  'error_permission': 'O aplicativo CyberDock não tem permissão da Shopee para etiquetas. Solicite o acesso a dados sensíveis no console do parceiro.',
+};
+
+const SHOPEE_LABEL_TYPES = {
+  pdf: 'NORMAL_AIR_WAYBILL',
+  thermal: 'THERMAL_AIR_WAYBILL',
+};
+
+const waitBeforeRetry = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+
+/** Traduz o código da Shopee, mantendo o texto original como último recurso. */
+function shopeeLabelMessage(code, fallback) {
+  return SHOPEE_LABEL_MESSAGES[code] || fallback || 'A Shopee não liberou a etiqueta deste pedido.';
+}
+
+/** Primeiro item do result_list, onde as APIs batch reportam falha por pedido. */
+function firstShopeeResult(payload) {
+  const list = payload?.response?.result_list;
+  return Array.isArray(list) && list[0] ? list[0] : null;
+}
+
+/**
+ * Conta da loja com token utilizável.
+ *
+ * Sempre escopada ao UID do token: um usuário nunca alcança a loja de outro,
+ * nem passando shopId na query.
+ */
+async function loadShopeeAccountForLabel(uid, shopId) {
+  const { rows } = await db.query(
+    `SELECT uid, shop_id, shop_name, access_token, refresh_token, expires_at
+       FROM public.shopee_accounts
+      WHERE uid = $1 AND shop_id = $2`,
+    [uid, String(shopId)]
+  );
+  if (!rows[0]) return { error: 'account_not_found' };
+
+  const { partnerId, partnerKey } = getShopeePartnerCredentials();
+  if (!partnerId || !partnerKey) return { error: 'server_config' };
+
+  const row = rows[0];
+  const account = {
+    uid: row.uid,
+    shopId: String(row.shop_id),
+    shopName: row.shop_name,
+    accessToken: row.access_token,
+    refreshToken: row.refresh_token,
+  };
+
+  const expiresAt = row.expires_at ? new Date(row.expires_at).getTime() : 0;
+  if (expiresAt - Date.now() < 10 * 60 * 1000) {
+    const refreshed = await refreshShopeeToken(account, partnerId, partnerKey);
+    account.accessToken = refreshed.access_token;
+    account.refreshToken = refreshed.refresh_token;
+  }
+  return { account, partnerId, partnerKey };
+}
+
+/** Rastreio já sincronizado. create_shipping_document exige ele na maioria dos canais. */
+async function findShopeeSaleForLabel(uid, shopId, orderSn) {
+  const { rows } = await db.query(
+    `SELECT tracking_number, order_status, shipping_status, shipping_carrier
+       FROM public.shopee_sales
+      WHERE uid = $1 AND shop_id = $2 AND order_sn = $3
+      LIMIT 1`,
+    [uid, String(shopId), String(orderSn)]
+  );
+  return rows[0] || null;
+}
+
+function readLabelQuery(req) {
+  return {
+    orderSn: String(req.query.orderSn || req.query.order_sn || '').trim(),
+    shopId: String(req.query.shopId || req.query.shop_id || '').trim(),
+    packageNumber: String(req.query.packageNumber || req.query.package_number || '').trim() || null,
+    documentType: SHOPEE_LABEL_TYPES[String(req.query.type || 'pdf').toLowerCase()] || SHOPEE_LABEL_TYPES.pdf,
+  };
+}
+
+/**
+ * Diagnóstico antes de imprimir: diz se a etiqueta pode sair e, quando não pode,
+ * por quê — em português, para a tela mostrar direto ao operador.
+ */
+router.get('/label-info', authenticateToken, async (req, res) => {
+  const { orderSn, shopId, packageNumber, documentType } = readLabelQuery(req);
+  if (!orderSn || !/^\d+$/.test(shopId)) {
+    return res.status(400).json({ error: 'Informe orderSn e shopId válidos.' });
+  }
+
+  try {
+    const loaded = await loadShopeeAccountForLabel(req.user.uid, shopId);
+    if (loaded.error === 'account_not_found') {
+      return res.status(404).json({ canPrint: false, reason: 'Loja Shopee não conectada nesta conta.' });
+    }
+    if (loaded.error === 'server_config') {
+      return res.status(500).json({ canPrint: false, reason: 'Credenciais Shopee ausentes no servidor.' });
+    }
+    const { account, partnerId, partnerKey } = loaded;
+    const sale = await findShopeeSaleForLabel(req.user.uid, shopId, orderSn);
+
+    // get_shipping_parameter é o que acusa nota fiscal pendente/recusada.
+    const parameter = await withTokenRetry(
+      account,
+      (accessToken) => getShopeeShippingParameter({
+        partnerId, partnerKey, accessToken, shopId: account.shopId, orderSn, packageNumber,
+      }),
+      partnerId,
+      partnerKey
+    );
+
+    if (parameter?.error) {
+      const requiresInvoice = parameter.error === 'logistics.lack_of_invoice_data';
+      return res.json({
+        canPrint: false,
+        requiresInvoice,
+        status: requiresInvoice ? 'invoice_pending' : 'blocked',
+        code: parameter.error,
+        reason: shopeeLabelMessage(parameter.error, parameter.message),
+      });
+    }
+
+    // Estado da tarefa de etiqueta. "ainda não criada" não é impedimento: o
+    // download cria antes de baixar.
+    const result = await withTokenRetry(
+      account,
+      (accessToken) => getShopeeShippingDocumentResult({
+        partnerId, partnerKey, accessToken, shopId: account.shopId, orderSn, packageNumber, documentType,
+      }),
+      partnerId,
+      partnerKey
+    );
+    const item = firstShopeeResult(result);
+    const failCode = item?.fail_error || (result?.error && result.error !== 'common.batch_api_all_failed' ? result.error : null);
+
+    if (failCode && failCode !== 'logistics.shipping_document_should_print_first') {
+      return res.json({
+        canPrint: false,
+        requiresInvoice: failCode === 'logistics.lack_of_invoice_data',
+        status: 'blocked',
+        code: failCode,
+        reason: shopeeLabelMessage(failCode, item?.fail_message || result?.message),
+      });
+    }
+
+    return res.json({
+      canPrint: true,
+      status: item?.status === 'READY' ? 'ready' : 'pending_creation',
+      trackingNumber: sale?.tracking_number || null,
+      reason: item?.status === 'READY'
+        ? 'Etiqueta pronta para baixar.'
+        : 'A etiqueta será gerada na hora da impressão.',
+    });
+  } catch (error) {
+    const code = error?.shopeeCode;
+    console.error(`[Shopee Label] Falha ao checar etiqueta do pedido ${orderSn}:`, error.message);
+    return res.status(code ? 200 : 500).json({
+      canPrint: false,
+      status: 'blocked',
+      code: code || null,
+      reason: code
+        ? shopeeLabelMessage(code, error.message)
+        : 'Não foi possível checar a etiqueta na Shopee agora.',
+    });
+  }
+});
+
+/**
+ * Gera (se preciso) e baixa a etiqueta.
+ *
+ * Segue os três passos exigidos pela Shopee: cria a tarefa, espera virar READY
+ * e só então baixa. Enquanto o documento não está pronto a própria API responde
+ * `logistics.download_later`, então a espera é curta e limitada.
+ */
+router.get('/download-label', authenticateToken, async (req, res) => {
+  const { orderSn, shopId, packageNumber, documentType } = readLabelQuery(req);
+  if (!orderSn || !/^\d+$/.test(shopId)) {
+    return res.status(400).json({ error: 'Informe orderSn e shopId válidos.' });
+  }
+
+  const fail = (status, code, message) => res.status(status).json({
+    error: shopeeLabelMessage(code, message),
+    code: code || null,
+    requiresInvoice: code === 'logistics.lack_of_invoice_data',
+  });
+
+  try {
+    const loaded = await loadShopeeAccountForLabel(req.user.uid, shopId);
+    if (loaded.error === 'account_not_found') return fail(404, null, 'Loja Shopee não conectada nesta conta.');
+    if (loaded.error === 'server_config') return fail(500, null, 'Credenciais Shopee ausentes no servidor.');
+
+    const { account, partnerId, partnerKey } = loaded;
+    const sale = await findShopeeSaleForLabel(req.user.uid, shopId, orderSn);
+
+    const creation = await withTokenRetry(
+      account,
+      (accessToken) => createShopeeShippingDocument({
+        partnerId, partnerKey, accessToken, shopId: account.shopId,
+        orderSn, packageNumber, trackingNumber: sale?.tracking_number || null, documentType,
+      }),
+      partnerId,
+      partnerKey
+    );
+
+    const creationItem = firstShopeeResult(creation);
+    const creationError = creationItem?.fail_error
+      || (creation?.error && creation.error !== 'common.batch_api_all_failed' ? creation.error : null);
+    // "já foi criada" não é falha: segue para o download.
+    if (creationError && creationError !== 'logistics.shipping_document_should_print_first') {
+      console.warn(`[Shopee Label] Pedido ${orderSn} recusado na criação: ${creationError}`);
+      return fail(409, creationError, creationItem?.fail_message || creation?.message);
+    }
+
+    // Espera curta pelo READY. A doc só libera o download nesse estado.
+    let ready = false;
+    let lastCode = null;
+    let lastMessage = null;
+    for (let attempt = 0; attempt < 6 && !ready; attempt += 1) {
+      if (attempt) await waitBeforeRetry(1500);
+      const result = await withTokenRetry(
+        account,
+        (accessToken) => getShopeeShippingDocumentResult({
+          partnerId, partnerKey, accessToken, shopId: account.shopId, orderSn, packageNumber, documentType,
+        }),
+        partnerId,
+        partnerKey
+      );
+      const item = firstShopeeResult(result);
+      lastCode = item?.fail_error || null;
+      lastMessage = item?.fail_message || result?.message || null;
+      if (item?.status === 'READY') ready = true;
+      if (item?.status === 'FAILED') {
+        return fail(409, lastCode || 'logistics.package_print_failed', lastMessage);
+      }
+    }
+
+    if (!ready) {
+      return fail(409, lastCode || 'logistics.download_later', lastMessage);
+    }
+
+    const download = await withTokenRetry(
+      account,
+      (accessToken) => downloadShopeeShippingDocument({
+        partnerId, partnerKey, accessToken, shopId: account.shopId, orderSn, packageNumber, documentType,
+      }),
+      partnerId,
+      partnerKey
+    );
+
+    if (!download.ok) {
+      console.warn(`[Shopee Label] Download recusado no pedido ${orderSn}: ${download.error}`);
+      return fail(409, download.error, download.message);
+    }
+
+    const suffix = documentType === SHOPEE_LABEL_TYPES.thermal ? 'termica' : 'etiqueta';
+    res.setHeader('Content-Type', download.contentType || 'application/pdf');
+    res.setHeader('Content-Disposition', `attachment; filename="shopee-${suffix}-${orderSn}.pdf"`);
+    res.setHeader('Cache-Control', 'no-store');
+    return res.send(download.buffer);
+  } catch (error) {
+    const code = error?.shopeeCode || null;
+    console.error(`[Shopee Label] Falha ao baixar etiqueta do pedido ${orderSn}:`, error.message);
+    return fail(code ? 409 : 500, code, error.message);
   }
 });
 
