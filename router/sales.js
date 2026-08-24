@@ -91,7 +91,18 @@ const SALES_COUNT_CACHE_MAX = 500;
  */
 const responseCache = new Map();
 const responseInFlight = new Map();
+const responseFailureAt = new Map();
 const RESPONSE_CACHE_MAX = 400;
+/* Espera depois de uma bateria de agregações que falhou.
+ *
+ * Só sucesso vai para o cache, então uma agregação que estoura o
+ * statement_timeout era refeita a cada recarga da tela — e cada tentativa
+ * ocupava conexões do pool por 30s antes de morrer. Foi o que transformou uma
+ * consulta lenta em indisponibilidade geral: dashboard, facetas, armazenamento e
+ * contratos falhando juntos por falta de conexão livre.
+ *
+ * Mesma ideia do cooldown da contagem de vendas, alguns metros acima. */
+const RESPONSE_FAILURE_COOLDOWN_MS = configInt('SALES_AGG_FAILURE_COOLDOWN_MS', 45000, 0, 600000);
 
 function withResponseCache(key, ttlMs, producer) {
   const hit = responseCache.get(key);
@@ -101,15 +112,34 @@ function withResponseCache(key, ttlMs, producer) {
   const running = responseInFlight.get(key);
   if (running) return running;
 
+  const failedAt = responseFailureAt.get(key);
+  if (failedAt !== undefined) {
+    if (Date.now() - failedAt < RESPONSE_FAILURE_COOLDOWN_MS) {
+      return Promise.reject(new Error(
+        'A consulta anterior deste recorte excedeu o tempo limite. Reduza o período ou filtre por cliente e tente de novo em instantes.'
+      ));
+    }
+    responseFailureAt.delete(key);
+  }
+
   const promise = Promise.resolve()
     .then(producer)
     .then((payload) => {
+      responseFailureAt.delete(key);
       if (responseCache.size >= RESPONSE_CACHE_MAX) {
         const oldest = responseCache.keys().next().value;
         if (oldest !== undefined) responseCache.delete(oldest);
       }
       responseCache.set(key, { payload, at: Date.now() });
       return payload;
+    })
+    .catch((error) => {
+      if (responseFailureAt.size >= RESPONSE_CACHE_MAX) {
+        const oldest = responseFailureAt.keys().next().value;
+        if (oldest !== undefined) responseFailureAt.delete(oldest);
+      }
+      responseFailureAt.set(key, Date.now());
+      throw error;
     })
     .finally(() => responseInFlight.delete(key));
 
@@ -1882,11 +1912,20 @@ const U_CANCELLED = `(${U_OPERATIONAL_STATUS} IN ('cancelled', 'canceled', 'in_c
    OR LOWER(COALESCE(s.order_status, '')) IN ('cancelled', 'canceled', 'in_cancel'))`;
 /* FULL sai pela mão do marketplace, nunca pela nossa expedição.
  *
- * Precisa ser a modalidade RESOLVIDA, não a coluna crua: pedido do ML sem
- * `shipping_mode` mas com `logistic_type = fulfillment` é FULL, e testar a
- * coluna direto contava esse pedido como "a despachar". O filtro por prazo de
- * despacho já usava a expressão resolvida, então as duas regras divergiam. */
-const U_NOT_FULL = `${U_SHIPPING_MODE} IS DISTINCT FROM 'FULL'`;
+ * Precisa considerar a modalidade RESOLVIDA, não só a coluna crua: pedido do ML
+ * sem `shipping_mode` mas com `logistic_type = fulfillment` é FULL, e testar a
+ * coluna direto contava esse pedido como "a despachar".
+ *
+ * Escrito como teste direto em vez de `${U_SHIPPING_MODE} IS DISTINCT FROM
+ * 'FULL'` porque esta expressão entra em FILTER de agregação e é avaliada por
+ * linha: aqui é UMA extração de JSONB, contra o COALESCE de quatro braços com
+ * CASE de cinco WHEN da expressão completa. O resultado é o mesmo, já que
+ * nenhum outro braço do COALESCE produz 'FULL'. */
+const U_NOT_FULL = `NOT (
+  COALESCE(s.shipping_mode, '') = 'FULL'
+  OR (s.marketplace = 'ML'
+      AND LOWER(COALESCE(s.raw_api_data->'shipping'->>'logistic_type', '')) = 'fulfillment')
+)`;
 // Estados em que o pedido já deixou a nossa operação.
 const U_SHIPPED_STATUSES = `('shipped', 'delivered', 'completed', 'not_delivered')`;
 const U_PENDING = `(${U_NOT_FULL}
@@ -1924,7 +1963,7 @@ const asFilterList = (value) =>
 function buildUnifiedFilters(query, uid, options = {}) {
   const {
     skip = [], startIndex = 1, dateRange = null,
-    includeUids = null, excludeUids = null,
+    includeUids = null, excludeUids = null, maxWindowDays = null,
   } = options;
   const uses = (name) => !skip.includes(name);
 
@@ -1953,7 +1992,7 @@ function buildUnifiedFilters(query, uid, options = {}) {
 
   if (uses('period') && from) {
     conditions.push(`s.sale_date >= $${p}`); params.push(`${from}T00:00:00-03:00`); p++;
-  } else if (uses('period') && (query.window || '').trim() !== 'all') {
+  } else if (uses('period') && (maxWindowDays || (query.window || '').trim() !== 'all')) {
     /* Janela padrão obrigatória.
      *
      * Dashboard e facetas rodam de 5 a 7 agregações sobre a view unificada. Sem
@@ -1961,9 +2000,13 @@ function buildUnifiedFilters(query, uid, options = {}) {
      * canais, com extração de JSONB por linha — passava do statement_timeout de
      * 30s e ainda ocupava várias conexões do pool ao mesmo tempo.
      *
-     * `window=all` continua disponível como escolha explícita.
+     * `window=all` está disponível como escolha explícita, MENOS quando o
+     * chamador impõe `maxWindowDays`. A visão global do master não tem dono
+     * fixo: lá "todo o histórico" é o histórico somado de todos os clientes, e
+     * liberar isso esgotava o pool e derrubava telas de outros usuários. Nessa
+     * visão o teto é obrigatório, mesmo que a query peça `all`.
      */
-    const DEFAULT_DAYS = configInt('SALES_STATS_WINDOW_DAYS', 30, 1, 3650);
+    const DEFAULT_DAYS = maxWindowDays || configInt('SALES_STATS_WINDOW_DAYS', 30, 1, 3650);
     conditions.push(`s.sale_date >= (
       ((now() AT TIME ZONE 'America/Sao_Paulo')::date - ($${p})::int)
     ) AT TIME ZONE 'America/Sao_Paulo'`);
@@ -2087,10 +2130,73 @@ const UNIFIED_FILTER_FIELDS = [
   // `userNickname` recorta por cliente. Ambos mudam a agregação, então precisam
   // entrar na chave de cache.
   'scope', 'userNickname',
+  /* `facets` escolhe QUAIS listas calcular. Precisa entrar na chave, senão uma
+   * resposta reduzida seria servida a quem pediu todas — e o tabelão perderia
+   * os filtros de status. */
+  'facets',
 ];
+
+/** Nomes de faceta que o chamador pediu; vazio significa todas. */
+function requestedFacets(query) {
+  const wanted = asFilterList(query.facets);
+  return wanted.length ? new Set(wanted) : null;
+}
 
 const FACETS_TTL_MS = configInt('SALES_FACETS_TTL_MS', 60000, 5000, 600000);
 const DASHBOARD_TTL_MS = configInt('SALES_DASHBOARD_TTL_MS', 60000, 5000, 600000);
+
+/* Teto de data de venda da visão global do master.
+ *
+ * Na tela do cliente, "todo o histórico" é o histórico de um dono e o filtro por
+ * uid já limita a varredura. Na visão global não existe dono: cada agregação
+ * percorre as duas tabelas inteiras, de todos os clientes, pagando a lista de
+ * saída da view por linha (o Postgres não elimina colunas não usadas de um UNION
+ * ALL). Liberar isso esgotava o pool de 15 conexões e derrubava telas de outros
+ * usuários por falta de conexão livre.
+ *
+ * 90 dias cobre a operação com folga: pedido ainda por despachar tem venda de
+ * semanas atrás, não de trimestres. */
+const MASTER_WINDOW_DAYS = configInt('SALES_MASTER_WINDOW_DAYS', 90, 1, 730);
+
+/* Agregações da visão global rodam em série.
+ *
+ * Em `Promise.all` as 7 do dashboard e as 6 das facetas tomam 13 das 15 conexões
+ * do pool ao mesmo tempo, cada uma segurando a conexão pelos 30s do
+ * statement_timeout. A tela é servida de cache por 60s, então trocar
+ * paralelismo por fila custa latência na primeira carga e devolve o pool ao
+ * resto do sistema. */
+async function runSerial(tasks) {
+  const out = [];
+  for (const task of tasks) out.push(await task());
+  return out;
+}
+
+/** Em série na visão global, em paralelo na do cliente (que é escopada por uid). */
+function runAggregations(tasks, serial) {
+  return serial ? runSerial(tasks) : Promise.all(tasks.map((task) => task()));
+}
+
+/* Recorte grande demais não é erro de programação.
+ *
+ * Antes tudo virava "Erro interno ao carregar métricas", que convida a recarregar
+ * — e cada recarga refazia a varredura pesada. Separar o caso de tempo esgotado
+ * permite responder 503 com instrução (reduza o período, filtre por cliente) e
+ * mantém o 500 para defeito de verdade.
+ *
+ * 57014 é o `canceling statement due to statement timeout` do Postgres; as
+ * outras variantes vêm do pg-pool (`Query read timeout`, `timeout exceeded when
+ * trying to connect`) e do cooldown daqui. */
+function isAggregationTimeout(error) {
+  if (error?.code === '57014') return true;
+  return /timeout|tempo limite/i.test(String(error?.message || ''));
+}
+
+function aggregationTimeoutMessage(error) {
+  const own = String(error?.message || '');
+  if (/tempo limite/i.test(own)) return own;
+  return 'O recorte selecionado é grande demais e excedeu o tempo limite. '
+    + 'Reduza o período ou filtre por um cliente e tente de novo.';
+}
 
 router.get('/filter-facets', authenticateToken, async (req, res) => {
   /* Escopo. Master pode pedir a visão global (`scope=all`), que é o que o
@@ -2109,7 +2215,8 @@ router.get('/filter-facets', authenticateToken, async (req, res) => {
     );
     res.json(payload);
   } catch (error) {
-    console.error('Erro ao montar opções de filtro:', error);
+    console.error('Erro ao montar opções de filtro:', error.message);
+    if (isAggregationTimeout(error)) return res.status(503).json({ error: aggregationTimeoutMessage(error) });
     res.status(500).json({ error: 'Erro interno ao carregar opções de filtro.' });
   }
 });
@@ -2148,10 +2255,11 @@ async function buildFacets(req, uid, options = {}) {
       ? await resolveGlobalScopeUids(req.query)
       : { excludeUids: null, includeUids: null };
     const { excludeUids, includeUids } = scoped;
+    const maxWindowDays = globalScope ? MASTER_WINDOW_DAYS : null;
 
     const facet = (skipName, keyExpr, extraSelect = '') => {
       const { where, params } = buildUnifiedFilters(req.query, uid, {
-        skip: [skipName], includeUids, excludeUids,
+        skip: [skipName], includeUids, excludeUids, maxWindowDays,
       });
       return db.query(
         `SELECT ${keyExpr} AS value${extraSelect},
@@ -2165,15 +2273,26 @@ async function buildFacets(req, uid, options = {}) {
       );
     };
 
-    const [marketplaces, accounts, statuses, modes, saleStatuses, owners] = await Promise.all([
-      facet('marketplace', 's.marketplace'),
-      facet('account', U_ACCOUNT_KEY, `, COALESCE(NULLIF(s.account_nickname, ''), s.account_id) AS label`),
-      facet('shippingStatus', U_SHIPPING_STATUS),
-      facet('shippingMode', U_SHIPPING_MODE),
-      facet('saleStatus', `LOWER(COALESCE(NULLIF(s.order_status, ''), 'sem_status'))`),
+    /* Cada faceta é uma varredura própria. Na visão global elas custam caro, e o
+     * Dashboard Master não exibe status de envio nem status do pedido — calcular
+     * para descartar era um terço do custo da tela. */
+    const wanted = requestedFacets(req.query);
+    const asked = (name) => !wanted || wanted.has(name);
+    const empty = () => Promise.resolve({ rows: [] });
+
+    const [marketplaces, accounts, statuses, modes, saleStatuses, owners] = await runAggregations([
+      () => (asked('marketplace') ? facet('marketplace', 's.marketplace') : empty()),
+      () => (asked('account')
+        ? facet('account', U_ACCOUNT_KEY, `, COALESCE(NULLIF(s.account_nickname, ''), s.account_id) AS label`)
+        : empty()),
+      () => (asked('shippingStatus') ? facet('shippingStatus', U_SHIPPING_STATUS) : empty()),
+      () => (asked('shippingMode') ? facet('shippingMode', U_SHIPPING_MODE) : empty()),
+      () => (asked('saleStatus')
+        ? facet('saleStatus', `LOWER(COALESCE(NULLIF(s.order_status, ''), 'sem_status'))`)
+        : empty()),
       // O filtro de cliente só existe na visão master.
-      globalScope ? facet('userNickname', 's.uid') : Promise.resolve({ rows: [] }),
-    ]);
+      () => (globalScope && asked('userNickname') ? facet('userNickname', 's.uid') : empty()),
+    ], globalScope);
 
     /* O filtro do painel admin casa o cliente por NOME, então a faceta traduz
      * uid em nome e soma os totais de quem compartilha o mesmo nome. */
@@ -2240,7 +2359,8 @@ router.get('/dashboard-stats', authenticateToken, async (req, res) => {
     );
     res.json(payload);
   } catch (error) {
-    console.error('Erro ao montar métricas do dashboard:', error);
+    console.error('Erro ao montar métricas do dashboard:', error.message);
+    if (isAggregationTimeout(error)) return res.status(503).json({ error: aggregationTimeoutMessage(error) });
     res.status(500).json({ error: 'Erro interno ao carregar métricas.' });
   }
 });
@@ -2249,6 +2369,7 @@ async function buildDashboardStats(req, uid, options = {}) {
   const { globalScope = false } = options;
   const from = (req.query.from || '').trim();
   const to = (req.query.to || '').trim();
+  const maxWindowDays = globalScope ? MASTER_WINDOW_DAYS : null;
 
   {
     const scoped = globalScope
@@ -2258,7 +2379,7 @@ async function buildDashboardStats(req, uid, options = {}) {
 
     // Mesmo construtor usado por /filter-facets: garante que o número do card
     // e a opção clicada no filtro venham exatamente da mesma regra.
-    const current = buildUnifiedFilters(req.query, uid, { includeUids, excludeUids });
+    const current = buildUnifiedFilters(req.query, uid, { includeUids, excludeUids, maxWindowDays });
     const where = current.where;
     const params = current.params;
 
@@ -2280,6 +2401,7 @@ async function buildDashboardStats(req, uid, options = {}) {
         dateRange: { from: iso(prevStart), to: iso(prevEnd) },
         includeUids,
         excludeUids,
+        maxWindowDays,
       });
       previousWhere = previousFilters.where;
       previousParams = previousFilters.params;
@@ -2295,8 +2417,18 @@ async function buildDashboardStats(req, uid, options = {}) {
     const pendingExpr = U_PENDING;
     const shippedExpr = U_SHIPPED;
 
-    const [totals, byStatus, byDay, byMarketplace, byShippingMode, byAccount, topSkus, previous] = await Promise.all([
-      db.query(
+    /* Agregações que a visão global NÃO pede.
+     *
+     * O Dashboard Master mostra cards, modalidade, canal e contas. Série por
+     * dia, ranking de status e top de SKUs são da tela do cliente, e cada uma é
+     * uma varredura completa das duas tabelas de todos os clientes. Cobrar isso
+     * para depois jogar fora era metade do custo da tela. */
+    const skipHeavyDetail = globalScope;
+    const noRows = () => Promise.resolve({ rows: [] });
+
+    const [totals, byStatus, byDay, byMarketplace, byShippingMode, byAccount, topSkus, previous] =
+      await runAggregations([
+      () => db.query(
         `SELECT
            COUNT(DISTINCT ${orderKey})::int AS orders,
            COUNT(DISTINCT ${orderKey})::int AS sales,
@@ -2315,28 +2447,28 @@ async function buildDashboardStats(req, uid, options = {}) {
          FROM public.unified_sales s ${where}`,
         params
       ),
-      db.query(
+      () => (skipHeavyDetail ? noRows() : db.query(
         `SELECT ${U_SHIPPING_STATUS} AS label,
                 COUNT(DISTINCT ${orderKey})::int AS value
          FROM public.unified_sales s ${where}
          GROUP BY 1 ORDER BY value DESC LIMIT 9`,
         params
-      ),
-      db.query(
+      )),
+      () => (skipHeavyDetail ? noRows() : db.query(
         // Dia no fuso de Brasília, para casar com o que o usuário vê na tela.
         `SELECT (s.sale_date AT TIME ZONE 'America/Sao_Paulo')::date AS day,
                 COUNT(DISTINCT ${orderKey})::int AS value
          FROM public.unified_sales s ${where}
          GROUP BY 1 ORDER BY 1 ASC`,
         params
-      ),
-      db.query(
+      )),
+      () => db.query(
         `SELECT s.marketplace, COUNT(DISTINCT ${orderKey})::int AS value
          FROM public.unified_sales s ${where}
          GROUP BY 1 ORDER BY value DESC`,
         params
       ),
-      db.query(
+      () => db.query(
         `SELECT ${U_SHIPPING_MODE} AS mode,
                 COUNT(DISTINCT ${orderKey})::int AS value
          FROM public.unified_sales s ${where}
@@ -2348,7 +2480,7 @@ async function buildDashboardStats(req, uid, options = {}) {
        * O Dashboard Master precisa das ~20 contas de todos os clientes lado a
        * lado, então o limite é maior que o das outras facetas. Vem com pendente
        * e despachado por conta para a tela não ter que cruzar duas chamadas. */
-      db.query(
+      () => db.query(
         `SELECT ${U_ACCOUNT_KEY} AS account_key,
                 COALESCE(NULLIF(s.account_nickname, ''), s.account_id) AS label,
                 COUNT(DISTINCT ${orderKey})::int AS value,
@@ -2358,7 +2490,7 @@ async function buildDashboardStats(req, uid, options = {}) {
          GROUP BY 1, 2 ORDER BY value DESC LIMIT 30`,
         params
       ),
-      db.query(
+      () => (skipHeavyDetail ? noRows() : db.query(
         `SELECT s.sku,
                 (array_agg(s.product_title ORDER BY s.sale_date DESC))[1] AS title,
                 COALESCE(SUM(s.quantity), 0)::int AS units,
@@ -2366,8 +2498,8 @@ async function buildDashboardStats(req, uid, options = {}) {
          FROM public.unified_sales s ${where}
          GROUP BY s.sku ORDER BY units DESC LIMIT 8`,
         params
-      ),
-      previousWhere
+      )),
+      () => (previousWhere
         ? db.query(
             `SELECT COUNT(DISTINCT ${orderKey})::int AS orders,
                     COUNT(DISTINCT ${orderKey})::int AS sales,
@@ -2375,8 +2507,8 @@ async function buildDashboardStats(req, uid, options = {}) {
              FROM public.unified_sales s ${previousWhere}`,
             previousParams
           )
-        : Promise.resolve({ rows: [] }),
-    ]);
+        : noRows()),
+    ], globalScope);
 
     return {
       totals: totals.rows[0] || {
