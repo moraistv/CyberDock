@@ -882,9 +882,24 @@ const SHOPEE_AWAITING_SHIPMENT_REASON = 'A Shopee ainda não gerou o código de 
   + 'A etiqueta só é liberada depois que o envio é agendado (coleta ou postagem) na Shopee. '
   + 'Agende o envio e sincronize as vendas para atualizar aqui.';
 
-/** Traduz o código da Shopee, mantendo o texto original como último recurso. */
+/**
+ * Traduz o código da Shopee.
+ *
+ * Antes o texto original entrava como fallback direto e o operador via inglês
+ * cru na tela (por exemplo "Package OFG241271838164384 not eligible for
+ * rescheduling"), que não diz o que fazer. Agora o inglês nunca é a mensagem:
+ * vira detalhe atrás de uma frase em português, com o código, para o suporte
+ * conseguir mapear o caso na próxima vez.
+ *
+ * Quando não há código, o `fallback` é texto nosso (já em português) e vale
+ * como está.
+ */
 function shopeeLabelMessage(code, fallback) {
-  return SHOPEE_LABEL_MESSAGES[code] || fallback || 'A Shopee não liberou a etiqueta deste pedido.';
+  if (!code) return fallback || 'A Shopee não liberou a etiqueta deste pedido.';
+  if (SHOPEE_LABEL_MESSAGES[code]) return SHOPEE_LABEL_MESSAGES[code];
+
+  const detail = [fallback, code].filter(Boolean).join(' · ');
+  return `A Shopee recusou a etiqueta deste pedido e não informou um motivo traduzido. Resposta da Shopee: ${detail}`;
 }
 
 /** Primeiro item do result_list, onde as APIs batch reportam falha por pedido. */
@@ -981,6 +996,34 @@ router.get('/label-info', authenticateToken, async (req, res) => {
     const { account, partnerId, partnerKey } = loaded;
     const sale = await findShopeeSaleForLabel(ownerUid, shopId, orderSn);
 
+    /* Estado da tarefa de etiqueta vem PRIMEIRO, de propósito.
+     *
+     * Documento READY encerra a checagem: a etiqueta já existe na Shopee e o
+     * download funciona. A Shopee trata a impressão como evento único do envio,
+     * então um pedido já expedido por outro sistema faz o get_shipping_parameter
+     * recusar — e checar o parâmetro antes negava etiqueta que a Shopee
+     * entrega. Foi o que travou os pedidos da CONDROENERGY já expedidos fora do
+     * CyberDock. "Ainda não criada" também não é impedimento: o download cria
+     * antes de baixar. */
+    const result = await withTokenRetry(
+      account,
+      (accessToken) => getShopeeShippingDocumentResult({
+        partnerId, partnerKey, accessToken, shopId: account.shopId, orderSn, packageNumber, documentType,
+      }),
+      partnerId,
+      partnerKey
+    );
+    const item = firstShopeeResult(result);
+
+    if (item?.status === 'READY') {
+      return res.json({
+        canPrint: true,
+        status: 'ready',
+        trackingNumber: sale?.tracking_number || null,
+        reason: 'Etiqueta pronta para baixar.',
+      });
+    }
+
     // get_shipping_parameter é o que acusa nota fiscal pendente/recusada.
     const parameter = await withTokenRetry(
       account,
@@ -1002,17 +1045,6 @@ router.get('/label-info', authenticateToken, async (req, res) => {
       });
     }
 
-    // Estado da tarefa de etiqueta. "ainda não criada" não é impedimento: o
-    // download cria antes de baixar.
-    const result = await withTokenRetry(
-      account,
-      (accessToken) => getShopeeShippingDocumentResult({
-        partnerId, partnerKey, accessToken, shopId: account.shopId, orderSn, packageNumber, documentType,
-      }),
-      partnerId,
-      partnerKey
-    );
-    const item = firstShopeeResult(result);
     const failCode = item?.fail_error || (result?.error && result.error !== 'common.batch_api_all_failed' ? result.error : null);
 
     if (failCode && failCode !== 'logistics.shipping_document_should_print_first') {
@@ -1025,8 +1057,8 @@ router.get('/label-info', authenticateToken, async (req, res) => {
       });
     }
 
-    // Documento pronto dispensa rastreio: a etiqueta já existe na Shopee.
-    if (item?.status !== 'READY' && !sale?.tracking_number) {
+    // Sem documento pronto, sem rastreio não há etiqueta para criar.
+    if (!sale?.tracking_number) {
       return res.json({
         canPrint: false,
         requiresInvoice: false,
@@ -1039,11 +1071,9 @@ router.get('/label-info', authenticateToken, async (req, res) => {
 
     return res.json({
       canPrint: true,
-      status: item?.status === 'READY' ? 'ready' : 'pending_creation',
-      trackingNumber: sale?.tracking_number || null,
-      reason: item?.status === 'READY'
-        ? 'Etiqueta pronta para baixar.'
-        : 'A etiqueta será gerada na hora da impressão.',
+      status: 'pending_creation',
+      trackingNumber: sale.tracking_number,
+      reason: 'A etiqueta será gerada na hora da impressão.',
     });
   } catch (error) {
     const code = error?.shopeeCode;
@@ -1087,44 +1117,62 @@ router.get('/download-label', authenticateToken, async (req, res) => {
     const { account, partnerId, partnerKey } = loaded;
     const sale = await findShopeeSaleForLabel(ownerUid, shopId, orderSn);
 
-    /* Se o documento já existe, o download funciona mesmo sem rastreio nosso.
-     * Só quando ele não existe é que a falta de rastreio é impedimento real. */
-    if (!sale?.tracking_number) {
-      const existing = await withTokenRetry(
-        account,
-        (accessToken) => getShopeeShippingDocumentResult({
-          partnerId, partnerKey, accessToken, shopId: account.shopId, orderSn, packageNumber, documentType,
-        }),
-        partnerId,
-        partnerKey
-      );
-      if (firstShopeeResult(existing)?.status !== 'READY') {
-        console.warn(`[Shopee Label] Pedido ${orderSn} sem rastreio: envio ainda não agendado.`);
-        return fail(409, null, SHOPEE_AWAITING_SHIPMENT_REASON, { awaitingShipment: true });
-      }
-    }
-
-    const creation = await withTokenRetry(
+    const readDocumentStatus = () => withTokenRetry(
       account,
-      (accessToken) => createShopeeShippingDocument({
-        partnerId, partnerKey, accessToken, shopId: account.shopId,
-        orderSn, packageNumber, trackingNumber: sale?.tracking_number || null, documentType,
+      (accessToken) => getShopeeShippingDocumentResult({
+        partnerId, partnerKey, accessToken, shopId: account.shopId, orderSn, packageNumber, documentType,
       }),
       partnerId,
       partnerKey
     );
 
-    const creationItem = firstShopeeResult(creation);
-    const creationError = creationItem?.fail_error
-      || (creation?.error && creation.error !== 'common.batch_api_all_failed' ? creation.error : null);
-    // "já foi criada" não é falha: segue para o download.
-    if (creationError && creationError !== 'logistics.shipping_document_should_print_first') {
-      console.warn(`[Shopee Label] Pedido ${orderSn} recusado na criação: ${creationError}`);
-      return fail(409, creationError, creationItem?.fail_message || creation?.message);
+    /* Documento já pronto vai direto para o download.
+     *
+     * A Shopee trata a impressão como evento único do envio: se a etiqueta já
+     * saiu (aqui ou em outro sistema), ela recusa criar de novo, mas continua
+     * entregando o documento existente. Chamar a criação nesse caso só rendia
+     * uma recusa que virava erro na tela. Sem documento pronto, a falta de
+     * rastreio é impedimento real: não há o que criar. */
+    let documentReady = firstShopeeResult(await readDocumentStatus())?.status === 'READY';
+
+    if (!documentReady && !sale?.tracking_number) {
+      console.warn(`[Shopee Label] Pedido ${orderSn} sem rastreio: envio ainda não agendado.`);
+      return fail(409, null, SHOPEE_AWAITING_SHIPMENT_REASON, { awaitingShipment: true });
+    }
+
+    if (!documentReady) {
+      const creation = await withTokenRetry(
+        account,
+        (accessToken) => createShopeeShippingDocument({
+          partnerId, partnerKey, accessToken, shopId: account.shopId,
+          orderSn, packageNumber, trackingNumber: sale?.tracking_number || null, documentType,
+        }),
+        partnerId,
+        partnerKey
+      );
+
+      const creationItem = firstShopeeResult(creation);
+      const creationError = creationItem?.fail_error
+        || (creation?.error && creation.error !== 'common.batch_api_all_failed' ? creation.error : null);
+      // "já foi criada" não é falha: segue para o download.
+      if (creationError && creationError !== 'logistics.shipping_document_should_print_first') {
+        /* Recusa na criação ainda pode ter documento do outro lado: a etiqueta
+         * pode ter sido gerada entre a checagem e agora, ou por outro operador.
+         * Só desistimos depois de confirmar que não existe documento pronto. */
+        const creationDetail = creationItem?.fail_message || creation?.message || 'sem detalhe';
+        documentReady = firstShopeeResult(await readDocumentStatus())?.status === 'READY';
+
+        if (!documentReady) {
+          console.warn(`[Shopee Label] Pedido ${orderSn} recusado na criação: ${creationError} — ${creationDetail}`);
+          return fail(409, creationError, creationItem?.fail_message || creation?.message);
+        }
+        console.warn(`[Shopee Label] Pedido ${orderSn}: criação recusada (${creationError} — ${creationDetail}), `
+          + 'mas o documento já existe na Shopee. Baixando o existente.');
+      }
     }
 
     // Espera curta pelo READY. A doc só libera o download nesse estado.
-    let ready = false;
+    let ready = documentReady;
     let lastCode = null;
     let lastMessage = null;
     for (let attempt = 0; attempt < 6 && !ready; attempt += 1) {
@@ -1160,7 +1208,8 @@ router.get('/download-label', authenticateToken, async (req, res) => {
     );
 
     if (!download.ok) {
-      console.warn(`[Shopee Label] Download recusado no pedido ${orderSn}: ${download.error}`);
+      console.warn(`[Shopee Label] Download recusado no pedido ${orderSn}: ${download.error} `
+        + `— ${download.message || 'sem detalhe'}`);
       return fail(409, download.error, download.message);
     }
 
