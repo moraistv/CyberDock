@@ -1880,9 +1880,25 @@ const U_OPERATIONAL_STATUS = `LOWER(COALESCE(
 ))`;
 const U_CANCELLED = `(${U_OPERATIONAL_STATUS} IN ('cancelled', 'canceled', 'in_cancel')
    OR LOWER(COALESCE(s.order_status, '')) IN ('cancelled', 'canceled', 'in_cancel'))`;
-const U_PENDING = `(s.shipping_mode IS DISTINCT FROM 'FULL'
+/* FULL sai pela mão do marketplace, nunca pela nossa expedição.
+ *
+ * Precisa ser a modalidade RESOLVIDA, não a coluna crua: pedido do ML sem
+ * `shipping_mode` mas com `logistic_type = fulfillment` é FULL, e testar a
+ * coluna direto contava esse pedido como "a despachar". O filtro por prazo de
+ * despacho já usava a expressão resolvida, então as duas regras divergiam. */
+const U_NOT_FULL = `${U_SHIPPING_MODE} IS DISTINCT FROM 'FULL'`;
+// Estados em que o pedido já deixou a nossa operação.
+const U_SHIPPED_STATUSES = `('shipped', 'delivered', 'completed', 'not_delivered')`;
+const U_PENDING = `(${U_NOT_FULL}
    AND NOT ${U_CANCELLED}
-   AND ${U_OPERATIONAL_STATUS} NOT IN ('shipped', 'delivered', 'completed', 'not_delivered'))`;
+   AND ${U_OPERATIONAL_STATUS} NOT IN ${U_SHIPPED_STATUSES})`;
+/* Complemento exato de U_PENDING dentro do que passa pela expedição.
+ *
+ * Assim "a despachar" + "despachadas" + canceladas + FULL fecha o total do
+ * período, e o master consegue conferir o número em vez de ter que confiar. */
+const U_SHIPPED = `(${U_NOT_FULL}
+   AND NOT ${U_CANCELLED}
+   AND ${U_OPERATIONAL_STATUS} IN ${U_SHIPPED_STATUSES})`;
 const U_SKU_MAPPED = `EXISTS (
   SELECT 1 FROM public.skus sk
    WHERE sk.user_id = s.uid
@@ -1970,7 +1986,7 @@ function buildUnifiedFilters(query, uid, options = {}) {
   }
   // Filtrar por prazo de despacho exclui FULL: quem expede FULL é o marketplace.
   if (uses('shipPeriod') && (shipFrom || shipTo)) {
-    conditions.push(`${U_SHIPPING_MODE} IS DISTINCT FROM 'FULL'`);
+    conditions.push(U_NOT_FULL);
   }
 
   const marketplace = (query.marketplace || '').trim();
@@ -2042,6 +2058,7 @@ function buildUnifiedFilters(query, uid, options = {}) {
 
   const queue = (query.queue || '').trim();
   if (uses('queue') && queue === 'pending') conditions.push(U_PENDING);
+  if (uses('queue') && queue === 'shipped') conditions.push(U_SHIPPED);
   if (uses('queue') && queue === 'cancelled') conditions.push(U_CANCELLED);
   if (uses('queue') && queue === 'valid') conditions.push(`NOT ${U_CANCELLED}`);
 
@@ -2097,28 +2114,40 @@ router.get('/filter-facets', authenticateToken, async (req, res) => {
   }
 });
 
+/**
+ * Recorte por cliente da visão master global.
+ *
+ * Na visão global não existe dono fixo, então o recorte é resolvido aqui, do
+ * mesmo modo que /sales/all faz: esconde cliente inativo e, se o filtro de
+ * cliente estiver preenchido, restringe aos uids daquele nome.
+ *
+ * Compartilhado entre facetas e dashboard de propósito: se cada um resolvesse os
+ * uids do seu jeito, o número do card e a contagem do filtro divergiriam.
+ */
+async function resolveGlobalScopeUids(query) {
+  const userNickname = (query.userNickname || '').trim();
+  const [inactive, byName] = await Promise.all([
+    db.query('SELECT uid FROM public.users WHERE active = false'),
+    userNickname
+      ? db.query('SELECT uid FROM public.users WHERE name ILIKE $1', [`%${userNickname}%`])
+      : Promise.resolve({ rows: [] }),
+  ]);
+  return {
+    excludeUids: inactive.rows.map((r) => r.uid),
+    // Lista vazia é intencional: nome sem cliente correspondente não tem venda
+    // alguma, e é isso que a tela deve mostrar.
+    includeUids: userNickname ? byName.rows.map((r) => r.uid) : null,
+  };
+}
+
 async function buildFacets(req, uid, options = {}) {
   {
     const { globalScope = false } = options;
 
-    /* Na visão global não existe dono fixo: o recorte por usuário é resolvido
-     * aqui, do mesmo modo que /sales/all faz — esconde cliente inativo e, se o
-     * filtro de cliente estiver preenchido, restringe aos uids daquele nome. */
-    let excludeUids = null;
-    let includeUids = null;
-    const userNickname = (req.query.userNickname || '').trim();
-    if (globalScope) {
-      const [inactive, byName] = await Promise.all([
-        db.query('SELECT uid FROM public.users WHERE active = false'),
-        userNickname
-          ? db.query('SELECT uid FROM public.users WHERE name ILIKE $1', [`%${userNickname}%`])
-          : Promise.resolve({ rows: [] }),
-      ]);
-      excludeUids = inactive.rows.map((r) => r.uid);
-      // Lista vazia é intencional: nome sem cliente correspondente não tem
-      // opção alguma, e é isso que a tela deve mostrar.
-      if (userNickname) includeUids = byName.rows.map((r) => r.uid);
-    }
+    const scoped = globalScope
+      ? await resolveGlobalScopeUids(req.query)
+      : { excludeUids: null, includeUids: null };
+    const { excludeUids, includeUids } = scoped;
 
     const facet = (skipName, keyExpr, extraSelect = '') => {
       const { where, params } = buildUnifiedFilters(req.query, uid, {
@@ -2191,10 +2220,24 @@ async function buildFacets(req, uid, options = {}) {
 }
 
 router.get('/dashboard-stats', authenticateToken, async (req, res) => {
-  const { uid } = req.user;
+  /* Escopo, mesmo contrato de /filter-facets: só master alcança a visão global
+   * (`scope=all`), que é o que o Dashboard Master consome. Usuário comum que
+   * mandar `scope=all` continua preso ao próprio uid do token.
+   *
+   * A chave de cache usa o uid do TOKEN, não o escopo resolvido, e `scope` já
+   * faz parte de UNIFIED_FILTER_FIELDS — visão global e visão do próprio master
+   * não se misturam no cache. */
+  const isMaster = req.user.role === 'master';
+  const globalScope = isMaster && (req.query.scope || '').trim() === 'all';
+  const uid = globalScope ? null : req.user.uid;
+
   try {
-    const cacheKey = cacheKeyFromQuery(`dashboard|${uid}`, req.query, UNIFIED_FILTER_FIELDS);
-    const payload = await withResponseCache(cacheKey, DASHBOARD_TTL_MS, () => buildDashboardStats(req, uid));
+    const cacheKey = cacheKeyFromQuery(`dashboard|${req.user.uid}`, req.query, UNIFIED_FILTER_FIELDS);
+    const payload = await withResponseCache(
+      cacheKey,
+      DASHBOARD_TTL_MS,
+      () => buildDashboardStats(req, uid, { globalScope })
+    );
     res.json(payload);
   } catch (error) {
     console.error('Erro ao montar métricas do dashboard:', error);
@@ -2202,14 +2245,20 @@ router.get('/dashboard-stats', authenticateToken, async (req, res) => {
   }
 });
 
-async function buildDashboardStats(req, uid) {
+async function buildDashboardStats(req, uid, options = {}) {
+  const { globalScope = false } = options;
   const from = (req.query.from || '').trim();
   const to = (req.query.to || '').trim();
 
   {
+    const scoped = globalScope
+      ? await resolveGlobalScopeUids(req.query)
+      : { excludeUids: null, includeUids: null };
+    const { excludeUids, includeUids } = scoped;
+
     // Mesmo construtor usado por /filter-facets: garante que o número do card
     // e a opção clicada no filtro venham exatamente da mesma regra.
-    const current = buildUnifiedFilters(req.query, uid);
+    const current = buildUnifiedFilters(req.query, uid, { includeUids, excludeUids });
     const where = current.where;
     const params = current.params;
 
@@ -2229,6 +2278,8 @@ async function buildDashboardStats(req, uid) {
       // Mesmos filtros, apenas deslocando a janela de datas.
       const previousFilters = buildUnifiedFilters(req.query, uid, {
         dateRange: { from: iso(prevStart), to: iso(prevEnd) },
+        includeUids,
+        excludeUids,
       });
       previousWhere = previousFilters.where;
       previousParams = previousFilters.params;
@@ -2242,8 +2293,9 @@ async function buildDashboardStats(req, uid) {
     // que o filtro `queue` aplica — card e filtro nunca divergem.
     const cancelledExpr = U_CANCELLED;
     const pendingExpr = U_PENDING;
+    const shippedExpr = U_SHIPPED;
 
-    const [totals, byStatus, byDay, byMarketplace, byShippingMode, topSkus, previous] = await Promise.all([
+    const [totals, byStatus, byDay, byMarketplace, byShippingMode, byAccount, topSkus, previous] = await Promise.all([
       db.query(
         `SELECT
            COUNT(DISTINCT ${orderKey})::int AS orders,
@@ -2251,6 +2303,8 @@ async function buildDashboardStats(req, uid) {
            COALESCE(SUM(s.quantity), 0)::int AS units,
            (COUNT(DISTINCT ${orderKey}) FILTER (WHERE ${pendingExpr}))::int AS pending_orders,
            (COUNT(DISTINCT ${orderKey}) FILTER (WHERE ${pendingExpr}))::int AS pending,
+           (COUNT(DISTINCT ${orderKey}) FILTER (WHERE ${shippedExpr}))::int AS shipped_orders,
+           (COUNT(DISTINCT ${orderKey}) FILTER (WHERE ${shippedExpr}))::int AS shipped,
            (COUNT(DISTINCT ${orderKey}) FILTER (WHERE NOT (${cancelledExpr})))::int AS valid_orders,
            (COUNT(DISTINCT ${orderKey}) FILTER (WHERE ${cancelledExpr}))::int AS cancelled_orders,
            (COUNT(DISTINCT ${orderKey}) FILTER (WHERE ${cancelledExpr}))::int AS cancelled,
@@ -2289,6 +2343,21 @@ async function buildDashboardStats(req, uid) {
          GROUP BY 1 ORDER BY value DESC LIMIT 8`,
         params
       ),
+      /* Distribuição por conta.
+       *
+       * O Dashboard Master precisa das ~20 contas de todos os clientes lado a
+       * lado, então o limite é maior que o das outras facetas. Vem com pendente
+       * e despachado por conta para a tela não ter que cruzar duas chamadas. */
+      db.query(
+        `SELECT ${U_ACCOUNT_KEY} AS account_key,
+                COALESCE(NULLIF(s.account_nickname, ''), s.account_id) AS label,
+                COUNT(DISTINCT ${orderKey})::int AS value,
+                (COUNT(DISTINCT ${orderKey}) FILTER (WHERE ${pendingExpr}))::int AS pending,
+                (COUNT(DISTINCT ${orderKey}) FILTER (WHERE ${shippedExpr}))::int AS shipped
+         FROM public.unified_sales s ${where}
+         GROUP BY 1, 2 ORDER BY value DESC LIMIT 30`,
+        params
+      ),
       db.query(
         `SELECT s.sku,
                 (array_agg(s.product_title ORDER BY s.sale_date DESC))[1] AS title,
@@ -2312,6 +2381,7 @@ async function buildDashboardStats(req, uid) {
     return {
       totals: totals.rows[0] || {
         orders: 0, sales: 0, units: 0, pending_orders: 0, pending: 0,
+        shipped_orders: 0, shipped: 0,
         valid_orders: 0, cancelled_orders: 0, cancelled: 0,
         processed_orders: 0, processed: 0, processed_lines: 0, distinct_skus: 0,
       },
@@ -2323,6 +2393,16 @@ async function buildDashboardStats(req, uid) {
       })),
       byMarketplace: byMarketplace.rows,
       byShippingMode: byShippingMode.rows,
+      // Canal vem do prefixo da chave, igual às facetas, para a tela conseguir
+      // pôr a logo do marketplace na frente do apelido da conta.
+      byAccount: byAccount.rows.map((r) => ({
+        value: r.account_key,
+        label: r.label || r.account_key,
+        marketplace: String(r.account_key || '').split(':')[0],
+        orders: r.value,
+        pending: r.pending,
+        shipped: r.shipped,
+      })),
       topSkus: topSkus.rows,
     };
   }

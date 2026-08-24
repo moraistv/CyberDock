@@ -288,6 +288,97 @@ router.get('/user/:userId/billing-summary', authenticateToken, requireOwnerOrMas
   }
 });
 
+/* Dimensão numérica tolerante.
+ *
+ * `dimensoes` é JSONB livre: uma linha com "20,5", "" ou texto derruba o cast.
+ * Numa soma que varre TODOS os clientes, uma linha ruim de um cliente zeraria o
+ * card do painel inteiro — diferente do billing por usuário, onde o estrago
+ * fica contido. Valor que não é número limpo conta como zero.
+ */
+const numericDimension = (key) => `CASE
+      WHEN (s.dimensoes->>'${key}') ~ '^[0-9]+(\\.[0-9]+)?$'
+      THEN (s.dimensoes->>'${key}')::numeric
+      ELSE 0
+    END`;
+
+/**
+ * @route   GET /api/storage/master/consumed-summary
+ * @desc    Armazenamento consumido e contratado, somado de todos os clientes.
+ * @access  Private (Master)
+ *
+ * Existe para o Dashboard Master mostrar a ocupação total sem fazer N chamadas a
+ * /user/:userId/billing-summary — que além de N idas ao banco recalcula custos e
+ * movimentações, caro e desnecessário aqui.
+ *
+ * A regra de volume acompanha a tela do cliente: kit não tem volume próprio
+ * (o volume está nos componentes), então kit conta zero. Sem isso o total do
+ * painel não fecharia com a soma das telas individuais.
+ */
+router.get('/master/consumed-summary', authenticateToken, requireMaster, async (req, res) => {
+  try {
+    const query = `
+      WITH consumo AS (
+        SELECT s.user_id AS uid,
+               COALESCE(SUM(
+                 ${numericDimension('altura')}
+                 * ${numericDimension('largura')}
+                 * ${numericDimension('comprimento')}
+                 / 1000000 * COALESCE(s.quantidade, 0)
+               ), 0) AS consumed_volume,
+               COUNT(*)::int AS sku_count
+          FROM public.skus s
+         WHERE COALESCE(s.is_kit, false) = false
+         GROUP BY s.user_id
+      ),
+      contratado AS (
+        SELECT uc.uid, COALESCE(SUM(uc.volume), 0) AS contracted_volume
+          FROM public.user_contracts uc
+         GROUP BY uc.uid
+      )
+      SELECT u.uid,
+             COALESCE(NULLIF(TRIM(u.name), ''), u.email) AS name,
+             COALESCE(c.consumed_volume, 0)::float8 AS consumed_volume,
+             COALESCE(t.contracted_volume, 0)::float8 AS contracted_volume,
+             COALESCE(c.sku_count, 0) AS sku_count
+        FROM public.users u
+        LEFT JOIN consumo c ON c.uid = u.uid
+        LEFT JOIN contratado t ON t.uid = u.uid
+       WHERE u.active = true
+         AND COALESCE(u.role, '') <> 'master'
+       ORDER BY consumed_volume DESC;
+    `;
+    const { rows } = await db.query(query);
+
+    const clients = rows.map((r) => ({
+      uid: r.uid,
+      name: r.name,
+      consumedVolume: Number(r.consumed_volume) || 0,
+      contractedVolume: Number(r.contracted_volume) || 0,
+      skuCount: r.sku_count,
+      occupancyPercent: Number(r.contracted_volume) > 0
+        ? Math.min((Number(r.consumed_volume) / Number(r.contracted_volume)) * 100, 100)
+        : 0,
+    }));
+
+    const totalConsumedVolume = clients.reduce((sum, c) => sum + c.consumedVolume, 0);
+    const totalContractedVolume = clients.reduce((sum, c) => sum + c.contractedVolume, 0);
+
+    res.json({
+      totalConsumedVolume,
+      totalContractedVolume,
+      occupancyPercent: totalContractedVolume > 0
+        ? Math.min((totalConsumedVolume / totalContractedVolume) * 100, 100)
+        : 0,
+      clientCount: clients.length,
+      clientsWithVolume: clients.filter((c) => c.consumedVolume > 0).length,
+      clients,
+    });
+  } catch (error) {
+    console.error('Erro ao somar armazenamento de todos os clientes:', error);
+    res.status(500).json({ error: 'Erro interno ao somar o armazenamento dos clientes.' });
+  }
+});
+
 // --- ROTAS DE GERENCIAMENTO DE SKU ---
 
 // GET /api/storage/user/:userId/available-child-skus
