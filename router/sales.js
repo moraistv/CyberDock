@@ -560,6 +560,17 @@ function buildInsertBatchRows(orders, targetUid, nickname) {
         // Sem marcador: enriquecimento incompleto ou outro fluxo de gravação.
         // Fica nulo de propósito para o pedido ser reavaliado na próxima vez.
         remote_state: order?.__remoteState || null,
+        /* Campos derivados: cópia dos escalares que as agregações leem, para
+         * elas não precisarem abrir o JSON (que é TOAST). Ver o comentário em
+         * UNIFIED_AGG_SOURCE e a extração espelhada em utils/init-db.js.
+         *
+         * `?? null` de propósito, não `|| ''`: ausente tem de virar NULL, porque
+         * U_OPERATIONAL_STATUS depende do NULL para cair para o campo seguinte. */
+        order_status: order?.status ?? null,
+        logistic_type: order?.shipping?.logistic_type ?? null,
+        shipment_status: order?.shipping?.status ?? null,
+        sla_expected_date: parseSlaExpectedDate(order),
+        derived_fields_at: new Date(),
         raw_api_data: order
       });
     }
@@ -567,11 +578,27 @@ function buildInsertBatchRows(orders, targetUid, nickname) {
   return rows;
 }
 
+/**
+ * Prazo do SLA como instante, ou null.
+ *
+ * Mesma validação do backfill em utils/init-db.js: só aceita o texto no formato
+ * de data ISO. O ML às vezes devolve string vazia ou valor inesperado, e um cast
+ * cru quebraria a gravação do lote inteiro.
+ */
+function parseSlaExpectedDate(order) {
+  const raw = order?.sla_data?.expected_date;
+  if (typeof raw !== 'string' || !/^\d{4}-\d{2}-\d{2}/.test(raw)) return null;
+  const parsed = new Date(raw);
+  return Number.isNaN(parsed.getTime()) ? null : parsed;
+}
+
 function buildMultiInsertQuery_DoUpdate(rows) {
   const cols = [
     'id', 'sku', 'uid', 'seller_id', 'channel', 'account_nickname',
     'sale_date', 'product_title', 'quantity', 'shipping_mode',
-    'shipping_limit_date', 'packages', 'date_last_updated', 'sync_signature', 'remote_state', 'raw_api_data', 'updated_at'
+    'shipping_limit_date', 'packages', 'date_last_updated', 'sync_signature', 'remote_state',
+    'order_status', 'logistic_type', 'shipment_status', 'sla_expected_date', 'derived_fields_at',
+    'raw_api_data', 'updated_at'
   ];
   const values = [];
   const params = [];
@@ -619,7 +646,12 @@ function buildMultiInsertQuery_DoUpdate(rows) {
       id, r.sku, r.uid, sellerId, 'ML', r.account_nickname,
       r.sale_date, r.product_title, quantity, r.shipping_mode,
       r.shipping_limit_date, packages, r.date_last_updated || null, r.sync_signature || null,
-      r.remote_state || null, r.raw_api_data,
+      r.remote_state || null,
+      // `?? null` preserva NULL para campo ausente; `||` transformaria '' em null
+      // e, pior, esconderia um status legítimo de valor falsy.
+      r.order_status ?? null, r.logistic_type ?? null, r.shipment_status ?? null,
+      r.sla_expected_date ?? null, r.derived_fields_at ?? null,
+      r.raw_api_data,
       new Date()
     );
     const placeholders = cols.map(() => `$${p++}`).join(', ');
@@ -649,6 +681,11 @@ function buildMultiInsertQuery_DoUpdate(rows) {
       date_last_updated = EXCLUDED.date_last_updated,
       sync_signature = EXCLUDED.sync_signature,
       remote_state = EXCLUDED.remote_state,
+      order_status = EXCLUDED.order_status,
+      logistic_type = EXCLUDED.logistic_type,
+      shipment_status = EXCLUDED.shipment_status,
+      sla_expected_date = EXCLUDED.sla_expected_date,
+      derived_fields_at = EXCLUDED.derived_fields_at,
       raw_api_data = EXCLUDED.raw_api_data,
       updated_at = EXCLUDED.updated_at
     WHERE (
@@ -862,6 +899,12 @@ function buildMultiUpdateQuery_Backfill(rows) {
            shipping_limit_date = COALESCE(s.shipping_limit_date, d.shipping_limit_date::timestamp with time zone),
            packages           = COALESCE(s.packages, d.packages::integer),
            raw_api_data       = COALESCE(d.raw_api_data::jsonb, s.raw_api_data),
+           /* O JSON foi substituído pelo pedido enriquecido, que pode trazer
+            * shipping.status, logistic_type e sla_data diferentes. Zerar o
+            * marcador faz a leitura voltar ao JSON nesta linha até a próxima
+            * gravação da sincronização (ou o backfill) repreencher as colunas.
+            * Sem isso, a coluna derivada ficaria velha e o número mentiria. */
+           derived_fields_at  = NULL,
            updated_at         = GREATEST(COALESCE(s.updated_at, d.updated_at::timestamp with time zone), d.updated_at::timestamp with time zone)
       FROM data d
      WHERE s.id = d.id::bigint
@@ -1918,13 +1961,30 @@ router.get('/all', authenticateToken, requireMaster, async (req, res) => {
  * A view `public.unified_sales` continua intacta e é ela que a LISTAGEM usa —
  * lá o JSON é realmente necessário, e o LIMIT mantém o custo baixo.
  */
-const ML_SLA_EXPECTED = `s.raw_api_data->'sla_data'->>'expected_date'`;
+/* Escalares do pedido do ML: da coluna quando já preenchida, do JSON enquanto não.
+ *
+ * `derived_fields_at` marca a linha já preenchida (pela gravação da
+ * sincronização ou pelo backfill em lotes de utils/init-db.js). O `CASE`
+ * curto-circuita: linha preenchida NUNCA avalia o ramo do JSON, então não paga
+ * a leitura de TOAST. Linha ainda não preenchida lê o JSON e devolve
+ * exatamente o mesmo valor.
+ *
+ * É isso que torna a migração segura: o número na tela está correto do primeiro
+ * ao último lote do preenchimento, e não existe momento de virada. */
+const mlDerived = (column, jsonPath) =>
+  `CASE WHEN s.derived_fields_at IS NOT NULL THEN s.${column} ELSE ${jsonPath} END`;
 
 const UNIFIED_AGG_SOURCE = `(
   SELECT b.*,
+         /* Prazo real do canal. sla_ready já vem como instante (da coluna
+          * validada na gravação); sla_raw é o texto do JSON, e o teste de
+          * formato roda AQUI, sobre o texto já projetado. Fazer o regex e o cast
+          * lá dentro obrigaria a citar o caminho do JSON duas vezes — duas
+          * leituras de TOAST por linha, que é o que a view fazia. */
          COALESCE(
-           CASE WHEN b.sla_expected ~ '^\\d{4}-\\d{2}-\\d{2}'
-                THEN (b.sla_expected)::timestamptz END,
+           b.sla_ready,
+           CASE WHEN b.sla_raw ~ '^\\d{4}-\\d{2}-\\d{2}'
+                THEN (b.sla_raw)::timestamptz END,
            b.deadline_fallback
          ) AS shipping_deadline
     FROM (
@@ -1940,9 +2000,23 @@ const UNIFIED_AGG_SOURCE = `(
              s.shipping_mode                             AS shipping_mode,
              s.shipping_status                           AS shipping_status,
              s.processed_at                              AS processed_at,
-             s.raw_api_data->>'status'                   AS order_status,
-             jsonb_build_object('shipping', s.raw_api_data->'shipping') AS raw_api_data,
-             ${ML_SLA_EXPECTED}                          AS sla_expected,
+             ${mlDerived('order_status', `s.raw_api_data->>'status'`)} AS order_status,
+             /* Objeto mínimo remontado, só com o que as expressões canônicas
+              * consultam. Manter o nome raw_api_data é deliberado: as expressões
+              * seguem funcionando sem uma única alteração, o que elimina o risco
+              * de mudar um número ao reescrever expressão. NULL é preservado
+              * (não vira vazio), porque U_OPERATIONAL_STATUS depende dele para
+              * cair para o campo seguinte. */
+             CASE WHEN s.derived_fields_at IS NOT NULL
+                  THEN jsonb_build_object('shipping', jsonb_build_object(
+                         'logistic_type', s.logistic_type,
+                         'status', s.shipment_status))
+                  ELSE jsonb_build_object('shipping', s.raw_api_data->'shipping')
+             END                                         AS raw_api_data,
+             CASE WHEN s.derived_fields_at IS NOT NULL
+                  THEN s.sla_expected_date END           AS sla_ready,
+             CASE WHEN s.derived_fields_at IS NULL
+                  THEN s.raw_api_data->'sla_data'->>'expected_date' END AS sla_raw,
              s.shipping_limit_date                       AS deadline_fallback
         FROM public.sales s
       UNION ALL
@@ -1960,6 +2034,7 @@ const UNIFIED_AGG_SOURCE = `(
              s.processed_at,
              s.order_status,
              '{}'::jsonb,
+             NULL::timestamptz,
              NULL::text,
              s.ship_by_date
         FROM public.shopee_sales s
@@ -1974,7 +2049,7 @@ const UNIFIED_AGG_SOURCE = `(
 const UNIFIED_AGG_COLUMNS = [
   'marketplace', 'id', 'sku', 'uid', 'account_id', 'account_nickname',
   'sale_date', 'product_title', 'quantity', 'shipping_mode', 'shipping_status',
-  'processed_at', 'order_status', 'raw_api_data', 'sla_expected',
+  'processed_at', 'order_status', 'raw_api_data', 'sla_ready', 'sla_raw',
   'deadline_fallback', 'shipping_deadline',
 ];
 
@@ -4194,7 +4269,10 @@ router.post('/enrich-existing-sales', authenticateToken, async (req, res) => {
         
         // Atualiza a venda no banco
         await db.query(
-          'UPDATE public.sales SET raw_api_data = $1, updated_at = NOW() WHERE id = $2',
+          // derived_fields_at = NULL: o JSON foi trocado inteiro, então as colunas
+          // derivadas podem estar velhas. Zerar devolve a leitura ao JSON até a
+          // sincronização repreencher.
+          'UPDATE public.sales SET raw_api_data = $1, derived_fields_at = NULL, updated_at = NOW() WHERE id = $2',
           [JSON.stringify(rawData), sale.id]
         );
         
@@ -4417,6 +4495,9 @@ router.get('/fix-shipping-modes', async (req, res) => {
                     to_jsonb($2::text),
                     true
                   ),
+                  -- Mesmo valor que acabou de entrar no JSON: mantém a coluna
+                  -- derivada em dia sem invalidar o caminho rápido da leitura.
+                  logistic_type = $2,
                   updated_at = NOW()
             WHERE id = $3 AND uid = $4 AND seller_id = $5
               AND (shipping_mode IS NULL OR shipping_mode = 'Outros'

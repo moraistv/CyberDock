@@ -503,6 +503,45 @@ const LEGACY_BACKFILLS = [
         ],
     },
     {
+        /* Preenche os campos derivados do JSON criados em syncDatabaseSchema.
+         *
+         * Escreve APENAS as cinco colunas novas. Nenhuma coluna existente entra
+         * no SET, então nada do que já estava gravado é alterado ou perdido.
+         *
+         * Os valores são copiados exatamente como o JSON os entrega, inclusive
+         * NULL quando o campo não existe. Isso é essencial: `U_OPERATIONAL_STATUS`
+         * faz COALESCE(shipping.status, order_status, shipping_status) e depende
+         * do NULL para cair para o campo seguinte. Guardar '' no lugar de NULL
+         * mudaria silenciosamente o status operacional de pedidos sem
+         * shipping.status.
+         *
+         * ATENÇÃO: a extração aqui precisa bater EXATAMENTE com a do lado da
+         * gravação em router/sales.js (mapOrdersToRows). Se divergirem, linha
+         * antiga e linha nova passam a ter valores diferentes para o mesmo
+         * pedido. */
+        key: 'sales_derived_fields_backfilled_v1',
+        label: 'campos derivados do JSON em public.sales (order_status, logistic_type, shipment_status, sla_expected_date)',
+        steps: [
+            `WITH lote AS (
+                 SELECT ctid
+                   FROM public.sales
+                  WHERE derived_fields_at IS NULL
+                  LIMIT ${BACKFILL_BATCH}
+             )
+             UPDATE public.sales s
+                SET order_status      = s.raw_api_data->>'status',
+                    logistic_type     = s.raw_api_data->'shipping'->>'logistic_type',
+                    shipment_status   = s.raw_api_data->'shipping'->>'status',
+                    sla_expected_date = CASE
+                                          WHEN (s.raw_api_data->'sla_data'->>'expected_date') ~ '^\\d{4}-\\d{2}-\\d{2}'
+                                          THEN (s.raw_api_data->'sla_data'->>'expected_date')::timestamptz
+                                        END,
+                    derived_fields_at = NOW()
+               FROM lote
+              WHERE s.ctid = lote.ctid`,
+        ],
+    },
+    {
         key: 'shopee_sale_date_tz_fixed',
         label: 'fuso da data de venda em public.shopee_sales',
         steps: [
@@ -874,6 +913,38 @@ async function syncDatabaseSchema() {
          * primeiro ciclo, pedido por pedido, sem varrer a tabela.
          */
         await client.query('ALTER TABLE public.sales ADD COLUMN IF NOT EXISTS remote_state TEXT;');
+
+        /* Campos derivados do JSON, promovidos a colunas reais.
+         *
+         * Medição em produção (25/08/2026): contar 46.809 pedidos de 90 dias
+         * levava 27–44s e movia ~13,8 GB de I/O lógico numa base de 718 MB.
+         * `raw_api_data` fica em TOAST (413 MB dos 718 MB) e cada `->` num valor
+         * TOAST refaz a leitura fora da página. As agregações do dashboard só
+         * precisam de quatro escalares de dentro desse JSON, mas pagavam a
+         * leitura do blob inteiro, várias vezes por linha.
+         *
+         * A prova está no próprio plano: o lado Shopee do UNION, que não toca
+         * JSON nenhum, gastou 358 buffers para 7.721 linhas; o lado ML gastou
+         * 488.202 para 39.086. Mesma consulta, mesma máquina.
+         *
+         * Estas colunas são CÓPIA de dado que já existe dentro do JSON — nada
+         * novo, nada calculado. `raw_api_data` continua intacto e é ele que a
+         * listagem usa. Nenhuma coluna existente foi alterada ou removida.
+         *
+         * `derived_fields_at` é o marcador de "esta linha já tem os campos".
+         * Enquanto for nulo, a leitura cai de volta no JSON — então o número na
+         * tela está correto durante todo o preenchimento, sem cutover.
+         *
+         * SEM backfill em massa aqui, pelo mesmo motivo documentado acima em
+         * `remote_state`: UPDATE na tabela inteira dentro do boot passa do
+         * timeout, aborta o schema e joga o servidor em loop de reinício. O
+         * preenchimento roda em lotes, em segundo plano, em applyLegacyBackfills().
+         */
+        await client.query('ALTER TABLE public.sales ADD COLUMN IF NOT EXISTS order_status TEXT;');
+        await client.query('ALTER TABLE public.sales ADD COLUMN IF NOT EXISTS logistic_type TEXT;');
+        await client.query('ALTER TABLE public.sales ADD COLUMN IF NOT EXISTS shipment_status TEXT;');
+        await client.query('ALTER TABLE public.sales ADD COLUMN IF NOT EXISTS sla_expected_date TIMESTAMPTZ;');
+        await client.query('ALTER TABLE public.sales ADD COLUMN IF NOT EXISTS derived_fields_at TIMESTAMPTZ;');
 
         await client.query('CREATE UNIQUE INDEX IF NOT EXISTS idx_sales_id_sku_uid_unique ON public.sales(id, sku, uid);');
         await client.query('CREATE INDEX IF NOT EXISTS idx_sales_seller_id ON public.sales(seller_id);');
