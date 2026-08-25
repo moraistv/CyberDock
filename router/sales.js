@@ -1756,12 +1756,37 @@ router.get('/all', authenticateToken, requireMaster, async (req, res) => {
     // Postgres avaliar JSONB linha por linha só para contar).
     const countQuery = buildCountQuery(whereClause);
 
-    // Mesma estratégia da tela do usuário: recorta a página primeiro e só
-    // depois resolve SKU/JSON, para o custo por linha valer apenas 1 página.
+    /* Recorta a página com a fonte BARATA e só depois lê a view.
+     *
+     * Medição em produção (25/08/2026), este mesmo recorte de 30 dias:
+     *   SELECT s.* FROM public.unified_sales  -> 15.307 ms, 642.672 buffers
+     *   idem sobre a fonte projetada          ->     94 ms,  13.654 buffers
+     *
+     * O índice de `sale_date DESC` existe nas duas tabelas e é usado nos dois
+     * casos. A diferença é a lista de saída da view: `SELECT s.*` obriga o
+     * Postgres a montar as 22 colunas — com extração de JSONB e leitura de TOAST
+     * — para CADA linha examinada, inclusive as que o filtro descarta. E como a
+     * view é um UNION ALL, ele não elimina coluna não usada.
+     *
+     * Então: `chaves` acha as 50 linhas da página pela fonte projetada (sem
+     * TOAST), `janela` extrai o intervalo de datas dessas 50, e `page_rows` lê a
+     * view apenas dentro dessa janela. Para uma página ordenada por data, a
+     * janela contém poucas dezenas de linhas — o JSON passa a ser aberto ~50
+     * vezes em vez de 70 mil.
+     *
+     * O SELECT externo continua idêntico, lendo `page_rows` como antes. Foi
+     * deliberado: mexer nele exigiria remapear thumbnail, permalink, comprador,
+     * tags e variação, e cada campo remapeado é uma chance de quebrar a tela.
+     *
+     * `chaves` cai de volta na view quando o filtro de comprador está ativo: só
+     * a view tem buyer_name/buyer_nickname (no ML eles vêm do JSON). É o caminho
+     * lento, mas é raro e continua correto.
+     */
+    const chavesSource = buyer ? 'public.unified_sales' : UNIFIED_AGG_SOURCE;
     const dataQuery = `
-      WITH page_rows AS MATERIALIZED (
-        SELECT s.*
-          FROM public.unified_sales s
+      WITH chaves AS MATERIALIZED (
+        SELECT s.marketplace, s.id, s.sku, s.uid, s.sale_date
+          FROM ${chavesSource} s
           ${whereClause}
          -- Ordena SÓ por sale_date: as duas tabelas de origem têm índice
          -- (sale_date DESC), então o Postgres percorre os índices e para na
@@ -1771,6 +1796,20 @@ router.get('/all', authenticateToken, requireMaster, async (req, res) => {
          -- continua no ORDER BY externo, aplicado só às 50 linhas da página.
          ORDER BY s.sale_date DESC
          LIMIT $${paramIdx} OFFSET $${paramIdx + 1}
+      ),
+      -- Página vazia deixa os dois nulos, e o BETWEEN abaixo não casa nada.
+      janela AS (SELECT MIN(sale_date) AS ini, MAX(sale_date) AS fim FROM chaves),
+      page_rows AS MATERIALIZED (
+        SELECT s.*
+          FROM public.unified_sales s, janela j
+         WHERE s.sale_date BETWEEN j.ini AND j.fim
+           AND EXISTS (
+                 SELECT 1 FROM chaves k
+                  WHERE k.marketplace = s.marketplace
+                    AND k.id = s.id
+                    AND k.sku = s.sku
+                    AND k.uid = s.uid
+               )
       )
       SELECT s.id, s.sku, s.uid, s.marketplace,
         s.marketplace AS channel,
