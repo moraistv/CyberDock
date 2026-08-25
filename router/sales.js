@@ -1646,41 +1646,31 @@ router.get('/all', authenticateToken, requireMaster, async (req, res) => {
       params.push(asList(saleStatus).map((v) => v.toLowerCase()));
       paramIdx++;
     }
-    /* ------------------------ Janela padrão de datas -------------------------
-     * Sem recorte de data, este tabelão pede "as 50 vendas mais recentes de
-     * TODOS os clientes" e o Postgres tem de considerar o histórico inteiro das
-     * duas tabelas. Na prática isso batia no statement_timeout de 30s do pool e
-     * a tela devolvia 500 — era o "29 segundos" observado.
+    /* ------------------------ Sem janela padrão de datas ---------------------
+     * Havia um recorte obrigatório de 30 dias aqui, e uma linha de botões
+     * "Período" na tela para escolher entre 30/7/hoje/tudo. Existia porque sem
+     * recorte este tabelão pedia "as 50 vendas mais recentes de TODOS os
+     * clientes", o Postgres considerava o histórico inteiro das duas tabelas e
+     * a consulta batia no statement_timeout de 30s.
      *
-     * Com uma janela padrão o intervalo vira uma leitura por índice em
-     * (sale_date DESC), que é limitada por natureza. O cliente continua podendo
-     * pedir qualquer período: `window=all` desliga o padrão explicitamente.
+     * O motivo acabou. Depois que o recorte da página passou a usar a fonte
+     * projetada, a mesma consulta caiu de 15.307 ms para 94 ms (medido em
+     * 25/08/2026). E sem filtro de data o plano é o MAIS barato de todos: o
+     * Postgres percorre o índice de `sale_date DESC` das duas tabelas e para nas
+     * 50 linhas da página, sem precisar avaliar o resto.
+     *
+     * Um recorte obrigatório e invisível era pior que inútil: escondia venda
+     * antiga sem avisar. Quem quiser recortar usa "Data da Venda" nos filtros
+     * avançados, que continua enviando saleDateStart/saleDateEnd.
+     *
+     * `window` na query string é ignorado de propósito, para não quebrar link
+     * salvo com `?window=30d`.
      */
-    const windowMode = (req.query.window || '').trim();
-    const WINDOW_DAYS = {
-      today: 0,
-      '7d': 7,
-      '30d': 30,
-      '90d': 90,
-    };
-    const DEFAULT_WINDOW_DAYS = parseInt(process.env.ADMIN_SALES_WINDOW_DAYS || '30', 10);
-    let defaultWindowDays = null;
-
     if (saleDateStart) {
       conditions.push(`s.sale_date >= $${paramIdx}`);
       // Limite do dia em horário de Brasília (UTC-3). Antes usava meia-noite
       // UTC, o que trazia vendas do fim da noite de ontem (BRT) no filtro "hoje".
       params.push(saleDateStart + 'T00:00:00-03:00');
-      paramIdx++;
-    } else if (windowMode !== 'all') {
-      defaultWindowDays = Object.prototype.hasOwnProperty.call(WINDOW_DAYS, windowMode)
-        ? WINDOW_DAYS[windowMode]
-        : DEFAULT_WINDOW_DAYS;
-      // Início do dia em Brasília, para "hoje" bater com o calendário do usuário.
-      conditions.push(`s.sale_date >= (
-        ((now() AT TIME ZONE 'America/Sao_Paulo')::date - ($${paramIdx})::int)
-      ) AT TIME ZONE 'America/Sao_Paulo'`);
-      params.push(defaultWindowDays);
       paramIdx++;
     }
     if (saleDateEnd) {
@@ -1927,8 +1917,9 @@ router.get('/all', authenticateToken, requireMaster, async (req, res) => {
       page,
       limit,
       totalPages: totalExact ? (Math.ceil(total / limit) || 1) : page + 1,
-      // A tela avisa qual janela está em uso, para o número não parecer errado.
-      defaultWindowDays,
+      // `defaultWindowDays` saiu junto com a janela obrigatória. Nenhuma tela
+      // lia esse campo, então não há nada a avisar: sem filtro de data, a
+      // listagem devolve o histórico completo, paginado.
     });
 
     if (!totalExact) {
