@@ -1883,6 +1883,101 @@ router.get('/all', authenticateToken, requireMaster, async (req, res) => {
  * que existe na tela e recebe lista vazia — foi o que acontecia com o rótulo
  * genérico "Outros".
  */
+/* Fonte das AGREGAÇÕES: as tabelas de origem, projetadas.
+ *
+ * Medição em produção (25/08/2026), contando 46.809 pedidos dos últimos 90 dias
+ * sobre `public.unified_sales`:
+ *
+ *   Execution Time: 27139 ms
+ *   Buffers: shared hit=1714862 read=55721   (~13,8 GB de I/O lógico)
+ *
+ * A base inteira tem 718 MB (`sales`: 104 MB heap + 413 MB TOAST). A consulta
+ * tocou 17 vezes o tamanho da base para contar 46 mil linhas — ~335 KB de I/O
+ * por linha, para linhas de ~7 KB.
+ *
+ * Motivo: `raw_api_data` é TOAST, e a lista de saída da view referencia esse
+ * campo umas doze vezes por linha (status, shipping.id, shipping.status,
+ * logistic_type, thumbnail, permalink, item_id, buyer first/last/nickname,
+ * sla_data duas vezes) além de devolver a coluna inteira. Cada `->` num valor
+ * TOAST refaz a leitura fora da página. E como a view é um `UNION ALL`, o
+ * Postgres avalia a lista de saída COMPLETA mesmo quando a consulta usa três
+ * campos — é o mesmo motivo já documentado acima de `SALES_COUNT_MAX`, que o
+ * `buildCountQuery` resolve contando nas tabelas de origem.
+ *
+ * Aqui a mesma ideia serve as agregações: projetamos só as colunas que filtros e
+ * agregações usam, e reduzimos o JSON a TRÊS leituras por linha — `status`, o
+ * sub-objeto `shipping` e o `expected_date` do SLA.
+ *
+ * O `raw_api_data` projetado é um objeto MINÚSCULO remontado com apenas o
+ * `shipping`. Isso é deliberado: mantém as expressões canônicas abaixo
+ * funcionando sem uma única alteração, o que elimina o risco de mudar um número
+ * ao reescrever expressão. As colunas pesadas que nenhuma agregação usa
+ * (`raw_api_data` completo, thumbnail, permalink, item_id, comprador,
+ * shipping_id, updated_at) simplesmente não entram.
+ *
+ * A view `public.unified_sales` continua intacta e é ela que a LISTAGEM usa —
+ * lá o JSON é realmente necessário, e o LIMIT mantém o custo baixo.
+ */
+const ML_SLA_EXPECTED = `s.raw_api_data->'sla_data'->>'expected_date'`;
+
+const UNIFIED_AGG_SOURCE = `(
+  SELECT b.*,
+         COALESCE(
+           CASE WHEN b.sla_expected ~ '^\\d{4}-\\d{2}-\\d{2}'
+                THEN (b.sla_expected)::timestamptz END,
+           b.deadline_fallback
+         ) AS shipping_deadline
+    FROM (
+      SELECT 'ML'::text                                  AS marketplace,
+             s.id::text                                  AS id,
+             s.sku                                       AS sku,
+             s.uid                                       AS uid,
+             s.seller_id::text                           AS account_id,
+             s.account_nickname                          AS account_nickname,
+             s.sale_date                                 AS sale_date,
+             s.product_title                             AS product_title,
+             s.quantity                                  AS quantity,
+             s.shipping_mode                             AS shipping_mode,
+             s.shipping_status                           AS shipping_status,
+             s.processed_at                              AS processed_at,
+             s.raw_api_data->>'status'                   AS order_status,
+             jsonb_build_object('shipping', s.raw_api_data->'shipping') AS raw_api_data,
+             ${ML_SLA_EXPECTED}                          AS sla_expected,
+             s.shipping_limit_date                       AS deadline_fallback
+        FROM public.sales s
+      UNION ALL
+      SELECT 'Shopee'::text,
+             s.order_sn,
+             s.sku,
+             s.uid,
+             s.shop_id::text,
+             s.account_nickname,
+             s.sale_date,
+             s.product_title,
+             s.quantity,
+             COALESCE(NULLIF(s.shipping_carrier, ''), 'Shopee'),
+             s.shipping_status,
+             s.processed_at,
+             s.order_status,
+             '{}'::jsonb,
+             NULL::text,
+             s.ship_by_date
+        FROM public.shopee_sales s
+    ) b
+)`;
+
+/* Colunas que a fonte projetada expõe.
+ *
+ * Existe para o teste automatizado provar que nenhum filtro ou agregação
+ * referencia coluna de fora da lista. Sem isso, um filtro novo que use, por
+ * exemplo, `s.shipping_id` quebraria só em produção. */
+const UNIFIED_AGG_COLUMNS = [
+  'marketplace', 'id', 'sku', 'uid', 'account_id', 'account_nickname',
+  'sale_date', 'product_title', 'quantity', 'shipping_mode', 'shipping_status',
+  'processed_at', 'order_status', 'raw_api_data', 'sla_expected',
+  'deadline_fallback', 'shipping_deadline',
+];
+
 const U_ACCOUNT_KEY = `(s.marketplace || ':' || COALESCE(s.account_id, ''))`;
 const U_SHIPPING_STATUS = `COALESCE(NULLIF(s.shipping_status, ''), 'Pendente')`;
 // Quando o ML não traz shipping_mode, a modalidade real está no logistic_type.
@@ -2264,7 +2359,7 @@ async function buildFacets(req, uid, options = {}) {
       return db.query(
         `SELECT ${keyExpr} AS value${extraSelect},
                 COUNT(DISTINCT (s.marketplace, COALESCE(s.account_id, ''), s.id))::int AS count
-           FROM public.unified_sales s
+           FROM ${UNIFIED_AGG_SOURCE} s
            ${where}
           GROUP BY 1${extraSelect ? ', 2' : ''}
           ORDER BY count DESC
@@ -2444,13 +2539,13 @@ async function buildDashboardStats(req, uid, options = {}) {
            (COUNT(DISTINCT ${orderKey}) FILTER (WHERE s.processed_at IS NOT NULL))::int AS processed,
            COUNT(*) FILTER (WHERE s.processed_at IS NOT NULL)::int AS processed_lines,
            COUNT(DISTINCT s.sku)::int AS distinct_skus
-         FROM public.unified_sales s ${where}`,
+         FROM ${UNIFIED_AGG_SOURCE} s ${where}`,
         params
       ),
       () => (skipHeavyDetail ? noRows() : db.query(
         `SELECT ${U_SHIPPING_STATUS} AS label,
                 COUNT(DISTINCT ${orderKey})::int AS value
-         FROM public.unified_sales s ${where}
+         FROM ${UNIFIED_AGG_SOURCE} s ${where}
          GROUP BY 1 ORDER BY value DESC LIMIT 9`,
         params
       )),
@@ -2458,20 +2553,20 @@ async function buildDashboardStats(req, uid, options = {}) {
         // Dia no fuso de Brasília, para casar com o que o usuário vê na tela.
         `SELECT (s.sale_date AT TIME ZONE 'America/Sao_Paulo')::date AS day,
                 COUNT(DISTINCT ${orderKey})::int AS value
-         FROM public.unified_sales s ${where}
+         FROM ${UNIFIED_AGG_SOURCE} s ${where}
          GROUP BY 1 ORDER BY 1 ASC`,
         params
       )),
       () => db.query(
         `SELECT s.marketplace, COUNT(DISTINCT ${orderKey})::int AS value
-         FROM public.unified_sales s ${where}
+         FROM ${UNIFIED_AGG_SOURCE} s ${where}
          GROUP BY 1 ORDER BY value DESC`,
         params
       ),
       () => db.query(
         `SELECT ${U_SHIPPING_MODE} AS mode,
                 COUNT(DISTINCT ${orderKey})::int AS value
-         FROM public.unified_sales s ${where}
+         FROM ${UNIFIED_AGG_SOURCE} s ${where}
          GROUP BY 1 ORDER BY value DESC LIMIT 8`,
         params
       ),
@@ -2486,7 +2581,7 @@ async function buildDashboardStats(req, uid, options = {}) {
                 COUNT(DISTINCT ${orderKey})::int AS value,
                 (COUNT(DISTINCT ${orderKey}) FILTER (WHERE ${pendingExpr}))::int AS pending,
                 (COUNT(DISTINCT ${orderKey}) FILTER (WHERE ${shippedExpr}))::int AS shipped
-         FROM public.unified_sales s ${where}
+         FROM ${UNIFIED_AGG_SOURCE} s ${where}
          GROUP BY 1, 2 ORDER BY value DESC LIMIT 30`,
         params
       ),
@@ -2495,7 +2590,7 @@ async function buildDashboardStats(req, uid, options = {}) {
                 (array_agg(s.product_title ORDER BY s.sale_date DESC))[1] AS title,
                 COALESCE(SUM(s.quantity), 0)::int AS units,
                 COUNT(DISTINCT ${orderKey})::int AS orders
-         FROM public.unified_sales s ${where}
+         FROM ${UNIFIED_AGG_SOURCE} s ${where}
          GROUP BY s.sku ORDER BY units DESC LIMIT 8`,
         params
       )),
@@ -2504,7 +2599,7 @@ async function buildDashboardStats(req, uid, options = {}) {
             `SELECT COUNT(DISTINCT ${orderKey})::int AS orders,
                     COUNT(DISTINCT ${orderKey})::int AS sales,
                     COALESCE(SUM(s.quantity), 0)::int AS units
-             FROM public.unified_sales s ${previousWhere}`,
+             FROM ${UNIFIED_AGG_SOURCE} s ${previousWhere}`,
             previousParams
           )
         : noRows()),
