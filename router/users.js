@@ -4,6 +4,7 @@ const bcrypt = require('bcryptjs');
 const db = require('../utils/postgres');
 const { authenticateToken, requireMaster, requireOwnerOrMaster } = require('../utils/authMiddleware');
 const { BASE_STORAGE_TYPES } = require('../utils/billingRules');
+const { normalizarCpfCnpj, normalizarTelefone, formatarCpfCnpj } = require('../utils/documentoFiscal');
 
 const router = express.Router();
 
@@ -332,6 +333,120 @@ router.get('/contracts/:uid', authenticateToken, requireOwnerOrMaster, async (re
     } catch (error) {
         console.error(`Erro ao buscar contratos para o usuário ${uid}:`, error);
         res.status(500).json({ error: 'Erro interno ao buscar contratos.' });
+    }
+});
+
+/**
+ * @route   GET /api/users/billing-info/pending
+ * @desc    Clientes ativos sem documento cadastrado.
+ * @access  Private (Master)
+ *
+ * Cobrança emitida fora do sistema exige o documento do pagador, e o cadastro
+ * nunca pediu isso. Esta rota responde "quem falta preencher", que é a única
+ * pergunta útil antes de ligar qualquer integração de cobrança: sem ela, a
+ * descoberta acontece uma recusa por vez, no meio do faturamento.
+ */
+router.get('/billing-info/pending', authenticateToken, requireMaster, async (req, res) => {
+    try {
+        const { rows } = await db.query(`
+            SELECT uid, name, email, phone, created_at
+              FROM public.users
+             WHERE role = 'cliente'
+               AND COALESCE(active, true) = true
+               AND (cpf_cnpj IS NULL OR TRIM(cpf_cnpj) = '')
+             ORDER BY name NULLS LAST, email;
+        `);
+
+        const total = await db.query(`
+            SELECT COUNT(*)::int AS clientes,
+                   COUNT(NULLIF(TRIM(COALESCE(cpf_cnpj, '')), ''))::int AS com_documento
+              FROM public.users
+             WHERE role = 'cliente' AND COALESCE(active, true) = true;
+        `);
+
+        res.json({
+            pendentes: rows,
+            resumo: {
+                clientesAtivos: total.rows[0].clientes,
+                comDocumento: total.rows[0].com_documento,
+                semDocumento: rows.length,
+            },
+        });
+    } catch (error) {
+        console.error('Erro ao listar clientes sem documento:', error);
+        res.status(500).json({ error: 'Erro interno ao listar clientes sem documento.' });
+    }
+});
+
+/**
+ * @route   PUT /api/users/:uid/billing-info
+ * @desc    Grava CPF/CNPJ e telefone do cliente.
+ * @access  Private (Master)
+ *
+ * O documento é validado pelo dígito verificador, não pelo tamanho: número
+ * digitado errado passaria pela contagem de caracteres e só seria recusado no
+ * provedor de cobrança, com uma mensagem que ninguém sabe interpretar.
+ *
+ * Gravado sem máscara. Telefone é opcional e pode ser limpado enviando vazio.
+ */
+router.put('/:uid/billing-info', authenticateToken, requireMaster, async (req, res) => {
+    const { uid } = req.params;
+    const { cpfCnpj, phone } = req.body || {};
+
+    const documento = normalizarCpfCnpj(cpfCnpj);
+    if (!documento.ok) {
+        return res.status(400).json({ error: documento.erro, field: 'cpfCnpj' });
+    }
+
+    const telefone = normalizarTelefone(phone);
+    if (!telefone.ok) {
+        return res.status(400).json({ error: telefone.erro, field: 'phone' });
+    }
+
+    try {
+        /* Mesmo documento em dois cadastros é quase sempre cliente duplicado, e
+         * o provedor de cobrança trata CPF/CNPJ como critério de unicidade —
+         * dois cadastros locais apontando para o mesmo pagador acabam brigando
+         * pelo mesmo customer lá. Recusa aqui em vez de deixar o problema
+         * aparecer na emissão. Não virou constraint no banco de propósito: se
+         * existir um caso legítimo, ele não fica impossível de registrar. */
+        const jaUsado = await db.query(
+            `SELECT uid, name, email FROM public.users WHERE cpf_cnpj = $1 AND uid <> $2 LIMIT 1`,
+            [documento.digitos, uid]
+        );
+        if (jaUsado.rowCount > 0) {
+            const outro = jaUsado.rows[0];
+            return res.status(409).json({
+                error: `Este ${documento.tipo} já está cadastrado em outro cliente: `
+                    + `${outro.name || outro.email}.`,
+                code: 'document_already_used',
+                owner: { uid: outro.uid, name: outro.name, email: outro.email },
+            });
+        }
+
+        const { rows, rowCount } = await db.query(`
+            UPDATE public.users
+               SET cpf_cnpj = $1, phone = $2, updated_at = NOW()
+             WHERE uid = $3
+             RETURNING uid, name, email, cpf_cnpj, phone, asaas_customer_id;
+        `, [documento.digitos, telefone.digitos, uid]);
+
+        if (rowCount === 0) {
+            return res.status(404).json({ error: 'Usuário não encontrado.' });
+        }
+
+        const user = rows[0];
+        res.json({
+            message: 'Dados de cobrança atualizados.',
+            user: {
+                ...user,
+                documentType: documento.tipo,
+                cpfCnpjFormatted: formatarCpfCnpj(user.cpf_cnpj),
+            },
+        });
+    } catch (error) {
+        console.error(`Erro ao gravar dados de cobrança do usuário ${uid}:`, error);
+        res.status(500).json({ error: 'Erro interno ao gravar os dados de cobrança.' });
     }
 });
 
