@@ -75,6 +75,70 @@ function storageDescription(type, calc) {
 }
 
 /**
+ * Ordena um contrato base pela data de início e diz se ele já valia no período.
+ *
+ * `rank` é o instante de início em ms, usado para achar o contrato mais recente.
+ * Contrato sem data (ou com data inválida) fica com o menor rank possível: ele
+ * é elegível, mas perde de qualquer contrato datado — sem data não há como
+ * afirmar que é o plano mais novo.
+ */
+function baseStartRank(startDate, year, month) {
+  if (!startDate) return { rank: -Infinity, started: true };
+  const start = startDate instanceof Date ? startDate : new Date(startDate);
+  if (Number.isNaN(start.getTime())) return { rank: -Infinity, started: true };
+
+  const startYear = start.getUTCFullYear();
+  const startMonth = start.getUTCMonth() + 1;
+  const started = !(startYear > year || (startYear === year && startMonth > month));
+  return { rank: start.getTime(), started };
+}
+
+/**
+ * Escolhe UM contrato de armazenamento inicial para o período faturado.
+ *
+ * `base_storage` (1m³ integral) e `base_storage_50` (metade, operação FULL)
+ * representam a MESMA linha da fatura em planos diferentes — são mutuamente
+ * exclusivos. Antes daqui saía um item para cada tipo contratado, então o
+ * cliente que trocou de plano (e ficou com os dois contratos, porque
+ * `unique_contract` só barra o mesmo service_id) recebia duas linhas de
+ * "Armazenamento Inicial" e pagava 397,00 + 198,50.
+ *
+ * O critério é o contrato VIGENTE: entre os que já começaram até o fim do
+ * período, vale o de início mais recente. Assim, quem migrou para o plano de 50%
+ * em março continua com o valor antigo em fevereiro e passa a pagar o novo de
+ * março em diante — a fatura de cada competência reflete o plano daquela época.
+ *
+ * Contrato cujo serviço está com preço zerado no catálogo não concorre: preço
+ * zero é o master dizendo "não cobrar isso", e promover o outro plano no lugar
+ * cobraria o cliente por algo que foi desligado de propósito.
+ *
+ * O desempate por `contract_id` existe porque `ORDER BY start_date` sozinho não
+ * define ordem quando as datas empatam, e sem desempate o valor faturado podia
+ * mudar de uma requisição para outra.
+ */
+function pickBaseStorageContract({ contracts, prices, year, month }) {
+  const candidates = [];
+
+  for (const contract of contracts || []) {
+    if (!BASE_STORAGE_TYPES.includes(contract.type)) continue;
+    if ((Number(prices?.[contract.type]) || 0) <= 0) continue;
+
+    const { rank, started } = baseStartRank(contract.start_date, year, month);
+    if (!started) continue;
+    candidates.push({ contract, rank });
+  }
+
+  if (candidates.length === 0) return null;
+
+  candidates.sort((a, b) => {
+    if (a.rank !== b.rank) return b.rank - a.rank;
+    return Number(b.contract.contract_id ?? 0) - Number(a.contract.contract_id ?? 0);
+  });
+
+  return candidates[0].contract;
+}
+
+/**
  * Monta os itens de armazenamento da fatura a partir dos contratos do cliente.
  *
  * @param {Array} contracts [{ type, volume, start_date, service_id }]
@@ -83,24 +147,22 @@ function storageDescription(type, calc) {
 function buildStorageItems({ contracts, prices, year, month }) {
   const items = [];
 
-  for (const type of BASE_STORAGE_TYPES) {
-    const contract = contracts.find((c) => c.type === type);
-    if (!contract) continue;
-    const price = Number(prices[type]) || 0;
-    if (price <= 0) continue;
-
-    const calc = proportionalStorage({ price, year, month, startDate: contract.start_date });
-    if (calc.notStarted || calc.amount <= 0) continue;
-
-    items.push({
-      description: storageDescription(type, calc),
-      quantity: 1,
-      unit: 'm3',
-      unit_price: calc.amount,
-      total_price: calc.amount,
-      type: 'storage',
-      service_id: contract.service_id ?? null,
-    });
+  // UMA linha de armazenamento inicial, sempre. Ver pickBaseStorageContract.
+  const base = pickBaseStorageContract({ contracts, prices, year, month });
+  if (base) {
+    const price = Number(prices[base.type]) || 0;
+    const calc = proportionalStorage({ price, year, month, startDate: base.start_date });
+    if (!calc.notStarted && calc.amount > 0) {
+      items.push({
+        description: storageDescription(base.type, calc),
+        quantity: 1,
+        unit: 'm3',
+        unit_price: calc.amount,
+        total_price: calc.amount,
+        type: 'storage',
+        service_id: base.service_id ?? null,
+      });
+    }
   }
 
   const additional = contracts.find((c) => c.type === ADDITIONAL_STORAGE_TYPE);
@@ -163,6 +225,7 @@ module.exports = {
   daysInMonth,
   proportionalStorage,
   storageDescription,
+  pickBaseStorageContract,
   buildStorageItems,
   getTierUnitPrice,
   unitLabel,

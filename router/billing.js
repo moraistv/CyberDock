@@ -4,6 +4,7 @@ const db = require('../utils/postgres');
 const { authenticateToken, requireMaster } = require('../utils/authMiddleware');
 const { BillingQueryBuilder } = require('../utils/billingQueryBuilder');
 const {
+  BASE_STORAGE_TYPES,
   STORAGE_TYPES,
   buildStorageItems,
   getTierUnitPrice,
@@ -38,12 +39,15 @@ async function calculateAndSaveInvoice(client, uid, period) {
   // A start_date vem junto: antes era buscada numa segunda query por
   // `type = 'base_storage' LIMIT 1`, que apontava para o serviço errado
   // quando havia mais de um registro do mesmo tipo no catálogo.
+  // `uc.id AS contract_id` é o desempate de pickBaseStorageContract quando dois
+  // contratos base têm a mesma data de início: sem ele, `ORDER BY start_date`
+  // não define ordem e o valor faturado podia mudar entre requisições.
   const contractsRes = await client.query(`
-    SELECT s.type, s.id AS service_id, uc.volume, uc.start_date
+    SELECT s.type, s.id AS service_id, uc.id AS contract_id, uc.volume, uc.start_date
     FROM public.user_contracts uc
     JOIN public.services s ON uc.service_id = s.id
     WHERE uc.uid = $1 AND s.type = ANY($2)
-    ORDER BY uc.start_date ASC;
+    ORDER BY uc.start_date ASC, uc.id ASC;
   `, [uid, STORAGE_TYPES]);
 
   // Regras de proporcional e rótulos ficam em utils/billingRules.js, para não
@@ -481,6 +485,193 @@ router.get('/all-manual-services', authenticateToken, requireMaster, async (req,
   } catch (err) {
     console.error('Erro ao buscar histórico de serviços manuais:', err);
     res.status(500).json({ error: 'Erro ao buscar histórico.' });
+  }
+});
+
+/* Descrições usadas pelo item de armazenamento inicial, hoje e no passado.
+ *
+ * O rótulo atual vem de STORAGE_LABELS ("Armazenamento Inicial (1m³)" e
+ * "... 50% | FULL"), mas faturas antigas foram gravadas com o nome do catálogo,
+ * "Armazenamento Base (até 1m³)". Um diagnóstico que olhasse só a grafia nova
+ * diria que está tudo certo no histórico. */
+const BASE_STORAGE_DESCRIPTION_PATTERNS = ['Armazenamento Base%', 'Armazenamento Inicial%'];
+
+/**
+ * ===== Diagnóstico da duplicidade de armazenamento inicial (master) =====
+ *
+ * SOMENTE LEITURA. Responde três perguntas, que são coisas diferentes:
+ *
+ * 1. `faturasComDuplicidade`: competências com mais de uma linha de
+ *    armazenamento inicial. Se o `type` é 'storage', o recálculo resolve — é o
+ *    que POST /recalculate faz.
+ * 2. `itensForaDoRecalculo`: linha de armazenamento gravada com `type` diferente
+ *    de 'storage' (por exemplo 'manual'). O recálculo NÃO apaga essas: ele só
+ *    remove type IN ('storage','shipment'). Elas convivem com a linha automática
+ *    e continuam somando no total. Exigem decisão humana, por isso só listo.
+ * 3. `clientesComDoisContratosBase`: a origem do problema. Enquanto os dois
+ *    contratos existirem, a fatura escolhe o vigente (o mais recente) — não
+ *    duplica mais, mas o plano antigo continua cadastrado.
+ */
+router.get('/storage-duplicates', authenticateToken, requireMaster, async (req, res) => {
+  try {
+    const duplicadas = await db.query(`
+      SELECT i.uid, u.name AS client_name, u.email AS client_email, i.period,
+             i.total_amount,
+             COUNT(*)::int AS itens_base,
+             json_agg(json_build_object(
+               'id', it.id, 'description', it.description, 'type', it.type,
+               'total_price', it.total_price
+             ) ORDER BY it.id) AS itens
+        FROM public.invoices i
+        JOIN public.invoice_items it ON it.invoice_id = i.id
+        LEFT JOIN public.users u ON u.uid = i.uid
+       WHERE it.description ILIKE ANY ($1::text[])
+       GROUP BY i.id, i.uid, u.name, u.email, i.period, i.total_amount
+      HAVING COUNT(*) > 1
+       ORDER BY i.period DESC, u.name NULLS LAST;
+    `, [BASE_STORAGE_DESCRIPTION_PATTERNS]);
+
+    const foraDoRecalculo = await db.query(`
+      SELECT it.id, it.description, it.type, it.total_price,
+             i.uid, i.period, u.name AS client_name
+        FROM public.invoice_items it
+        JOIN public.invoices i ON i.id = it.invoice_id
+        LEFT JOIN public.users u ON u.uid = i.uid
+       WHERE it.description ILIKE ANY ($1::text[])
+         AND it.type <> 'storage'
+       ORDER BY i.period DESC, it.id;
+    `, [BASE_STORAGE_DESCRIPTION_PATTERNS]);
+
+    const contratos = await db.query(`
+      SELECT uc.uid, u.name AS client_name, u.email AS client_email,
+             json_agg(json_build_object(
+               'contractId', uc.id, 'serviceId', uc.service_id, 'name', s.name,
+               'type', s.type, 'price', uc.price, 'startDate', uc.start_date
+             ) ORDER BY uc.start_date DESC, uc.id DESC) AS contratos
+        FROM public.user_contracts uc
+        JOIN public.services s ON s.id = uc.service_id
+        LEFT JOIN public.users u ON u.uid = uc.uid
+       WHERE s.type = ANY($1::text[])
+       GROUP BY uc.uid, u.name, u.email
+      HAVING COUNT(*) > 1
+       ORDER BY u.name NULLS LAST;
+    `, [BASE_STORAGE_TYPES]);
+
+    res.json({
+      faturasComDuplicidade: duplicadas.rows,
+      itensForaDoRecalculo: foraDoRecalculo.rows,
+      clientesComDoisContratosBase: contratos.rows,
+      resumo: {
+        faturasAfetadas: duplicadas.rowCount,
+        itensQueORecalculoNaoResolve: foraDoRecalculo.rowCount,
+        clientesComDoisContratosBase: contratos.rowCount,
+      },
+    });
+  } catch (err) {
+    console.error('Erro ao diagnosticar duplicidade de armazenamento:', err);
+    res.status(500).json({ error: 'Erro ao diagnosticar duplicidade de armazenamento.' });
+  }
+});
+
+/**
+ * ===== Recálculo das competências passadas (master) =====
+ *
+ * A regra nova de armazenamento vale para qualquer competência, mas a fatura só
+ * é regravada quando alguém abre aquele período: GET /invoices/:uid recalcula
+ * apenas `req.query.period`. Sem isto, corrigir "o passado" dependeria de abrir
+ * cada mês de cada cliente na mão.
+ *
+ * Não apaga dado de negócio. Reusa `calculateAndSaveInvoice`, cujo DELETE atinge
+ * somente `type IN ('storage','shipment')` — os itens automáticos, que ele
+ * recria na sequência. Lançamento manual, status de pagamento e paid_at/paid_by
+ * ficam onde estão.
+ *
+ * Uma transação POR competência: um período que falhe não desfaz os outros, e a
+ * resposta diz exatamente o que mudou em cada um. Em série de propósito — o
+ * recálculo varre vendas, e treze consultas dessas em paralelo já esgotaram o
+ * pool antes (ver o incidente de 25/08).
+ *
+ * `?dryRun=1` calcula nada e só devolve a lista de competências que seriam
+ * processadas.
+ */
+router.post('/recalculate/:uid', authenticateToken, requireMaster, async (req, res) => {
+  const { uid } = req.params;
+  const dryRun = req.query.dryRun === '1';
+  const pedidos = Array.isArray(req.body?.periods) ? req.body.periods : null;
+
+  const PERIODO_VALIDO = /^\d{4}-(0[1-9]|1[0-2])$/;
+  if (pedidos && pedidos.some((p) => !PERIODO_VALIDO.test(String(p)))) {
+    return res.status(400).json({ error: 'Competência inválida. Use o formato AAAA-MM.' });
+  }
+
+  try {
+    const alvo = pedidos && pedidos.length
+      ? pedidos.map(String)
+      : (await db.query(
+          'SELECT period FROM public.invoices WHERE uid = $1 ORDER BY period ASC',
+          [uid]
+        )).rows.map((r) => r.period);
+
+    if (alvo.length === 0) {
+      return res.json({ uid, periodos: [], resumo: { processados: 0, alterados: 0, falhas: 0 } });
+    }
+    if (dryRun) {
+      return res.json({ uid, dryRun: true, periodos: alvo, resumo: { aProcessar: alvo.length } });
+    }
+
+    // Contagem de linhas de armazenamento inicial e total, antes e depois.
+    const medir = async (client, period) => {
+      const { rows } = await client.query(`
+        SELECT i.total_amount,
+               COUNT(it.id) FILTER (WHERE it.description ILIKE ANY ($3::text[]))::int AS itens_base
+          FROM public.invoices i
+          LEFT JOIN public.invoice_items it ON it.invoice_id = i.id
+         WHERE i.uid = $1 AND i.period = $2
+         GROUP BY i.id, i.total_amount;
+      `, [uid, period, BASE_STORAGE_DESCRIPTION_PATTERNS]);
+      if (rows.length === 0) return { total: null, itensBase: 0 };
+      return { total: parseFloat(rows[0].total_amount), itensBase: rows[0].itens_base };
+    };
+
+    const resultado = [];
+    for (const period of alvo) {
+      const client = await db.pool.connect();
+      try {
+        await client.query('BEGIN');
+        const antes = await medir(client, period);
+        await calculateAndSaveInvoice(client, uid, period);
+        const depois = await medir(client, period);
+        await client.query('COMMIT');
+        resultado.push({
+          period,
+          ok: true,
+          itensBaseAntes: antes.itensBase,
+          itensBaseDepois: depois.itensBase,
+          totalAntes: antes.total,
+          totalDepois: depois.total,
+          alterado: antes.itensBase !== depois.itensBase || antes.total !== depois.total,
+        });
+      } catch (err) {
+        await client.query('ROLLBACK').catch(() => {});
+        console.error(`Erro ao recalcular ${uid} ${period}:`, err.message);
+        resultado.push({ period, ok: false, erro: err.message });
+      } finally {
+        client.release();
+      }
+    }
+
+    res.json({
+      uid,
+      periodos: resultado,
+      resumo: {
+        processados: resultado.filter((r) => r.ok).length,
+        alterados: resultado.filter((r) => r.ok && r.alterado).length,
+        falhas: resultado.filter((r) => !r.ok).length,
+      },
+    });
+  } catch (err) {
+    console.error(`Erro ao recalcular faturas de ${uid}:`, err);
+    res.status(500).json({ error: 'Erro ao recalcular as faturas do cliente.' });
   }
 });
 

@@ -130,12 +130,14 @@ router.get('/user/:userId/billing-summary', authenticateToken, requireOwnerOrMas
     }, {});
     const masterAdditionalPrice = masterPrices[ADDITIONAL_STORAGE_TYPE] || 0;
 
+    // Mesmas colunas e mesma ordem da fatura (router/billing.js): a estimativa
+    // desta tela tem de escolher o MESMO contrato base que será cobrado.
     const contractsResult = await db.query(`
-      SELECT s.type, s.id AS service_id, uc.volume, uc.start_date
+      SELECT s.type, s.id AS service_id, uc.id AS contract_id, uc.volume, uc.start_date
       FROM public.user_contracts uc
       JOIN public.services s ON uc.service_id = s.id
       WHERE uc.uid = $1 AND s.type = ANY($2)
-      ORDER BY uc.start_date ASC;
+      ORDER BY uc.start_date ASC, uc.id ASC;
     `, [userId, STORAGE_TYPES]);
 
     const reference = new Date();

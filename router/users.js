@@ -349,6 +349,49 @@ router.post('/contracts/:uid', authenticateToken, requireMaster, async (req, res
     }
 
     try {
+        /* Serviço inexistente dava 500 por violação de chave estrangeira. */
+        const serviceRes = await db.query(
+            'SELECT id, type, name FROM public.services WHERE id = $1',
+            [serviceId]
+        );
+        if (serviceRes.rowCount === 0) {
+            return res.status(404).json({ error: 'Serviço não encontrado no catálogo.' });
+        }
+        const service = serviceRes.rows[0];
+
+        /* Um armazenamento inicial por cliente.
+         *
+         * `base_storage` (1m³ integral) e `base_storage_50` (metade, operação
+         * FULL) são o MESMO item da fatura em planos diferentes, e a fatura
+         * cobra só um (utils/billingRules.js, pickBaseStorageContract). A
+         * constraint unique_contract é por (uid, service_id), então ela não
+         * impede contratar os dois — era assim que o cliente terminava com duas
+         * linhas de "Armazenamento Inicial".
+         *
+         * Recusa em vez de substituir: trocar o contrato aqui apagaria a data de
+         * início do plano antigo, que é o que faz a fatura de uma competência
+         * passada continuar correta.
+         */
+        if (BASE_STORAGE_TYPES.includes(service.type)) {
+            const existente = await db.query(`
+                SELECT uc.id, s.name, uc.start_date
+                  FROM public.user_contracts uc
+                  JOIN public.services s ON s.id = uc.service_id
+                 WHERE uc.uid = $1 AND s.type = ANY($2) AND uc.service_id <> $3
+                 ORDER BY uc.start_date DESC, uc.id DESC
+                 LIMIT 1;
+            `, [uid, BASE_STORAGE_TYPES, serviceId]);
+
+            if (existente.rowCount > 0) {
+                const atual = existente.rows[0];
+                return res.status(409).json({
+                    error: `Este cliente já tem um armazenamento inicial contratado: "${atual.name}". A fatura cobra apenas um. Remova o contrato atual antes de contratar outro plano.`,
+                    code: 'base_storage_conflict',
+                    current: { contractId: atual.id, name: atual.name, startDate: atual.start_date },
+                });
+            }
+        }
+
         const query = `
             INSERT INTO public.user_contracts (uid, service_id, name, price, volume, start_date)
             VALUES ($1, $2, $3, $4, $5, $6)
