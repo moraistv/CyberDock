@@ -55,6 +55,21 @@ async function startServer() {
   await initializeDatabase();
   app.listen(PORT, () => {
     console.log(`🚀 Servidor backend rodando na porta ${PORT}`);
+
+    /* Correção de dado histórico, DEPOIS de começar a atender.
+     *
+     * Faturas antigas que ficaram com duas linhas de armazenamento inicial
+     * (`base_storage` e `base_storage_50` contratados ao mesmo tempo) só se
+     * corrigem quando alguém abre aquela competência na tela. Isto recalcula as
+     * afetadas uma única vez, controlado por marcador em system_settings.
+     *
+     * Fora da prontidão de propósito: é correção de dado, não requisito para o
+     * servidor responder. Falha aqui só registra aviso.
+     */
+    const { recalculateDuplicatedStorageInvoices } = require('./router/billing');
+    recalculateDuplicatedStorageInvoices().catch((error) => {
+      console.warn('Correção retroativa do armazenamento não executada:', error.message);
+    });
   });
 }
 

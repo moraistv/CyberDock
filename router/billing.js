@@ -597,6 +597,14 @@ router.get('/storage-duplicates', authenticateToken, requireMaster, async (req, 
 router.post('/recalculate/:uid', authenticateToken, requireMaster, async (req, res) => {
   const { uid } = req.params;
   const dryRun = req.query.dryRun === '1';
+  /* Fatura PAGA fica de fora por padrão.
+   *
+   * O recálculo não mexe no status (nem em paid_at/paid_by), mas mexe no
+   * `total_amount`. Numa competência já quitada, corrigir a duplicidade faria o
+   * sistema passar a exibir um total MENOR do que o cliente efetivamente pagou —
+   * um problema contábil criado por uma correção técnica. Quem quiser assumir
+   * isso pede explicitamente com ?includePaid=1. */
+  const includePaid = req.query.includePaid === '1';
   const pedidos = Array.isArray(req.body?.periods) ? req.body.periods : null;
 
   const PERIODO_VALIDO = /^\d{4}-(0[1-9]|1[0-2])$/;
@@ -605,10 +613,11 @@ router.post('/recalculate/:uid', authenticateToken, requireMaster, async (req, r
   }
 
   try {
+    const filtroPago = includePaid ? '' : " AND COALESCE(status, '') <> 'paid'";
     const alvo = pedidos && pedidos.length
       ? pedidos.map(String)
       : (await db.query(
-          'SELECT period FROM public.invoices WHERE uid = $1 ORDER BY period ASC',
+          `SELECT period FROM public.invoices WHERE uid = $1${filtroPago} ORDER BY period ASC`,
           [uid]
         )).rows.map((r) => r.period);
 
@@ -662,6 +671,7 @@ router.post('/recalculate/:uid', authenticateToken, requireMaster, async (req, r
 
     res.json({
       uid,
+      includePaid,
       periodos: resultado,
       resumo: {
         processados: resultado.filter((r) => r.ok).length,
@@ -675,4 +685,108 @@ router.post('/recalculate/:uid', authenticateToken, requireMaster, async (req, r
   }
 });
 
+/**
+ * ===== Correção retroativa da duplicidade de armazenamento inicial =====
+ *
+ * Roda UMA vez, em segundo plano, depois que o servidor já está atendendo
+ * (chamada em server.js). Existe porque corrigir a regra de geração não reescreve
+ * o que já está gravado: `GET /invoices/:uid` só recalcula a competência que
+ * alguém abre. Sem isto, "corrigir o passado" dependia de abrir mês a mês, de
+ * cliente em cliente, ou de chamar POST /recalculate/:uid na mão para cada um.
+ *
+ * Escopo deliberadamente estreito:
+ *
+ *   - só faturas que REALMENTE têm mais de uma linha de armazenamento inicial;
+ *   - só faturas NÃO pagas, pelo mesmo motivo do endpoint acima: numa
+ *     competência quitada, baixar o total para menos do que o cliente pagou é
+ *     criar um problema contábil. As pagas ficam listadas em
+ *     GET /billing/storage-duplicates, para decisão humana.
+ *
+ * Uma transação por competência, em série, com pausa entre elas — recálculo
+ * varre vendas, e treze dessas em paralelo já esgotaram o pool antes.
+ *
+ * O marcador em system_settings só é gravado quando TODAS passam: se alguma
+ * falhar, a próxima subida tenta de novo. O recálculo é idempotente, então
+ * repetir não causa dano.
+ */
+async function recalculateDuplicatedStorageInvoices() {
+  const MARCADOR = 'storage_base_duplicate_invoices_recalculated_v1';
+
+  try {
+    const feito = await db.query('SELECT 1 FROM public.system_settings WHERE key = $1', [MARCADOR]);
+    if (feito.rowCount > 0) return;
+
+    const marcarConcluido = () => db.query(
+      `INSERT INTO public.system_settings (key, value, updated_at)
+       VALUES ($1, to_jsonb(NOW()::text), NOW())
+       ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value, updated_at = NOW()`,
+      [MARCADOR]
+    );
+
+    const alvo = await db.query(`
+      SELECT i.uid, i.period,
+             COUNT(*)::int AS itens_base,
+             COALESCE(i.status, '') = 'paid' AS paga
+        FROM public.invoices i
+        JOIN public.invoice_items it ON it.invoice_id = i.id
+       WHERE it.description ILIKE ANY ($1::text[])
+       GROUP BY i.id, i.uid, i.period, i.status
+      HAVING COUNT(*) > 1
+       ORDER BY i.period ASC
+    `, [BASE_STORAGE_DESCRIPTION_PATTERNS]);
+
+    if (alvo.rowCount === 0) {
+      await marcarConcluido();
+      return;
+    }
+
+    const pagas = alvo.rows.filter((r) => r.paga);
+    const aCorrigir = alvo.rows.filter((r) => !r.paga);
+
+    console.log(`   -> Correção retroativa: ${alvo.rowCount} fatura(s) com armazenamento inicial duplicado `
+      + `(${aCorrigir.length} a recalcular, ${pagas.length} já paga(s), preservada(s)).`);
+
+    let corrigidas = 0;
+    let falhas = 0;
+
+    for (const { uid, period } of aCorrigir) {
+      const client = await db.pool.connect();
+      try {
+        await client.query('BEGIN');
+        await calculateAndSaveInvoice(client, uid, period);
+        await client.query('COMMIT');
+        corrigidas += 1;
+      } catch (err) {
+        await client.query('ROLLBACK').catch(() => {});
+        falhas += 1;
+        console.warn(`   -> Falha ao recalcular ${uid} ${period}: ${err.message}`);
+      } finally {
+        client.release();
+      }
+      // Devolve a vez para as requisições entre competências.
+      await new Promise((resolve) => setTimeout(resolve, 120));
+    }
+
+    if (pagas.length > 0) {
+      console.warn('   -> Faturas PAGAS com duplicidade não foram alteradas (o total pago não seria mais o exibido): '
+        + `${pagas.map((r) => `${r.uid}/${r.period}`).join(', ')}. `
+        + 'Use GET /api/billing/storage-duplicates para revisar.');
+    }
+
+    if (falhas === 0) {
+      await marcarConcluido();
+      console.log(`   -> Concluído: ${corrigidas} fatura(s) recalculada(s).`);
+    } else {
+      console.warn(`   -> Correção retroativa incompleta (${corrigidas} ok, ${falhas} falha(s)); `
+        + 'será retomada na próxima subida.');
+    }
+  } catch (error) {
+    // Nunca fatal: é correção de dado histórico, não parte da prontidão.
+    console.warn(`   -> Correção retroativa do armazenamento não concluída agora: ${error.message}`);
+  }
+}
+
 module.exports = router;
+// Anexado ao router porque este arquivo exporta o próprio middleware. O boot
+// (server.js) chama isto em segundo plano depois de começar a atender.
+module.exports.recalculateDuplicatedStorageInvoices = recalculateDuplicatedStorageInvoices;
