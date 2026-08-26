@@ -24,6 +24,7 @@ const {
   requireOwnerOrMaster,
   verifyAccessToken,
 } = require('../utils/authMiddleware');
+const { stampLabelLines, buildItemLines } = require('../utils/labelStamp');
 const {
   getShopeePartnerCredentials,
   getShopeeAuthUrl,
@@ -1004,6 +1005,26 @@ async function findShopeeSaleForLabel(uid, shopId, orderSn) {
   return rows[0] || null;
 }
 
+/**
+ * Itens do pedido, para estampar SKU e quantidade na etiqueta.
+ *
+ * Uma linha por SKU: na Shopee o pedido pode levar produtos diferentes no mesmo
+ * pacote, e a etiqueta é o que quem separa tem na mão.
+ *
+ * `findShopeeSaleForLabel` acima usa LIMIT 1 porque só precisa do rastreio, que
+ * é do envio; aqui a lista inteira importa.
+ */
+async function findShopeeItemsForLabel(uid, shopId, orderSn) {
+  const { rows } = await db.query(
+    `SELECT sku, quantity
+       FROM public.shopee_sales
+      WHERE uid = $1 AND shop_id = $2 AND order_sn = $3
+      ORDER BY sku`,
+    [uid, String(shopId), String(orderSn)]
+  );
+  return rows;
+}
+
 function readLabelQuery(req) {
   /* Dono da loja.
    *
@@ -1261,11 +1282,37 @@ router.get('/download-label', authenticateToken, async (req, res) => {
       return fail(409, download.error, download.message);
     }
 
+    /* SKU estampado na etiqueta, como já acontece no Mercado Livre.
+     *
+     * Fica num bloco de fundo branco na base da etiqueta. Não escrevo sobre o
+     * QR code nem sobre o código de barras de propósito: texto sobre os módulos
+     * do QR pode impedir a leitura no centro de distribuição, e etiqueta que não
+     * é lida sai mais caro que SKU pouco destacado.
+     *
+     * Nada aqui é impeditivo. Sem itens gravados, ou se o PDF não puder ser
+     * reescrito, a etiqueta original segue para o cliente do mesmo jeito.
+     */
+    let labelBuffer = download.buffer;
+    const isPdf = /pdf/i.test(download.contentType || 'application/pdf');
+    if (isPdf) {
+      try {
+        const itens = await findShopeeItemsForLabel(ownerUid, account.shopId, orderSn);
+        const linhas = buildItemLines(itens);
+        if (linhas.length > 0) {
+          labelBuffer = await stampLabelLines(labelBuffer, linhas);
+        } else {
+          console.warn(`[Shopee Label] Pedido ${orderSn} sem SKU gravado: etiqueta sai sem o bloco de conferência.`);
+        }
+      } catch (stampError) {
+        console.error(`[Shopee Label] Falha ao estampar SKU no pedido ${orderSn}:`, stampError.message);
+      }
+    }
+
     const suffix = documentType === SHOPEE_LABEL_TYPES.thermal ? 'termica' : 'etiqueta';
     res.setHeader('Content-Type', download.contentType || 'application/pdf');
     res.setHeader('Content-Disposition', `attachment; filename="shopee-${suffix}-${orderSn}.pdf"`);
     res.setHeader('Cache-Control', 'no-store');
-    return res.send(download.buffer);
+    return res.send(labelBuffer);
   } catch (error) {
     const code = error?.shopeeCode || null;
     console.error(`[Shopee Label] Falha ao baixar etiqueta do pedido ${orderSn}:`, error.message);
