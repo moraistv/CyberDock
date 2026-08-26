@@ -379,6 +379,69 @@ function resolveBoundedTotal(counted) {
     : { total: counted, exact: true };
 }
 
+/* ------------- Hidratação da página SEM passar pela view ------------------
+ *
+ * Para montar as 50 linhas de uma página é preciso quase tudo o que a view
+ * expõe (thumbnail, permalink, comprador, tags, variação). O caro é que cada
+ * linha PROJETADA da view custa ~112 buffers de TOAST de `raw_api_data`
+ * (medição de produção: 15.307 ms e 642.672 buffers num recorte de 30 dias).
+ * Então a consulta só é rápida se o filtro reduzir a projeção a ~50 linhas.
+ *
+ * E aí entra a regra do planner que derrubou duas tentativas:
+ *
+ *   Num `UNION ALL`, o Postgres só empurra o filtro para DENTRO dos ramos
+ *   quando a coluna citada é uma coluna crua (Var simples) em TODOS os ramos.
+ *   Se em algum ramo ela é uma EXPRESSÃO, o filtro fica ACIMA do UNION ALL — e
+ *   aí a view projeta as 79 mil linhas, com TOAST, antes de filtrar.
+ *
+ * Conferindo com a definição da view em utils/init-db.js:
+ *
+ *   sale_date  -> `s.sale_date`   nos dois ramos ......... Var, empurra
+ *   id         -> `s.id::text` no ML, `sp.order_sn` na Shopee ... expressão, NÃO empurra
+ *
+ * Foi exatamente isso:
+ *   - filtrar por `sale_date` funcionava (foi o recorte de 30 dias), mas a
+ *     janela deduzida da página era frágil e degenerava para `IS NULL`;
+ *   - filtrar por `s.id = ANY(...)` parecia melhor e ficou PIOR: statement
+ *     timeout em toda página, porque o filtro nem chegou a entrar nos ramos.
+ *     Log: `Erro interno ao buscar todas as vendas [etapa=hidratacao]`.
+ *
+ * A saída é não depender do planner: escrevemos o `UNION ALL` aqui, com o
+ * filtro de chave DENTRO de cada ramo, contra a chave NATIVA de cada tabela:
+ *
+ *   public.sales        -> UNIQUE (id, sku, uid)        -> `id = ANY(bigint[])`
+ *   public.shopee_sales -> PRIMARY KEY (order_sn, ...)  -> `order_sn = ANY(text[])`
+ *
+ * Assim o Postgres entra pelo índice, lê ~50 linhas e projeta ~50 linhas.
+ *
+ * As expressões de coluna NÃO são reescritas à mão: saem de COUNT_SOURCES, que
+ * já é o espelho verificado do SELECT da view. Uma coluna nova na view sem
+ * espelho no mapa estoura no carregamento do módulo, não em silêncio na tela.
+ */
+const HYDRATE_COLS = Object.keys(COUNT_SOURCES[0].cols);
+
+/* Filtro de chave por ramo, na ordem de COUNT_SOURCES. Os placeholders $1 e $2
+ * são os primeiros parâmetros da consulta de hidratação. */
+const HYDRATE_KEY_FILTERS = [
+  's.id = ANY($1::bigint[])',
+  's.order_sn = ANY($2::text[])',
+];
+
+function buildHydrateSource() {
+  return COUNT_SOURCES.map(({ from, cols }, i) => {
+    const select = HYDRATE_COLS.map((col) => {
+      const expr = cols[col];
+      if (expr === undefined) {
+        throw new Error(`coluna sem espelho para hidratação em ${from}: ${col}`);
+      }
+      return `${expr} AS ${col}`;
+    }).join(',\n                 ');
+    return `        SELECT ${select}\n          FROM ${from}\n         WHERE ${HYDRATE_KEY_FILTERS[i]}`;
+  }).join('\n        UNION ALL\n');
+}
+
+const HYDRATE_SOURCE = buildHydrateSource();
+
 const sendEvent = (clientId, data) => {
   if (clients[clientId]) {
     clients[clientId].res.write(`data: ${JSON.stringify(data)}\n\n`);
@@ -1821,53 +1884,38 @@ router.get('/all', authenticateToken, requireMaster, async (req, res) => {
          ORDER BY s.sale_date DESC NULLS LAST
          LIMIT $${paramIdx} OFFSET $${paramIdx + 1}`;
 
-    /* Hidratação da página: a view, restrita SÓ pelas chaves da página.
+    /* Hidratação da página, pelas chaves, direto nas tabelas de origem.
      *
-     * O que importa aqui é o custo por linha PROJETADA. Medição de produção
-     * (25/08/2026) de `SELECT s.* FROM unified_sales WHERE sale_date >= now() -
-     * interval '30 days'`: 15.307 ms e 642.672 buffers. Descontando a varredura
-     * (~13.600 buffers), sobram ~112 buffers por linha de saída — é o TOAST de
-     * raw_api_data, que a lista de saída da view referencia cerca de 12 vezes.
-     * Ou seja: o filtro é empurrado para dentro do UNION ALL e a projeção só
-     * roda nas linhas que passam, mas CADA linha que passa custa ~112 buffers.
+     * O porquê de não ler `public.unified_sales` aqui está em HYDRATE_SOURCE, no
+     * alto do arquivo: num UNION ALL o Postgres só empurra o filtro para dentro
+     * dos ramos quando a coluna é crua nos DOIS lados, e `id` é `s.id::text` no
+     * ramo do ML. Filtrando a view por `id`, o filtro fica acima do UNION ALL e
+     * a view projeta as 79 mil linhas com TOAST — statement timeout.
      *
-     * Então a única coisa que garante esta consulta rápida é o filtro casar com
-     * ~50 linhas. Duas tentativas anteriores falharam nisso:
+     * Histórico das tentativas, para não repetir:
      *
-     * 1) Janela de datas vinda de CTE (`janela AS (SELECT MIN(sale_date)...)`)
-     *    com as chaves em EXISTS. Limite de CTE não é constante em tempo de
-     *    PLANEJAMENTO, então o intervalo não entrou nos ramos do UNION ALL:
-     *      ->  Append (actual rows=79063)
-     *            ->  Seq Scan on sales (rows=70522)
-     *    Projetou as 70 mil linhas e deu statement timeout (57014).
+     * 1) Janela de datas vinda de CTE, chaves em EXISTS. Limite de CTE não é
+     *    constante em tempo de PLANEJAMENTO, então nem o intervalo entrou nos
+     *    ramos:  Append (actual rows=79063) -> Seq Scan on sales (rows=70522).
+     * 2) Janela de datas como PARÂMETRO deduzida da página. Entrava nos ramos
+     *    (sale_date é coluna crua nos dois), mas `ORDER BY sale_date DESC`
+     *    devolve NULL PRIMEIRO: a página 1 vinha de venda sem data e a janela
+     *    degenerava para `sale_date IS NULL`.
+     * 3) `s.id = ANY(...)` na view. Timeout em TODA página, pelo motivo acima.
      *
-     * 2) Janela de datas como PARÂMETRO, deduzida das chaves da página. Entrou
-     *    nos ramos, mas a dedução era frágil: `ORDER BY sale_date DESC` no
-     *    Postgres devolve NULL PRIMEIRO, então a página 1 podia vir cheia de
-     *    venda sem data e a janela virava `sale_date IS NULL` — que casa com
-     *    TODAS as linhas sem data, não com 50. Timeout de novo, e só na página
-     *    1, e só depois que a janela obrigatória de 30 dias saiu da rota (era
-     *    ela que escondia essas linhas). Também perdia linha de SKU nulo:
-     *    concatenar NULL em SQL produz NULL, e NULL = ANY(...) nunca é verdade.
-     *
-     * Agora o recorte é só a chave, que é exata e não depende de data nenhuma:
-     *
-     *   s.id = ANY($1)  -> elimina 99,9% das linhas ANTES da projeção, lendo um
-     *                      inteiro/texto curto. É o que mantém a varredura em
-     *                      ~200 ms (medido: 79 mil linhas nas duas tabelas).
-     *   chave composta   -> desempata SKU repetido no mesmo pedido, para não
-     *                      hidratar item que não está na página.
+     * Agora: `$1` são os id do ML e `$2` os order_sn da Shopee, cada um no seu
+     * ramo, contra a chave nativa da tabela. `page_rows` traz os pedidos da
+     * página inteiros (todos os SKUs de cada pedido), e a chave composta em `$4`
+     * mantém só as linhas que realmente estão na página.
      *
      * A chave composta usa o separador de unidade (U+001F), que não aparece em
      * SKU nem em apelido de conta — diferente de '|' ou ':'. COALESCE(sku,'')
-     * nos dois lados mantém a linha de SKU nulo na listagem.
+     * nos dois lados mantém a linha de SKU nulo na listagem: concatenar NULL em
+     * SQL produz NULL, e NULL = ANY(...) nunca é verdade.
      */
     const dataQuery = `
       WITH page_rows AS MATERIALIZED (
-        SELECT s.*
-          FROM public.unified_sales s
-         WHERE s.id = ANY($1)
-           AND (s.marketplace || $2 || s.id || $2 || COALESCE(s.sku, '') || $2 || s.uid) = ANY($3)
+${HYDRATE_SOURCE}
       )
       SELECT s.id, s.sku, s.uid, s.marketplace,
         s.marketplace AS channel,
@@ -1929,6 +1977,8 @@ router.get('/all', authenticateToken, requireMaster, async (req, res) => {
         WHERE sk.user_id = s.uid
           AND UPPER(TRIM(sk.sku)) = UPPER(TRIM(s.sku))
       ) skm ON TRUE
+      -- Descarta o SKU que veio junto do pedido mas não está nesta página.
+      WHERE (s.marketplace || $3 || s.id || $3 || COALESCE(s.sku, '') || $3 || s.uid) = ANY($4)
       -- Mesmo NULLS LAST do recorte: se as duas ordenações discordassem, a
       -- página exibida sairia numa ordem diferente da que definiu quais linhas
       -- entram nela.
@@ -1972,16 +2022,38 @@ router.get('/all', authenticateToken, requireMaster, async (req, res) => {
     if (chaves.length > 0) {
       // U+001F: separador de unidade. Não aparece em SKU nem em apelido de conta.
       const SEP = '\u001f';
-      // Lista de ids sem repetição: pedido com vários SKUs aparece uma vez só,
-      // e é este filtro que elimina as linhas antes da projeção da view.
-      const ids = [...new Set(chaves.map((k) => String(k.id)))];
+
+      /* Chaves separadas por canal, sem repetição: cada ramo da hidratação
+       * filtra pela chave NATIVA da sua tabela (bigint no ML, texto na Shopee).
+       *
+       * O id do ML precisa ser numérico para o cast `::bigint[]`: um valor não
+       * numérico faria a consulta INTEIRA falhar, não apenas aquela linha. Não
+       * deveria existir (a coluna de origem é BIGINT), mas a listagem não é
+       * lugar de descobrir isso.
+       */
+      const mlIds = new Set();
+      const shopeeIds = new Set();
+      for (const k of chaves) {
+        const id = String(k.id);
+        if (k.marketplace === 'ML') {
+          if (/^\d+$/.test(id)) mlIds.add(id);
+        } else {
+          shopeeIds.add(id);
+        }
+      }
+
       // `?? ''` espelha o COALESCE(sku,'') do SQL. Sem os dois lados, venda de
       // SKU nulo entra no recorte e desaparece na hidratação.
       const chaveKeys = chaves.map((k) => [k.marketplace, k.id, k.sku ?? '', k.uid].join(SEP));
 
       // Etapa 2: hidrata só as linhas da página.
       etapa = 'hidratacao';
-      const dataResult = await db.query(dataQuery, [ids, SEP, chaveKeys]);
+      const dataResult = await db.query(dataQuery, [
+        [...mlIds],
+        [...shopeeIds],
+        SEP,
+        chaveKeys,
+      ]);
       rows = dataResult.rows;
     }
 
