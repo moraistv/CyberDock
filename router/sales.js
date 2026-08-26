@@ -748,31 +748,55 @@ async function warmMlThumbnailCache(rows, uid = null) {
     const accountNames = Object.keys(byAccount);
     if (accountNames.length === 0) return;
 
+    /* Traz também user_id/uid/refresh_token: sem eles não há como renovar o
+     * token, e um access_token do ML vale 6 horas. Era a razão de "algumas
+     * imagens não vêm": a conta cujo token estava vencido recebia 401 aqui, o
+     * `if (res.ok)` descartava a resposta em silêncio e a thumbnail NUNCA era
+     * gravada — a cada visita a tela repetia a chamada e o 401. Só as contas
+     * sincronizadas nas últimas horas tinham token bom e imagem. */
     const tokenResult = await db.query(
-      "SELECT access_token, nickname FROM public.ml_accounts WHERE status = 'active' ORDER BY updated_at DESC NULLS LAST"
+      `SELECT user_id, uid, nickname, access_token, refresh_token
+         FROM public.ml_accounts
+        WHERE status = 'active'
+        ORDER BY updated_at DESC NULLS LAST`
     );
     if (tokenResult.rowCount === 0) return;
 
-    const tokenByNickname = {};
+    const accountByNickname = {};
     for (const t of tokenResult.rows) {
-      if (t.nickname && !tokenByNickname[t.nickname]) tokenByNickname[t.nickname] = t.access_token;
+      if (t.nickname && !accountByNickname[t.nickname]) accountByNickname[t.nickname] = t;
     }
-    const fallbackToken = tokenResult.rows[0].access_token;
+    const fallbackAccount = tokenResult.rows[0];
 
     const thumbMap = {};
     const BATCH_SIZE = 20;
 
     for (const acctName of accountNames) {
       const itemIds = Array.from(byAccount[acctName]);
-      const token = tokenByNickname[acctName] || fallbackToken;
-      if (!token) continue;
+      const account = accountByNickname[acctName] || fallbackAccount;
+      if (!account || !account.access_token) continue;
 
       for (let i = 0; i < itemIds.length; i += BATCH_SIZE) {
         const batch = itemIds.slice(i, i + BATCH_SIZE).filter((id) => !thumbMap[id]);
         if (batch.length === 0) continue;
         try {
           const url = `https://api.mercadolibre.com/items?ids=${batch.join(',')}&attributes=id,thumbnail,secure_thumbnail`;
-          const res = await mlFetch(url, { headers: { Authorization: `Bearer ${token}` } });
+          let res = await mlFetch(url, { headers: { Authorization: `Bearer ${account.access_token}` } });
+
+          /* Renova UMA vez por conta e por aquecimento. Sem o limite, uma conta
+           * com refresh_token inválido tentaria renovar em cada lote de 20
+           * itens. `refreshAccountToken` não escreve nada quando o ML recusa,
+           * então a credencial atual fica intacta. */
+          if (res.status === 401 && account.refresh_token && !account.__refreshTentado) {
+            account.__refreshTentado = true;
+            try {
+              account.access_token = await refreshAccountToken(account.user_id, account.uid, account.refresh_token);
+              res = await mlFetch(url, { headers: { Authorization: `Bearer ${account.access_token}` } });
+            } catch (err) {
+              console.warn(`[THUMB] Token da conta ${acctName} não pôde ser renovado: ${err.message}`);
+            }
+          }
+
           if (res.ok) {
             const data = await res.json();
             for (const entry of data) {
@@ -1540,6 +1564,11 @@ router.get('/separacao', authenticateToken, requireMaster, async (req, res) => {
 });
 
 router.get('/all', authenticateToken, requireMaster, async (req, res) => {
+  /* Qual passo estourou. Esta rota faz três consultas com custos muito
+   * diferentes (recorte, hidratação e contagem) e o log anterior dizia apenas
+   * "erro ao buscar todas as vendas" — com statement timeout, isso não permite
+   * saber qual delas revisar. */
+  let etapa = 'preparo';
   try {
     const page = Math.max(1, parseInt(req.query.page) || 1);
     const limit = Math.min(100, Math.max(1, parseInt(req.query.limit) || 50));
@@ -1783,38 +1812,62 @@ router.get('/all', authenticateToken, requireMaster, async (req, res) => {
          -- obrigava ORDENAR TODAS as vendas de TODOS os clientes antes do
          -- LIMIT, e era o custo dominante desta tela. O desempate para exibição
          -- continua no ORDER BY externo, aplicado só às 50 linhas da página.
-         ORDER BY s.sale_date DESC
+         --
+         -- NULLS LAST é obrigatório: em DESC o padrão do Postgres é NULLS
+         -- FIRST, então venda sem data ia para o TOPO da primeira página. Isso
+         -- ficou visível quando a janela obrigatória de 30 dias saiu — antes a
+         -- janela descartava NULL (NULL >= data é NULL), e o defeito não
+         -- aparecia. A linha continua acessível, agora no fim da listagem.
+         ORDER BY s.sale_date DESC NULLS LAST
          LIMIT $${paramIdx} OFFSET $${paramIdx + 1}`;
 
-    /* Hidratação da página: a view, restrita por PARÂMETROS.
+    /* Hidratação da página: a view, restrita SÓ pelas chaves da página.
      *
-     * A primeira versão disto trazia a janela de datas de uma CTE
-     * (`janela AS (SELECT MIN(sale_date)...)`) e casava as chaves com EXISTS.
-     * Não funcionou, e o plano de produção mostrou por quê:
+     * O que importa aqui é o custo por linha PROJETADA. Medição de produção
+     * (25/08/2026) de `SELECT s.* FROM unified_sales WHERE sale_date >= now() -
+     * interval '30 days'`: 15.307 ms e 642.672 buffers. Descontando a varredura
+     * (~13.600 buffers), sobram ~112 buffers por linha de saída — é o TOAST de
+     * raw_api_data, que a lista de saída da view referencia cerca de 12 vezes.
+     * Ou seja: o filtro é empurrado para dentro do UNION ALL e a projeção só
+     * roda nas linhas que passam, mas CADA linha que passa custa ~112 buffers.
      *
-     *   ->  Append (actual rows=79063)
-     *         ->  Seq Scan on sales (rows=70522)
+     * Então a única coisa que garante esta consulta rápida é o filtro casar com
+     * ~50 linhas. Duas tentativas anteriores falharam nisso:
      *
-     * Limite vindo de CTE não é constante na hora de PLANEJAR, então o Postgres
-     * não empurra o intervalo como filtro para dentro do UNION ALL e acaba
-     * projetando a lista de saída da view — com JSONB e TOAST — para as 70 mil
-     * linhas. A janela restringia o que SAI, não o que é LIDO. Deu statement
-     * timeout (57014).
+     * 1) Janela de datas vinda de CTE (`janela AS (SELECT MIN(sale_date)...)`)
+     *    com as chaves em EXISTS. Limite de CTE não é constante em tempo de
+     *    PLANEJAMENTO, então o intervalo não entrou nos ramos do UNION ALL:
+     *      ->  Append (actual rows=79063)
+     *            ->  Seq Scan on sales (rows=70522)
+     *    Projetou as 70 mil linhas e deu statement timeout (57014).
      *
-     * Com os limites como parâmetro, o filtro entra em cada ramo do UNION ALL e
-     * a projeção só é avaliada nas linhas que passam. As chaves da página cabem
-     * numa janela estreita de datas (são 50 vendas consecutivas), então a
-     * projeção roda dezenas de vezes em vez de 70 mil.
+     * 2) Janela de datas como PARÂMETRO, deduzida das chaves da página. Entrou
+     *    nos ramos, mas a dedução era frágil: `ORDER BY sale_date DESC` no
+     *    Postgres devolve NULL PRIMEIRO, então a página 1 podia vir cheia de
+     *    venda sem data e a janela virava `sale_date IS NULL` — que casa com
+     *    TODAS as linhas sem data, não com 50. Timeout de novo, e só na página
+     *    1, e só depois que a janela obrigatória de 30 dias saiu da rota (era
+     *    ela que escondia essas linhas). Também perdia linha de SKU nulo:
+     *    concatenar NULL em SQL produz NULL, e NULL = ANY(...) nunca é verdade.
+     *
+     * Agora o recorte é só a chave, que é exata e não depende de data nenhuma:
+     *
+     *   s.id = ANY($1)  -> elimina 99,9% das linhas ANTES da projeção, lendo um
+     *                      inteiro/texto curto. É o que mantém a varredura em
+     *                      ~200 ms (medido: 79 mil linhas nas duas tabelas).
+     *   chave composta   -> desempata SKU repetido no mesmo pedido, para não
+     *                      hidratar item que não está na página.
      *
      * A chave composta usa o separador de unidade (U+001F), que não aparece em
-     * SKU nem em apelido de conta — diferente de '|' ou ':'.
+     * SKU nem em apelido de conta — diferente de '|' ou ':'. COALESCE(sku,'')
+     * nos dois lados mantém a linha de SKU nulo na listagem.
      */
     const dataQuery = `
       WITH page_rows AS MATERIALIZED (
         SELECT s.*
           FROM public.unified_sales s
-         WHERE (s.sale_date >= $1 AND s.sale_date <= $2)
-           AND (s.marketplace || $3 || s.id || $3 || s.sku || $3 || s.uid) = ANY($4)
+         WHERE s.id = ANY($1)
+           AND (s.marketplace || $2 || s.id || $2 || COALESCE(s.sku, '') || $2 || s.uid) = ANY($3)
       )
       SELECT s.id, s.sku, s.uid, s.marketplace,
         s.marketplace AS channel,
@@ -1876,7 +1929,10 @@ router.get('/all', authenticateToken, requireMaster, async (req, res) => {
         WHERE sk.user_id = s.uid
           AND UPPER(TRIM(sk.sku)) = UPPER(TRIM(s.sku))
       ) skm ON TRUE
-      ORDER BY s.sale_date DESC, s.marketplace, s.id, s.sku;
+      -- Mesmo NULLS LAST do recorte: se as duas ordenações discordassem, a
+      -- página exibida sairia numa ordem diferente da que definiu quais linhas
+      -- entram nela.
+      ORDER BY s.sale_date DESC NULLS LAST, s.marketplace, s.id, s.sku;
     `;
 
     // O tabelão global varre as duas tabelas de TODOS os clientes; contar isso
@@ -1887,6 +1943,7 @@ router.get('/all', authenticateToken, requireMaster, async (req, res) => {
     if (req.query.countOnly === '1') {
       // A contagem é um refinamento do número já exibido. Se ela falhar ou
       // estiver em espera, a tela mantém o total aproximado em vez de erro.
+      etapa = 'contagem';
       let counted;
       try {
         counted = cachedTotal === null
@@ -1906,6 +1963,7 @@ router.get('/all', authenticateToken, requireMaster, async (req, res) => {
 
     /* Etapa 1: as chaves da página, pela fonte projetada. Medido em produção:
      * 205 ms para 79 mil linhas, com top-N heapsort. */
+    etapa = 'chaves';
     const chavesResult = await db.query(chavesQuery, [...params, limit + 1, offset]);
     const hasNext = chavesResult.rows.length > limit;
     const chaves = hasNext ? chavesResult.rows.slice(0, limit) : chavesResult.rows;
@@ -1914,32 +1972,16 @@ router.get('/all', authenticateToken, requireMaster, async (req, res) => {
     if (chaves.length > 0) {
       // U+001F: separador de unidade. Não aparece em SKU nem em apelido de conta.
       const SEP = '\u001f';
-      const chaveKeys = chaves.map((k) => [k.marketplace, k.id, k.sku, k.uid].join(SEP));
+      // Lista de ids sem repetição: pedido com vários SKUs aparece uma vez só,
+      // e é este filtro que elimina as linhas antes da projeção da view.
+      const ids = [...new Set(chaves.map((k) => String(k.id)))];
+      // `?? ''` espelha o COALESCE(sku,'') do SQL. Sem os dois lados, venda de
+      // SKU nulo entra no recorte e desaparece na hidratação.
+      const chaveKeys = chaves.map((k) => [k.marketplace, k.id, k.sku ?? '', k.uid].join(SEP));
 
-      /* Janela de datas da página, como PARÂMETRO.
-       *
-       * `ORDER BY sale_date DESC` no Postgres coloca NULL PRIMEIRO, então a
-       * primeira página pode começar com venda sem data. Nesse caso os limites
-       * saem só das datas presentes e a condição aceita NULL também — sem isso,
-       * a linha sem data desapareceria da listagem em silêncio. */
-      const datasMs = chaves
-        .map((k) => (k.sale_date ? new Date(k.sale_date).getTime() : null))
-        .filter((t) => t !== null && !Number.isNaN(t));
-      const temNula = datasMs.length < chaves.length;
-      const janelaSql = datasMs.length
-        ? `(s.sale_date >= $1 AND s.sale_date <= $2${temNula ? ' OR s.sale_date IS NULL' : ''})`
-        : 's.sale_date IS NULL';
-
-      // Etapa 2: hidrata só as linhas da página, com a janela em parâmetro.
-      const dataResult = await db.query(
-        dataQuery.replace('(s.sale_date >= $1 AND s.sale_date <= $2)', janelaSql),
-        [
-          datasMs.length ? new Date(Math.min(...datasMs)) : null,
-          datasMs.length ? new Date(Math.max(...datasMs)) : null,
-          SEP,
-          chaveKeys,
-        ]
-      );
+      // Etapa 2: hidrata só as linhas da página.
+      etapa = 'hidratacao';
+      const dataResult = await db.query(dataQuery, [ids, SEP, chaveKeys]);
       rows = dataResult.rows;
     }
 
@@ -1984,7 +2026,7 @@ router.get('/all', authenticateToken, requireMaster, async (req, res) => {
     // imagem ainda não foi gravada no banco aparece sem foto.
     setImmediate(() => warmMlThumbnailCache(rows));
   } catch (error) {
-    console.error("Erro interno ao buscar todas as vendas:", error);
+    console.error(`Erro interno ao buscar todas as vendas [etapa=${etapa}]:`, error);
     res.status(500).json({ error: 'Erro interno ao buscar vendas globais.' });
   }
 });
@@ -4627,8 +4669,21 @@ async function refreshAccountToken(userId, uid, refresh_token) {
       refresh_token
     })
   });
-  if (!r.ok) throw new Error('Falha ao renovar token no webhook.');
+  // A mensagem não cita mais "webhook": além dele, o aquecedor de thumbnail e o
+  // reparo de modalidade também renovam token por aqui.
+  if (!r.ok) throw new Error(`Mercado Livre recusou a renovação do token (HTTP ${r.status}).`);
   const t = await r.json();
+  /* Trava contra apagar credencial boa.
+   *
+   * O UPDATE abaixo grava access_token e refresh_token direto do corpo da
+   * resposta. Se o ML responder 200 com um corpo que não traz os dois campos, o
+   * UPDATE escreveria NULL sobre a credencial válida e marcaria a conta como
+   * 'active' — a conta pararia de sincronizar e só voltaria com reconexão
+   * manual pelo OAuth. Preferimos falhar sem escrever nada: quem chama já trata
+   * o erro, e o token atual continua no lugar. */
+  if (!t || !t.access_token || !t.refresh_token) {
+    throw new Error('Renovação de token do ML devolveu resposta sem token.');
+  }
   await db.query(
     "UPDATE public.ml_accounts SET access_token = $1, refresh_token = $2, expires_in = $3, status = 'active', updated_at = NOW() WHERE user_id = $4 AND uid = $5",
     [t.access_token, t.refresh_token, t.expires_in, userId, uid]
