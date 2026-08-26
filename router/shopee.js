@@ -834,6 +834,54 @@ router.delete('/contas/:shopId', authenticateToken, async (req, res) => {
   }
 });
 
+/* --------------- Excluir loja de OUTRO usuário (master) ---------------
+ *
+ * Mesmo motivo do par no Mercado Livre: a rota acima deriva o dono do token, e
+ * por isso o master recebe 404 ao tentar desconectar a loja de um cliente.
+ *
+ * Apaga a linha da loja. O schema já leva junto, por ON DELETE CASCADE em
+ * (uid, shop_id), o cursor de sincronização (shopee_sync_cursors) e o job
+ * (shopee_sync_jobs) — são estado de controle. As vendas em
+ * public.shopee_sales NÃO têm FK e permanecem: são histórico de faturamento.
+ */
+router.delete('/contas/:uid/:shopId', authenticateToken, requireMaster, async (req, res) => {
+  const { uid, shopId } = req.params;
+
+  if (!uid || !shopId) {
+    return res.status(400).json({ error: 'Informe o usuário e a loja a excluir.' });
+  }
+  if (!/^\d+$/.test(shopId)) {
+    return res.status(400).json({ error: 'ID da loja Shopee inválido.' });
+  }
+
+  try {
+    const { rows } = await db.query(
+      `DELETE FROM public.shopee_accounts
+        WHERE shop_id = $1 AND uid = $2
+        RETURNING shop_id, shop_name, uid`,
+      [shopId, uid]
+    );
+
+    if (rows.length === 0) {
+      return res.status(404).json({ error: 'Loja não encontrada para este usuário.' });
+    }
+
+    const removida = rows[0];
+    console.log(
+      `[Shopee] Loja ${removida.shop_id} (${removida.shop_name || 'sem nome'}) do usuário ${uid} `
+      + `excluída pelo master ${req.user.uid}.`
+    );
+
+    res.json({
+      message: 'Loja Shopee desconectada.',
+      account: { shopId: String(removida.shop_id), shopName: removida.shop_name, uid: removida.uid },
+    });
+  } catch (error) {
+    console.error(`Erro ao excluir loja Shopee ${shopId} do usuário ${uid}:`, error);
+    res.status(500).json({ error: 'Erro interno ao excluir a loja.' });
+  }
+});
+
 /* ------------------------------- Etiquetas ------------------------------- */
 
 /**

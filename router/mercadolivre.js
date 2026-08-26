@@ -5,7 +5,7 @@ const fetch = require('node-fetch'); // v2.x (web streams no v3 mudam o pipe)
 const crypto = require('crypto');
 const zlib = require('zlib');
 const db = require('../utils/postgres');
-const { authenticateToken } = require('../utils/authMiddleware');
+const { authenticateToken, requireMaster, requireOwnerOrMaster } = require('../utils/authMiddleware');
 const { PDFDocument, rgb, StandardFonts } = require('pdf-lib');
 
 const router = express.Router();
@@ -331,8 +331,16 @@ router.get('/all-accounts', authenticateToken, async (req, res) => {
   }
 });
 
-/* -------------------- Lista de Contas p/ Usuário ----------------- */
-router.get('/contas/:uid', authenticateToken, async (req, res) => {
+/* -------------------- Lista de Contas p/ Usuário -----------------
+ *
+ * `requireOwnerOrMaster` estava faltando: qualquer usuário autenticado lia as
+ * contas de qualquer UID — e a resposta inclui access_token e refresh_token.
+ * O par equivalente da Shopee (shopee.js) já exigia isso.
+ *
+ * Os tokens continuam no retorno porque a tela de contas do cliente os exibe.
+ * Tirá-los é o passo seguinte, junto de ajustar a tela.
+ */
+router.get('/contas/:uid', authenticateToken, requireOwnerOrMaster, async (req, res) => {
   const { uid } = req.params;
   try {
     const { rows } = await db.query(
@@ -940,6 +948,63 @@ router.delete('/contas/:mlUserId', authenticateToken, async (req, res) => {
     if (result.rowCount === 0) return res.status(404).json({ error: 'Conta não encontrada ou não pertence a este usuário.' });
     res.status(204).send();
   } catch (error) {
+    res.status(500).json({ error: 'Erro interno ao excluir a conta.' });
+  }
+});
+
+/* --------------- Excluir conta de OUTRO usuário (master) -------------
+ *
+ * A rota acima resolve o dono pelo `uid` do token, então o master só consegue
+ * excluir conta dele mesmo: para a conta de um cliente, o par (user_id, uid) não
+ * existe e a resposta é 404. Era o que faltava para o painel do master poder
+ * desconectar a conta de um cliente — inclusive o caso da conta vinculada ao
+ * usuário errado, que hoje só se resolve com SQL na mão em produção.
+ *
+ * O `uid` alvo vem na URL e a permissão é `requireMaster`, não
+ * `requireOwnerOrMaster`: o autoatendimento continua sendo a rota de cima.
+ *
+ * Apaga SOMENTE a linha da conta. Vendas já sincronizadas (public.sales) ficam
+ * onde estão — elas são histórico de faturamento, não dependem da conta seguir
+ * conectada, e não há FK entre as duas tabelas. O cursor em ml_sync_cursors
+ * também fica: se a mesma conta for reconectada por este mesmo dono, o cursor
+ * antigo faz o próximo sync continuar de onde parou em vez de varrer tudo.
+ */
+router.delete('/contas/:uid/:mlUserId', authenticateToken, requireMaster, async (req, res) => {
+  const { uid, mlUserId } = req.params;
+
+  if (!uid || !mlUserId) {
+    return res.status(400).json({ error: 'Informe o usuário e a conta a excluir.' });
+  }
+  if (!/^\d+$/.test(mlUserId)) {
+    return res.status(400).json({ error: 'ID da conta do Mercado Livre inválido.' });
+  }
+
+  try {
+    const { rows } = await db.query(
+      `DELETE FROM public.ml_accounts
+        WHERE user_id = $1 AND uid = $2
+        RETURNING user_id, nickname, uid`,
+      [mlUserId, uid]
+    );
+
+    if (rows.length === 0) {
+      return res.status(404).json({ error: 'Conta não encontrada para este usuário.' });
+    }
+
+    const removida = rows[0];
+    // Quem removeu o que, e de quem. Exclusão de conta é irreversível pela tela
+    // (só reconectando pelo OAuth), então precisa deixar rastro no log.
+    console.log(
+      `[ML] Conta ${removida.user_id} (${removida.nickname || 'sem apelido'}) do usuário ${uid} `
+      + `excluída pelo master ${req.user.uid}.`
+    );
+
+    res.json({
+      message: 'Conta do Mercado Livre desconectada.',
+      account: { userId: String(removida.user_id), nickname: removida.nickname, uid: removida.uid },
+    });
+  } catch (error) {
+    console.error(`Erro ao excluir conta ML ${mlUserId} do usuário ${uid}:`, error);
     res.status(500).json({ error: 'Erro interno ao excluir a conta.' });
   }
 });
