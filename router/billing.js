@@ -23,6 +23,30 @@ const billingQueryBuilder = new BillingQueryBuilder();
 async function calculateAndSaveInvoice(client, uid, period) {
   const [year, month] = period.split('-').map(Number);
 
+  /* Competência FECHADA não é recalculada.
+   *
+   * Esta função apaga e recria os itens automáticos e regrava o total a cada
+   * chamada — e ela é chamada em toda abertura da fatura. Enquanto o mês está
+   * aberto, isso é o certo: venda processada hoje entra na conta de hoje.
+   *
+   * Deixa de ser certo no instante em que o valor sai do sistema (cobrança
+   * emitida, boleto enviado, nota fiscal). Uma venda com processed_at retroativo
+   * ou um avulso lançado depois mudariam o total de uma fatura já cobrada, e o
+   * cliente receberia um valor diferente do que está no documento.
+   *
+   * Sair aqui é o que torna o fechamento uma garantia, e não uma convenção que
+   * cada chamador precisa lembrar de respeitar: `GET /invoices/:uid`,
+   * `POST /add-manual-item`, `POST /recalculate/:uid` e o backfill do boot
+   * passam todos por esta função.
+   */
+  const existente = await client.query(
+    'SELECT closed_at FROM public.invoices WHERE uid = $1 AND period = $2',
+    [uid, period]
+  );
+  if (existente.rows[0]?.closed_at) {
+    return { recalculada: false, motivo: 'competencia_fechada' };
+  }
+
   // === 1) Preços "master" dos serviços de armazenamento ===
   // Inclui base_storage_50 (Armazenamento Inicial 1m³ 50% | FULL).
   const masterPricesRes = await client.query(`
@@ -128,6 +152,8 @@ async function calculateAndSaveInvoice(client, uid, period) {
 
   const newTotal = autoTotal + parseFloat(manualSumRes.rows[0].sum || 0);
   await client.query(`UPDATE public.invoices SET total_amount = $1 WHERE id = $2;`, [newTotal, invoiceId]);
+
+  return { recalculada: true, invoiceId, total: newTotal };
 }
 
 /** ===== ROTAS ===== */
@@ -150,6 +176,10 @@ router.get('/invoices/:uid', authenticateToken, async (req, res) => {
     const q = `
       SELECT i.id, i.uid, i.period, i.due_date, i.payment_date, i.total_amount, i.status,
              i.paid_at, i.paid_by,
+             -- Fechamento e vínculo externo: a tela precisa saber se o valor
+             -- ainda pode mudar e se já existe cobrança emitida.
+             i.closed_at, i.closed_by,
+             i.asaas_payment_id, i.asaas_status, i.asaas_invoice_url,
              COALESCE(json_agg(json_build_object(
                'id', it.id,
                'description', it.description,
@@ -269,6 +299,27 @@ router.post('/add-manual-item', authenticateToken, requireMaster, async (req, re
     }
 
     const totalPrice = unitPrice * qty;
+
+    /* Competência fechada não recebe lançamento.
+     *
+     * Sem esta guarda o fechamento seria furado: `calculateAndSaveInvoice` sai
+     * cedo na fatura fechada, mas o INSERT do item manual e o UPDATE do total
+     * abaixo continuariam rodando — o valor congelado mudaria por um caminho
+     * diferente. Quem precisa lançar em mês fechado reabre a competência,
+     * assumindo que vai ter de reemitir a cobrança.
+     */
+    const fechada = await client.query(
+      'SELECT closed_at FROM public.invoices WHERE uid = $1 AND period = $2',
+      [uid, period]
+    );
+    if (fechada.rows[0]?.closed_at) {
+      await client.query('ROLLBACK');
+      return res.status(409).json({
+        error: 'Esta competência está fechada e não aceita novos lançamentos. Reabra antes de lançar.',
+        code: 'period_closed',
+        closedAt: fechada.rows[0].closed_at,
+      });
+    }
 
     // 3) Garante fatura do período (gera automáticos e preserva manuais)
     await calculateAndSaveInvoice(client, uid, period);
@@ -415,10 +466,15 @@ router.delete('/manual-item/:itemId', authenticateToken, requireMaster, async (r
   try {
     await client.query('BEGIN');
 
-    const { rows } = await client.query(
-      `SELECT id, invoice_id, type FROM public.invoice_items WHERE id = $1`,
-      [itemId]
-    );
+    /* Traz o fechamento junto: remover um avulso muda o total, e numa
+     * competência fechada isso quebraria o valor congelado pelo mesmo caminho
+     * que o lançamento (ver a guarda em POST /add-manual-item). */
+    const { rows } = await client.query(`
+      SELECT it.id, it.invoice_id, it.type, i.closed_at, i.uid, i.period
+        FROM public.invoice_items it
+        JOIN public.invoices i ON i.id = it.invoice_id
+       WHERE it.id = $1
+    `, [itemId]);
     if (rows.length === 0) {
       await client.query('ROLLBACK');
       return res.status(404).json({ error: 'Lançamento não encontrado.' });
@@ -426,6 +482,15 @@ router.delete('/manual-item/:itemId', authenticateToken, requireMaster, async (r
     if (rows[0].type !== 'manual') {
       await client.query('ROLLBACK');
       return res.status(400).json({ error: 'Somente serviços avulsos podem ser removidos.' });
+    }
+    if (rows[0].closed_at) {
+      await client.query('ROLLBACK');
+      return res.status(409).json({
+        error: `A competência ${rows[0].period} está fechada e o valor não pode mais mudar. `
+          + 'Reabra a competência antes de remover o lançamento.',
+        code: 'period_closed',
+        closedAt: rows[0].closed_at,
+      });
     }
 
     const invoiceId = rows[0].invoice_id;
@@ -495,6 +560,122 @@ router.get('/all-manual-services', authenticateToken, requireMaster, async (req,
  * "Armazenamento Base (até 1m³)". Um diagnóstico que olhasse só a grafia nova
  * diria que está tudo certo no histórico. */
 const BASE_STORAGE_DESCRIPTION_PATTERNS = ['Armazenamento Base%', 'Armazenamento Inicial%'];
+
+/**
+ * ===== Fecha a competência (master) =====
+ *
+ * Fechar congela o valor: a partir daqui a fatura para de ser recalculada e o
+ * total exibido é o mesmo que pode ser cobrado do cliente por fora do sistema.
+ *
+ * Recalcula UMA última vez antes de congelar. Sem isso, o valor congelado seria
+ * o da última vez que alguém abriu a tela, que pode ser de dias antes e não
+ * incluir as expedições mais recentes.
+ */
+router.post('/invoices/:uid/:period/close', authenticateToken, requireMaster, async (req, res) => {
+  const { uid, period } = req.params;
+  if (!/^\d{4}-(0[1-9]|1[0-2])$/.test(period)) {
+    return res.status(400).json({ error: 'Competência inválida. Use o formato AAAA-MM.' });
+  }
+
+  const client = await db.pool.connect();
+  try {
+    await client.query('BEGIN');
+
+    const atual = await client.query(
+      'SELECT id, closed_at FROM public.invoices WHERE uid = $1 AND period = $2',
+      [uid, period]
+    );
+    if (atual.rowCount > 0 && atual.rows[0].closed_at) {
+      await client.query('ROLLBACK');
+      return res.status(409).json({
+        error: 'Esta competência já está fechada.',
+        code: 'already_closed',
+        closedAt: atual.rows[0].closed_at,
+      });
+    }
+
+    // Último recálculo com o mês aberto: é o valor que vai ser congelado.
+    await calculateAndSaveInvoice(client, uid, period);
+
+    const { rows, rowCount } = await client.query(`
+      UPDATE public.invoices
+         SET closed_at = NOW(), closed_by = $1
+       WHERE uid = $2 AND period = $3
+       RETURNING id, uid, period, total_amount, status, due_date, closed_at, closed_by;
+    `, [req.user.email || req.user.uid, uid, period]);
+
+    if (rowCount === 0) {
+      await client.query('ROLLBACK');
+      return res.status(404).json({ error: 'Não há fatura desta competência para este cliente.' });
+    }
+
+    await client.query('COMMIT');
+    const fatura = rows[0];
+    console.log(`[Cobrança] Competência ${period} de ${uid} fechada por ${fatura.closed_by} `
+      + `no valor de ${fatura.total_amount}.`);
+    res.json({ ok: true, invoice: { ...fatura, total_amount: parseFloat(fatura.total_amount) } });
+  } catch (err) {
+    await client.query('ROLLBACK').catch(() => {});
+    console.error(`Erro ao fechar a competência ${period} de ${uid}:`, err);
+    res.status(500).json({ error: 'Erro interno ao fechar a competência.' });
+  } finally {
+    client.release();
+  }
+});
+
+/**
+ * ===== Reabre a competência (master) =====
+ *
+ * Volta a fatura a ser recalculada. Serve para corrigir fechamento feito antes
+ * da hora.
+ *
+ * Com cobrança já emitida no provedor, exige `?force=1`: reabrir faz o total
+ * voltar a mudar, e aí o valor do sistema pode divergir do documento que o
+ * cliente recebeu. Quem reabre nesse caso tem que saber que vai precisar
+ * cancelar ou reemitir a cobrança.
+ */
+router.post('/invoices/:uid/:period/reopen', authenticateToken, requireMaster, async (req, res) => {
+  const { uid, period } = req.params;
+  const force = req.query.force === '1';
+  if (!/^\d{4}-(0[1-9]|1[0-2])$/.test(period)) {
+    return res.status(400).json({ error: 'Competência inválida. Use o formato AAAA-MM.' });
+  }
+
+  try {
+    const atual = await db.query(
+      'SELECT id, closed_at, asaas_payment_id, status FROM public.invoices WHERE uid = $1 AND period = $2',
+      [uid, period]
+    );
+    if (atual.rowCount === 0) {
+      return res.status(404).json({ error: 'Não há fatura desta competência para este cliente.' });
+    }
+    if (!atual.rows[0].closed_at) {
+      return res.json({ ok: true, alreadyOpen: true, message: 'Esta competência já está aberta.' });
+    }
+    if (atual.rows[0].asaas_payment_id && !force) {
+      return res.status(409).json({
+        error: 'Esta competência já tem cobrança emitida. Reabrir faz o total voltar a mudar e ele pode '
+          + 'divergir do documento enviado ao cliente. Repita com force=1 para assumir isso.',
+        code: 'has_external_charge',
+        paymentId: atual.rows[0].asaas_payment_id,
+      });
+    }
+
+    const { rows } = await db.query(`
+      UPDATE public.invoices
+         SET closed_at = NULL, closed_by = NULL
+       WHERE uid = $1 AND period = $2
+       RETURNING id, uid, period, total_amount, status, closed_at;
+    `, [uid, period]);
+
+    console.log(`[Cobrança] Competência ${period} de ${uid} REABERTA por ${req.user.email || req.user.uid}`
+      + `${force ? ' (forçado, havia cobrança emitida)' : ''}.`);
+    res.json({ ok: true, invoice: { ...rows[0], total_amount: parseFloat(rows[0].total_amount) } });
+  } catch (err) {
+    console.error(`Erro ao reabrir a competência ${period} de ${uid}:`, err);
+    res.status(500).json({ error: 'Erro interno ao reabrir a competência.' });
+  }
+});
 
 /**
  * ===== Diagnóstico da duplicidade de armazenamento inicial (master) =====
@@ -614,10 +795,15 @@ router.post('/recalculate/:uid', authenticateToken, requireMaster, async (req, r
 
   try {
     const filtroPago = includePaid ? '' : " AND COALESCE(status, '') <> 'paid'";
+    /* Competência fechada não entra na lista. `calculateAndSaveInvoice` já sai
+     * cedo nesse caso, então incluí-la só produziria linhas de relatório
+     * dizendo "nada mudou" — e esconderia o motivo real. */
     const alvo = pedidos && pedidos.length
       ? pedidos.map(String)
       : (await db.query(
-          `SELECT period FROM public.invoices WHERE uid = $1${filtroPago} ORDER BY period ASC`,
+          `SELECT period FROM public.invoices
+            WHERE uid = $1 AND closed_at IS NULL${filtroPago}
+            ORDER BY period ASC`,
           [uid]
         )).rows.map((r) => r.period);
 
@@ -726,11 +912,12 @@ async function recalculateDuplicatedStorageInvoices() {
     const alvo = await db.query(`
       SELECT i.uid, i.period,
              COUNT(*)::int AS itens_base,
-             COALESCE(i.status, '') = 'paid' AS paga
+             COALESCE(i.status, '') = 'paid' AS paga,
+             i.closed_at IS NOT NULL AS fechada
         FROM public.invoices i
         JOIN public.invoice_items it ON it.invoice_id = i.id
        WHERE it.description ILIKE ANY ($1::text[])
-       GROUP BY i.id, i.uid, i.period, i.status
+       GROUP BY i.id, i.uid, i.period, i.status, i.closed_at
       HAVING COUNT(*) > 1
        ORDER BY i.period ASC
     `, [BASE_STORAGE_DESCRIPTION_PATTERNS]);
@@ -740,11 +927,15 @@ async function recalculateDuplicatedStorageInvoices() {
       return;
     }
 
-    const pagas = alvo.rows.filter((r) => r.paga);
-    const aCorrigir = alvo.rows.filter((r) => !r.paga);
+    /* Preservadas por dois motivos diferentes, e os dois são deliberados:
+     * paga (baixar o total abaixo do que o cliente pagou é problema contábil) e
+     * fechada (o valor foi congelado justamente para não mudar mais). */
+    const pagas = alvo.rows.filter((r) => r.paga && !r.fechada);
+    const fechadas = alvo.rows.filter((r) => r.fechada);
+    const aCorrigir = alvo.rows.filter((r) => !r.paga && !r.fechada);
 
     console.log(`   -> Correção retroativa: ${alvo.rowCount} fatura(s) com armazenamento inicial duplicado `
-      + `(${aCorrigir.length} a recalcular, ${pagas.length} já paga(s), preservada(s)).`);
+      + `(${aCorrigir.length} a recalcular, ${pagas.length} já paga(s), ${fechadas.length} fechada(s)).`);
 
     let corrigidas = 0;
     let falhas = 0;
@@ -771,6 +962,11 @@ async function recalculateDuplicatedStorageInvoices() {
       console.warn('   -> Faturas PAGAS com duplicidade não foram alteradas (o total pago não seria mais o exibido): '
         + `${pagas.map((r) => `${r.uid}/${r.period}`).join(', ')}. `
         + 'Use GET /api/billing/storage-duplicates para revisar.');
+    }
+    if (fechadas.length > 0) {
+      console.warn('   -> Faturas com competência FECHADA não foram alteradas (o valor está congelado): '
+        + `${fechadas.map((r) => `${r.uid}/${r.period}`).join(', ')}. `
+        + 'Reabra a competência se quiser recalcular.');
     }
 
     if (falhas === 0) {

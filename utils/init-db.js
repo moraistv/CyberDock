@@ -253,6 +253,34 @@ const schema = {
             ativo BOOLEAN DEFAULT true,
             created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
             updated_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
+        );`,
+    /* Eventos recebidos do provedor de cobrança.
+     *
+     * Existe por dois motivos, e nenhum é opcional em integração financeira:
+     *
+     * 1. IDEMPOTÊNCIA. O mesmo evento pode chegar mais de uma vez (retentativa
+     *    do provedor, timeout nosso que ele interpreta como falha). `event_id`
+     *    é PRIMARY KEY, então processar duas vezes é impossível por construção,
+     *    não por lembrança de quem escreveu o handler.
+     *
+     * 2. AUDITORIA. Quando um cliente disser que pagou e o sistema disser que
+     *    não, a resposta tem que estar gravada com o payload cru e a hora, sem
+     *    depender de log rotativo de container.
+     *
+     * `processed_at` nulo = chegou mas não foi aplicado (erro no processamento);
+     * é o que permite reprocessar sem receber o evento de novo.
+     */
+    asaas_webhook_events: `
+        CREATE TABLE public.asaas_webhook_events (
+            event_id VARCHAR(120) PRIMARY KEY,
+            event_type VARCHAR(60),
+            payment_id VARCHAR(40),
+            uid VARCHAR(255),
+            period VARCHAR(7),
+            payload JSONB NOT NULL,
+            received_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            processed_at TIMESTAMP WITH TIME ZONE,
+            error TEXT
         );`
 };
 
@@ -733,6 +761,44 @@ async function syncDatabaseSchema() {
                         console.log(`   -> Adicionando coluna 'active' à tabela: public.users`);
                         await client.query('ALTER TABLE public.users ADD COLUMN active BOOLEAN DEFAULT TRUE;');
                     }
+
+                    /* ---------------- Dados de cobrança do cliente ----------------
+                     *
+                     * O cadastro só tinha e-mail e nome. Qualquer emissão de
+                     * cobrança fora do sistema (Asaas, banco, nota fiscal) exige
+                     * o documento do pagador, e o CPF/CNPJ é justamente o critério
+                     * que a maioria dessas APIs usa para não duplicar cadastro.
+                     *
+                     * Guardado SEM máscara (só dígitos), para a comparação não
+                     * depender de quem digitou com ponto ou sem. A formatação é
+                     * problema da tela.
+                     *
+                     * `asaas_customer_id` fica aqui, e não numa tabela separada,
+                     * porque é uma relação de um para um com o cliente e evita um
+                     * JOIN em todo lugar que precisa cobrar. Se um dia entrar um
+                     * segundo provedor, aí sim vale uma tabela de vínculos.
+                     */
+                    const cpfCnpjColRes = await client.query(`SELECT 1 FROM information_schema.columns WHERE table_schema = 'public' AND table_name = 'users' AND column_name = 'cpf_cnpj'`);
+                    if (cpfCnpjColRes.rowCount === 0) {
+                        console.log(`   -> Adicionando coluna 'cpf_cnpj' à tabela: public.users`);
+                        await client.query('ALTER TABLE public.users ADD COLUMN cpf_cnpj VARCHAR(14);');
+                    }
+                    const phoneColRes = await client.query(`SELECT 1 FROM information_schema.columns WHERE table_schema = 'public' AND table_name = 'users' AND column_name = 'phone'`);
+                    if (phoneColRes.rowCount === 0) {
+                        console.log(`   -> Adicionando coluna 'phone' à tabela: public.users`);
+                        await client.query('ALTER TABLE public.users ADD COLUMN phone VARCHAR(20);');
+                    }
+                    const asaasCustomerColRes = await client.query(`SELECT 1 FROM information_schema.columns WHERE table_schema = 'public' AND table_name = 'users' AND column_name = 'asaas_customer_id'`);
+                    if (asaasCustomerColRes.rowCount === 0) {
+                        console.log(`   -> Adicionando coluna 'asaas_customer_id' à tabela: public.users`);
+                        await client.query('ALTER TABLE public.users ADD COLUMN asaas_customer_id VARCHAR(40);');
+                    }
+                    // Um cadastro do provedor por cliente. Índice parcial: a
+                    // esmagadora maioria das linhas é NULL enquanto não houver
+                    // integração, e NULL não conflita com NULL.
+                    await client.query(`CREATE UNIQUE INDEX IF NOT EXISTS idx_users_asaas_customer
+                                        ON public.users(asaas_customer_id)
+                                     WHERE asaas_customer_id IS NOT NULL;`);
                 }
                  if (tableName === 'services') {
                     const colRes = await client.query(`SELECT 1 FROM information_schema.columns WHERE table_schema = 'public' AND table_name = 'services' AND column_name = 'config'`);
@@ -791,6 +857,65 @@ async function syncDatabaseSchema() {
                         console.log(`   -> Adicionando coluna 'paid_at' à tabela: public.invoices`);
                         await client.query('ALTER TABLE public.invoices ADD COLUMN paid_at TIMESTAMP WITH TIME ZONE;');
                     }
+
+                    /* -------------------- Fechamento da competência --------------------
+                     *
+                     * `closed_at` é a data em que a competência deixou de ser
+                     * recalculada. Hoje `calculateAndSaveInvoice` roda a CADA
+                     * abertura da fatura e regrava os itens automáticos e o
+                     * total — o que é correto enquanto o mês está aberto e passa
+                     * a ser um defeito no instante em que o valor é comunicado
+                     * para fora (cobrança emitida, boleto enviado, nota fiscal).
+                     *
+                     * Uma venda com processed_at retroativo, ou um avulso lançado
+                     * depois, mudaria o total de uma fatura já cobrada. Fechada,
+                     * a fatura para de mudar e o que chegar atrasado fica para a
+                     * competência seguinte.
+                     *
+                     * NULL = aberta, que é o comportamento de sempre. Nenhuma
+                     * fatura existente muda de comportamento por causa desta
+                     * coluna.
+                     */
+                    const closedAtColRes = await client.query(`SELECT 1 FROM information_schema.columns WHERE table_schema = 'public' AND table_name = 'invoices' AND column_name = 'closed_at'`);
+                    if (closedAtColRes.rowCount === 0) {
+                        console.log(`   -> Adicionando coluna 'closed_at' à tabela: public.invoices`);
+                        await client.query('ALTER TABLE public.invoices ADD COLUMN closed_at TIMESTAMP WITH TIME ZONE;');
+                    }
+                    const closedByColRes = await client.query(`SELECT 1 FROM information_schema.columns WHERE table_schema = 'public' AND table_name = 'invoices' AND column_name = 'closed_by'`);
+                    if (closedByColRes.rowCount === 0) {
+                        console.log(`   -> Adicionando coluna 'closed_by' à tabela: public.invoices`);
+                        await client.query('ALTER TABLE public.invoices ADD COLUMN closed_by VARCHAR(255);');
+                    }
+
+                    /* ------------- Vínculo com a cobrança no provedor -------------
+                     *
+                     * Guardado na própria fatura porque a relação é de um para um
+                     * com a competência. `asaas_status` é o status CRU do
+                     * provedor: não misturo com `status` local, que é o que a
+                     * tela usa e que o master pode alterar à mão para pagamento
+                     * recebido por fora.
+                     */
+                    for (const [coluna, tipo] of [
+                        ['asaas_payment_id', 'VARCHAR(40)'],
+                        ['asaas_status', 'VARCHAR(40)'],
+                        ['asaas_invoice_url', 'TEXT'],
+                        ['asaas_synced_at', 'TIMESTAMP WITH TIME ZONE'],
+                    ]) {
+                        const res = await client.query(
+                            `SELECT 1 FROM information_schema.columns WHERE table_schema = 'public' AND table_name = 'invoices' AND column_name = $1`,
+                            [coluna]
+                        );
+                        if (res.rowCount === 0) {
+                            console.log(`   -> Adicionando coluna '${coluna}' à tabela: public.invoices`);
+                            await client.query(`ALTER TABLE public.invoices ADD COLUMN ${coluna} ${tipo};`);
+                        }
+                    }
+                    // Uma cobrança do provedor não pode estar em duas faturas: é
+                    // o que impede cobrar a mesma competência duas vezes se uma
+                    // emissão for repetida por falha de rede.
+                    await client.query(`CREATE UNIQUE INDEX IF NOT EXISTS idx_invoices_asaas_payment
+                                        ON public.invoices(asaas_payment_id)
+                                     WHERE asaas_payment_id IS NOT NULL;`);
                 }
                 if (tableName === 'skus') {
                     const isKitColRes = await client.query(`SELECT 1 FROM information_schema.columns WHERE table_schema = 'public' AND table_name = 'skus' AND column_name = 'is_kit'`);
