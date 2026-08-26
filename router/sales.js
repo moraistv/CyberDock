@@ -1758,11 +1758,11 @@ router.get('/all', authenticateToken, requireMaster, async (req, res) => {
      * — para CADA linha examinada, inclusive as que o filtro descarta. E como a
      * view é um UNION ALL, ele não elimina coluna não usada.
      *
-     * Então: `chaves` acha as 50 linhas da página pela fonte projetada (sem
-     * TOAST), `janela` extrai o intervalo de datas dessas 50, e `page_rows` lê a
-     * view apenas dentro dessa janela. Para uma página ordenada por data, a
-     * janela contém poucas dezenas de linhas — o JSON passa a ser aberto ~50
-     * vezes em vez de 70 mil.
+     * Então são DUAS consultas: `chavesQuery` acha as 50 linhas da página pela
+     * fonte projetada (sem TOAST), e `dataQuery` hidrata só essas 50 lendo a
+     * view, restrita pela janela de datas e pelas chaves — as duas coisas em
+     * PARÂMETRO, o que é o detalhe que faz funcionar (ver o comentário do
+     * dataQuery abaixo).
      *
      * O SELECT externo continua idêntico, lendo `page_rows` como antes. Foi
      * deliberado: mexer nele exigiria remapear thumbnail, permalink, comprador,
@@ -1773,8 +1773,7 @@ router.get('/all', authenticateToken, requireMaster, async (req, res) => {
      * lento, mas é raro e continua correto.
      */
     const chavesSource = buyer ? 'public.unified_sales' : UNIFIED_AGG_SOURCE;
-    const dataQuery = `
-      WITH chaves AS MATERIALIZED (
+    const chavesQuery = `
         SELECT s.marketplace, s.id, s.sku, s.uid, s.sale_date
           FROM ${chavesSource} s
           ${whereClause}
@@ -1785,21 +1784,37 @@ router.get('/all', authenticateToken, requireMaster, async (req, res) => {
          -- LIMIT, e era o custo dominante desta tela. O desempate para exibição
          -- continua no ORDER BY externo, aplicado só às 50 linhas da página.
          ORDER BY s.sale_date DESC
-         LIMIT $${paramIdx} OFFSET $${paramIdx + 1}
-      ),
-      -- Página vazia deixa os dois nulos, e o BETWEEN abaixo não casa nada.
-      janela AS (SELECT MIN(sale_date) AS ini, MAX(sale_date) AS fim FROM chaves),
-      page_rows AS MATERIALIZED (
+         LIMIT $${paramIdx} OFFSET $${paramIdx + 1}`;
+
+    /* Hidratação da página: a view, restrita por PARÂMETROS.
+     *
+     * A primeira versão disto trazia a janela de datas de uma CTE
+     * (`janela AS (SELECT MIN(sale_date)...)`) e casava as chaves com EXISTS.
+     * Não funcionou, e o plano de produção mostrou por quê:
+     *
+     *   ->  Append (actual rows=79063)
+     *         ->  Seq Scan on sales (rows=70522)
+     *
+     * Limite vindo de CTE não é constante na hora de PLANEJAR, então o Postgres
+     * não empurra o intervalo como filtro para dentro do UNION ALL e acaba
+     * projetando a lista de saída da view — com JSONB e TOAST — para as 70 mil
+     * linhas. A janela restringia o que SAI, não o que é LIDO. Deu statement
+     * timeout (57014).
+     *
+     * Com os limites como parâmetro, o filtro entra em cada ramo do UNION ALL e
+     * a projeção só é avaliada nas linhas que passam. As chaves da página cabem
+     * numa janela estreita de datas (são 50 vendas consecutivas), então a
+     * projeção roda dezenas de vezes em vez de 70 mil.
+     *
+     * A chave composta usa o separador de unidade (U+001F), que não aparece em
+     * SKU nem em apelido de conta — diferente de '|' ou ':'.
+     */
+    const dataQuery = `
+      WITH page_rows AS MATERIALIZED (
         SELECT s.*
-          FROM public.unified_sales s, janela j
-         WHERE s.sale_date BETWEEN j.ini AND j.fim
-           AND EXISTS (
-                 SELECT 1 FROM chaves k
-                  WHERE k.marketplace = s.marketplace
-                    AND k.id = s.id
-                    AND k.sku = s.sku
-                    AND k.uid = s.uid
-               )
+          FROM public.unified_sales s
+         WHERE (s.sale_date >= $1 AND s.sale_date <= $2)
+           AND (s.marketplace || $3 || s.id || $3 || s.sku || $3 || s.uid) = ANY($4)
       )
       SELECT s.id, s.sku, s.uid, s.marketplace,
         s.marketplace AS channel,
@@ -1889,9 +1904,44 @@ router.get('/all', authenticateToken, requireMaster, async (req, res) => {
       });
     }
 
-    const dataResult = await db.query(dataQuery, [...params, limit + 1, offset]);
-    const hasNext = dataResult.rows.length > limit;
-    const rows = hasNext ? dataResult.rows.slice(0, limit) : dataResult.rows;
+    /* Etapa 1: as chaves da página, pela fonte projetada. Medido em produção:
+     * 205 ms para 79 mil linhas, com top-N heapsort. */
+    const chavesResult = await db.query(chavesQuery, [...params, limit + 1, offset]);
+    const hasNext = chavesResult.rows.length > limit;
+    const chaves = hasNext ? chavesResult.rows.slice(0, limit) : chavesResult.rows;
+
+    let rows = [];
+    if (chaves.length > 0) {
+      // U+001F: separador de unidade. Não aparece em SKU nem em apelido de conta.
+      const SEP = '\u001f';
+      const chaveKeys = chaves.map((k) => [k.marketplace, k.id, k.sku, k.uid].join(SEP));
+
+      /* Janela de datas da página, como PARÂMETRO.
+       *
+       * `ORDER BY sale_date DESC` no Postgres coloca NULL PRIMEIRO, então a
+       * primeira página pode começar com venda sem data. Nesse caso os limites
+       * saem só das datas presentes e a condição aceita NULL também — sem isso,
+       * a linha sem data desapareceria da listagem em silêncio. */
+      const datasMs = chaves
+        .map((k) => (k.sale_date ? new Date(k.sale_date).getTime() : null))
+        .filter((t) => t !== null && !Number.isNaN(t));
+      const temNula = datasMs.length < chaves.length;
+      const janelaSql = datasMs.length
+        ? `(s.sale_date >= $1 AND s.sale_date <= $2${temNula ? ' OR s.sale_date IS NULL' : ''})`
+        : 's.sale_date IS NULL';
+
+      // Etapa 2: hidrata só as linhas da página, com a janela em parâmetro.
+      const dataResult = await db.query(
+        dataQuery.replace('(s.sale_date >= $1 AND s.sale_date <= $2)', janelaSql),
+        [
+          datasMs.length ? new Date(Math.min(...datasMs)) : null,
+          datasMs.length ? new Date(Math.max(...datasMs)) : null,
+          SEP,
+          chaveKeys,
+        ]
+      );
+      rows = dataResult.rows;
+    }
 
     let total = null;
     let totalExact = false;
