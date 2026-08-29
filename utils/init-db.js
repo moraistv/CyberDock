@@ -799,6 +799,40 @@ async function syncDatabaseSchema() {
                     await client.query(`CREATE UNIQUE INDEX IF NOT EXISTS idx_users_asaas_customer
                                         ON public.users(asaas_customer_id)
                                      WHERE asaas_customer_id IS NOT NULL;`);
+
+                    /* ------------- Endereço de cobrança do cliente -------------
+                     *
+                     * Existe por uma exigência concreta: BOLETO. O provedor de
+                     * cobrança recusa emitir boleto sem CEP e número do endereço
+                     * do pagador. PIX e cartão passam sem, e era por isso que o
+                     * cadastro nunca tinha precisado disso — até a cobrança sair
+                     * do sistema.
+                     *
+                     * CEP guardado SEM máscara, pelo mesmo motivo do CPF/CNPJ: a
+                     * comparação não pode depender de quem digitou com traço.
+                     *
+                     * `city_name` e `state` ficam aqui mesmo o provedor sabendo
+                     * derivá-los do CEP, porque a TELA precisa exibir o endereço
+                     * sem depender de uma chamada externa para saber a cidade.
+                     */
+                    for (const [coluna, tipo] of [
+                        ['postal_code', 'VARCHAR(8)'],
+                        ['address', 'VARCHAR(255)'],
+                        ['address_number', 'VARCHAR(20)'],
+                        ['address_complement', 'VARCHAR(100)'],
+                        ['province', 'VARCHAR(100)'],
+                        ['city_name', 'VARCHAR(100)'],
+                        ['state', 'VARCHAR(2)'],
+                    ]) {
+                        const res = await client.query(
+                            `SELECT 1 FROM information_schema.columns WHERE table_schema = 'public' AND table_name = 'users' AND column_name = $1`,
+                            [coluna]
+                        );
+                        if (res.rowCount === 0) {
+                            console.log(`   -> Adicionando coluna '${coluna}' à tabela: public.users`);
+                            await client.query(`ALTER TABLE public.users ADD COLUMN ${coluna} ${tipo};`);
+                        }
+                    }
                 }
                  if (tableName === 'services') {
                     const colRes = await client.query(`SELECT 1 FROM information_schema.columns WHERE table_schema = 'public' AND table_name = 'services' AND column_name = 'config'`);

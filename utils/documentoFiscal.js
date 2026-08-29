@@ -115,6 +115,58 @@ function normalizarTelefone(valor) {
   return { ok: true, digitos: d };
 }
 
+/**
+ * Normaliza CEP para oito dígitos.
+ *
+ * Existe pelo mesmo motivo do CPF/CNPJ: o provedor de cobrança exige CEP e
+ * número do endereço para emitir BOLETO, e recusa com uma mensagem que fala em
+ * "postalCode" — que não diz a ninguém qual campo da tela preencher.
+ *
+ * Opcional: vazio devolve ok com null, para o endereço poder ser limpado sem
+ * virar erro. Quem exige o CEP é a emissão de boleto, não o cadastro.
+ */
+function normalizarCep(valor) {
+  if (valor === null || valor === undefined || String(valor).trim() === '') {
+    return { ok: true, digitos: null };
+  }
+  const d = apenasDigitos(valor);
+  if (d.length !== 8) {
+    return { ok: false, erro: `CEP deve ter 8 dígitos; recebi ${d.length}.` };
+  }
+  // 00000000 passa na contagem e não é endereço de ninguém.
+  if (todosIguais(d)) return { ok: false, erro: 'CEP inválido.' };
+  return { ok: true, digitos: d };
+}
+
+/** Máscara de CEP para exibição. Fora do padrão, volta como está. */
+function formatarCep(valor) {
+  const d = apenasDigitos(valor);
+  return d.length === 8 ? d.replace(/(\d{5})(\d{3})/, '$1-$2') : d;
+}
+
+/** Sigla de estado. Opcional, mas quando vem tem que ser duas letras. */
+function normalizarUf(valor) {
+  if (valor === null || valor === undefined || String(valor).trim() === '') {
+    return { ok: true, sigla: null };
+  }
+  const s = String(valor).trim().toUpperCase();
+  if (!/^[A-Z]{2}$/.test(s)) return { ok: false, erro: 'UF deve ter duas letras (ex.: SP).' };
+  return { ok: true, sigla: s };
+}
+
+/**
+ * Texto livre de endereço, limitado ao tamanho da coluna.
+ *
+ * Cortar aqui em vez de deixar o Postgres recusar com "value too long": o erro
+ * do banco não diz qual campo estourou, e o endereço não é dado crítico o
+ * suficiente para recusar o cadastro inteiro por causa de um complemento longo.
+ */
+function normalizarTexto(valor, limite) {
+  if (valor === null || valor === undefined) return null;
+  const t = String(valor).trim().replace(/\s+/g, ' ');
+  return t === '' ? null : t.slice(0, limite);
+}
+
 module.exports = {
   apenasDigitos,
   validarCpf,
@@ -122,4 +174,8 @@ module.exports = {
   normalizarCpfCnpj,
   formatarCpfCnpj,
   normalizarTelefone,
+  normalizarCep,
+  formatarCep,
+  normalizarUf,
+  normalizarTexto,
 };

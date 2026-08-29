@@ -175,7 +175,25 @@ async function findCustomerByCpfCnpj(cpfCnpj) {
   return dados?.data?.[0] || null;
 }
 
-async function createCustomer({ uid, name, cpfCnpj, email, phone, notificationDisabled }) {
+/* Endereço do pagador.
+ *
+ * Obrigatório para BOLETO: sem CEP e número o provedor recusa a emissão. PIX e
+ * cartão passam sem. Enviado como `undefined` quando não existe, para não
+ * sobrescrever com vazio um endereço que já esteja lá. */
+function camposDeEndereco({ postalCode, address, addressNumber, addressComplement, province }) {
+  return {
+    postalCode: postalCode || undefined,
+    address: address || undefined,
+    addressNumber: addressNumber || undefined,
+    complement: addressComplement || undefined,
+    province: province || undefined,
+  };
+}
+
+async function createCustomer({
+  uid, name, cpfCnpj, email, phone, notificationDisabled,
+  postalCode, address, addressNumber, addressComplement, province,
+}) {
   return request('POST', '/customers', {
     body: {
       name,
@@ -184,17 +202,22 @@ async function createCustomer({ uid, name, cpfCnpj, email, phone, notificationDi
       mobilePhone: phone || undefined,
       externalReference: uid,
       notificationDisabled: notificationDisabled === true,
+      ...camposDeEndereco({ postalCode, address, addressNumber, addressComplement, province }),
     },
   });
 }
 
-async function updateCustomer(customerId, { name, cpfCnpj, email, phone }) {
+async function updateCustomer(customerId, {
+  name, cpfCnpj, email, phone,
+  postalCode, address, addressNumber, addressComplement, province,
+}) {
   return request('POST', `/customers/${encodeURIComponent(customerId)}`, {
     body: {
       name,
       cpfCnpj,
       email: email || undefined,
       mobilePhone: phone || undefined,
+      ...camposDeEndereco({ postalCode, address, addressNumber, addressComplement, province }),
     },
   });
 }

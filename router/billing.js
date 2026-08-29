@@ -107,13 +107,24 @@ router.post('/asaas/customers/:uid', authenticateToken, requireMaster, async (re
 
   try {
     const { rows, rowCount } = await db.query(
-      `SELECT uid, name, email, cpf_cnpj, phone, asaas_customer_id
+      `SELECT uid, name, email, cpf_cnpj, phone, asaas_customer_id,
+              postal_code, address, address_number, address_complement, province
          FROM public.users WHERE uid = $1`,
       [uid]
     );
     if (rowCount === 0) return res.status(404).json({ error: 'Cliente não encontrado.' });
 
     const cliente = rows[0];
+    /* O endereço vai junto na criação E na atualização: é o que habilita boleto,
+     * e um cadastro criado sem ele continuaria recusando boleto para sempre se a
+     * gente só enviasse na criação. */
+    const endereco = {
+      postalCode: cliente.postal_code,
+      address: cliente.address,
+      addressNumber: cliente.address_number,
+      addressComplement: cliente.address_complement,
+      province: cliente.province,
+    };
 
     /* Documento é obrigatório no provedor. Recusar aqui, com o nome do campo,
      * evita a mensagem crua do Asaas — que fala em "cpfCnpj" e não diz onde
@@ -121,17 +132,32 @@ router.post('/asaas/customers/:uid', authenticateToken, requireMaster, async (re
     if (!cliente.cpf_cnpj || !String(cliente.cpf_cnpj).trim()) {
       return res.status(422).json({
         error: 'Este cliente não tem CPF/CNPJ cadastrado, e o provedor exige o documento do pagador.',
-        code: 'missing_document',
+        code: 'missing_billing_info',
+        /* `faltando` é o que permite à tela abrir o formulário já apontando o
+         * campo, em vez de mostrar a mensagem e deixar o master sem saída. */
+        faltando: ['cpfCnpj'],
         field: 'cpfCnpj',
       });
     }
 
+    /* Já vinculado: em vez de sair sem fazer nada, SINCRONIZA o cadastro. É o
+     * que faz o endereço preenchido depois da vinculação chegar ao provedor —
+     * sem isso, quem vinculou antes de ter CEP nunca conseguiria emitir boleto. */
     if (cliente.asaas_customer_id) {
+      await asaas.updateCustomer(cliente.asaas_customer_id, {
+        name: cliente.name || cliente.email,
+        cpfCnpj: cliente.cpf_cnpj,
+        email: cliente.email,
+        phone: cliente.phone,
+        ...endereco,
+      });
       return res.json({
         ok: true,
         created: false,
+        updated: true,
         customerId: cliente.asaas_customer_id,
-        message: 'Cliente já vinculado.',
+        boletoReady: Boolean(cliente.postal_code && cliente.address_number),
+        message: 'Cadastro do cliente atualizado no provedor.',
       });
     }
 
@@ -147,6 +173,7 @@ router.post('/asaas/customers/:uid', authenticateToken, requireMaster, async (re
         cpfCnpj: cliente.cpf_cnpj,
         email: cliente.email,
         phone: cliente.phone,
+        ...endereco,
       });
       criado = true;
     }

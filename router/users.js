@@ -4,7 +4,10 @@ const bcrypt = require('bcryptjs');
 const db = require('../utils/postgres');
 const { authenticateToken, requireMaster, requireOwnerOrMaster } = require('../utils/authMiddleware');
 const { BASE_STORAGE_TYPES } = require('../utils/billingRules');
-const { normalizarCpfCnpj, normalizarTelefone, formatarCpfCnpj } = require('../utils/documentoFiscal');
+const {
+    normalizarCpfCnpj, normalizarTelefone, formatarCpfCnpj,
+    normalizarCep, formatarCep, normalizarUf, normalizarTexto,
+} = require('../utils/documentoFiscal');
 
 const router = express.Router();
 
@@ -379,6 +382,58 @@ router.get('/billing-info/pending', authenticateToken, requireMaster, async (req
 });
 
 /**
+ * @route   GET /api/users/:uid/billing-info
+ * @desc    Dados de cobrança de um cliente, para abrir o formulário preenchido.
+ * @access  Private (Master)
+ *
+ * `faltando` é o ponto desta rota. Em vez de a tela redescobrir a regra do
+ * provedor, o backend informa o que impede cada operação:
+ *   - sem `cpfCnpj` nada pode ser emitido;
+ *   - sem CEP e número, PIX e cartão funcionam mas BOLETO é recusado.
+ * Assim a tela avisa antes da tentativa, e não depois do erro.
+ */
+router.get('/:uid/billing-info', authenticateToken, requireMaster, async (req, res) => {
+    const { uid } = req.params;
+    try {
+        const { rows, rowCount } = await db.query(`
+            SELECT uid, name, email, cpf_cnpj, phone, asaas_customer_id,
+                   postal_code, address, address_number, address_complement,
+                   province, city_name, state
+              FROM public.users WHERE uid = $1
+        `, [uid]);
+
+        if (rowCount === 0) return res.status(404).json({ error: 'Usuário não encontrado.' });
+
+        const u = rows[0];
+        const temDocumento = Boolean(u.cpf_cnpj && String(u.cpf_cnpj).trim());
+        const temEndereco = Boolean(u.postal_code && u.address_number);
+
+        const faltando = [];
+        if (!temDocumento) faltando.push('cpfCnpj');
+        if (!u.postal_code) faltando.push('postalCode');
+        if (!u.address_number) faltando.push('addressNumber');
+
+        res.json({
+            user: {
+                ...u,
+                documentType: temDocumento
+                    ? (String(u.cpf_cnpj).length === 14 ? 'CNPJ' : 'CPF')
+                    : null,
+                cpfCnpjFormatted: formatarCpfCnpj(u.cpf_cnpj),
+                postalCodeFormatted: formatarCep(u.postal_code),
+            },
+            faltando,
+            canCharge: temDocumento,
+            boletoReady: temDocumento && temEndereco,
+            linkedToProvider: Boolean(u.asaas_customer_id),
+        });
+    } catch (error) {
+        console.error(`Erro ao buscar dados de cobrança do usuário ${uid}:`, error);
+        res.status(500).json({ error: 'Erro interno ao buscar os dados de cobrança.' });
+    }
+});
+
+/**
  * @route   PUT /api/users/:uid/billing-info
  * @desc    Grava CPF/CNPJ e telefone do cliente.
  * @access  Private (Master)
@@ -391,7 +446,10 @@ router.get('/billing-info/pending', authenticateToken, requireMaster, async (req
  */
 router.put('/:uid/billing-info', authenticateToken, requireMaster, async (req, res) => {
     const { uid } = req.params;
-    const { cpfCnpj, phone } = req.body || {};
+    const {
+        cpfCnpj, phone,
+        postalCode, address, addressNumber, addressComplement, province, cityName, state,
+    } = req.body || {};
 
     const documento = normalizarCpfCnpj(cpfCnpj);
     if (!documento.ok) {
@@ -401,6 +459,36 @@ router.put('/:uid/billing-info', authenticateToken, requireMaster, async (req, r
     const telefone = normalizarTelefone(phone);
     if (!telefone.ok) {
         return res.status(400).json({ error: telefone.erro, field: 'phone' });
+    }
+
+    /* ------------------------- Endereço de cobrança -------------------------
+     *
+     * Todo opcional no cadastro, e obrigatório só na emissão de BOLETO — que é
+     * onde o provedor exige CEP e número. PIX e cartão passam sem.
+     *
+     * Deixar opcional aqui é deliberado: bloquear o cadastro inteiro por falta
+     * de endereço impediria registrar o CPF/CNPJ de quem só vai pagar por PIX.
+     * Quem cobra a completude é a emissão, no momento em que ela importa.
+     */
+    const cep = normalizarCep(postalCode);
+    if (!cep.ok) return res.status(400).json({ error: cep.erro, field: 'postalCode' });
+
+    const uf = normalizarUf(state);
+    if (!uf.ok) return res.status(400).json({ error: uf.erro, field: 'state' });
+
+    const logradouro = normalizarTexto(address, 255);
+    const numero = normalizarTexto(addressNumber, 20);
+    const complemento = normalizarTexto(addressComplement, 100);
+    const bairro = normalizarTexto(province, 100);
+    const cidade = normalizarTexto(cityName, 100);
+
+    /* CEP sem número, ou número sem CEP, é endereço que o provedor recusa pela
+     * metade. Recusar o par incompleto aqui evita descobrir isso na emissão. */
+    if ((cep.digitos && !numero) || (!cep.digitos && numero)) {
+        return res.status(400).json({
+            error: 'CEP e número do endereço andam juntos: informe os dois, ou nenhum.',
+            field: cep.digitos ? 'addressNumber' : 'postalCode',
+        });
     }
 
     try {
@@ -426,10 +514,16 @@ router.put('/:uid/billing-info', authenticateToken, requireMaster, async (req, r
 
         const { rows, rowCount } = await db.query(`
             UPDATE public.users
-               SET cpf_cnpj = $1, phone = $2, updated_at = NOW()
-             WHERE uid = $3
-             RETURNING uid, name, email, cpf_cnpj, phone, asaas_customer_id;
-        `, [documento.digitos, telefone.digitos, uid]);
+               SET cpf_cnpj = $1, phone = $2,
+                   postal_code = $3, address = $4, address_number = $5,
+                   address_complement = $6, province = $7, city_name = $8, state = $9,
+                   updated_at = NOW()
+             WHERE uid = $10
+             RETURNING uid, name, email, cpf_cnpj, phone, asaas_customer_id,
+                       postal_code, address, address_number, address_complement,
+                       province, city_name, state;
+        `, [documento.digitos, telefone.digitos, cep.digitos, logradouro, numero,
+            complemento, bairro, cidade, uf.sigla, uid]);
 
         if (rowCount === 0) {
             return res.status(404).json({ error: 'Usuário não encontrado.' });
@@ -442,6 +536,10 @@ router.put('/:uid/billing-info', authenticateToken, requireMaster, async (req, r
                 ...user,
                 documentType: documento.tipo,
                 cpfCnpjFormatted: formatarCpfCnpj(user.cpf_cnpj),
+                postalCodeFormatted: formatarCep(user.postal_code),
+                /* Diz se este cadastro já serve para boleto. A tela usa isto
+                 * para avisar ANTES de tentar emitir, em vez de depois. */
+                boletoReady: Boolean(user.postal_code && user.address_number),
             },
         });
     } catch (error) {
