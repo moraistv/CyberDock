@@ -917,6 +917,21 @@ async function syncDatabaseSchema() {
                                         ON public.invoices(asaas_payment_id)
                                      WHERE asaas_payment_id IS NOT NULL;`);
                 }
+                if (tableName === 'asaas_webhook_events') {
+                    /* Evento recebido e não aplicado é o que a tela de
+                     * diagnóstico procura, e é uma fração minúscula da tabela.
+                     * Índice PARCIAL: só indexa as linhas pendentes, então ele
+                     * fica pequeno e não pesa na gravação do caso normal, que é
+                     * processar na hora. Sem ele, cada consulta varria a tabela
+                     * inteira de eventos. */
+                    await client.query(`CREATE INDEX IF NOT EXISTS idx_asaas_webhook_pending
+                                        ON public.asaas_webhook_events (received_at DESC)
+                                     WHERE processed_at IS NULL;`);
+                    // Buscar por cobrança é como se responde "o que chegou sobre esta fatura".
+                    await client.query(`CREATE INDEX IF NOT EXISTS idx_asaas_webhook_payment
+                                        ON public.asaas_webhook_events (payment_id)
+                                     WHERE payment_id IS NOT NULL;`);
+                }
                 if (tableName === 'skus') {
                     const isKitColRes = await client.query(`SELECT 1 FROM information_schema.columns WHERE table_schema = 'public' AND table_name = 'skus' AND column_name = 'is_kit'`);
                     if (isKitColRes.rowCount === 0) {

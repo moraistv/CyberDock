@@ -248,6 +248,28 @@ async function getPayment(paymentId) {
   return request('GET', `/payments/${encodeURIComponent(paymentId)}`);
 }
 
+/**
+ * Altera uma cobrança já emitida.
+ *
+ * Escopo estreito de propósito: só vencimento e descrição. Mudar o VALOR aqui
+ * criaria divergência silenciosa com o total congelado da competência — para
+ * valor diferente, o caminho é cancelar e emitir de novo, que deixa rastro nos
+ * dois lados.
+ *
+ * O Asaas exige `billingType` e `value` no corpo desta chamada mesmo quando não
+ * mudam, então quem chama precisa passar os valores atuais.
+ */
+async function updatePayment(paymentId, { value, dueDate, description, billingType }) {
+  return request('POST', `/payments/${encodeURIComponent(paymentId)}`, {
+    body: {
+      billingType: billingType || 'UNDEFINED',
+      value,
+      dueDate,
+      description: description || undefined,
+    },
+  });
+}
+
 /** Cancelamento é o caminho para competência reaberta ou emitida por engano. */
 async function deletePayment(paymentId) {
   return request('DELETE', `/payments/${encodeURIComponent(paymentId)}`);
@@ -302,6 +324,7 @@ module.exports = {
   findPaymentByInvoice,
   createPayment,
   getPayment,
+  updatePayment,
   deletePayment,
   isValidWebhookToken,
 };
