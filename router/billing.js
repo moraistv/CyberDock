@@ -118,7 +118,23 @@ async function calculateAndSaveInvoice(client, uid, period) {
   // O status NÃO é mais reescrito aqui. Antes o recálculo forçava 'pending' e
   // a leitura da fatura dispara o recálculo, então uma fatura marcada como paga
   // voltava para pendente sozinha na próxima vez que a tela era aberta.
-  const dueDate = new Date(Date.UTC(year, month, 5));
+  /* Vencimento no dia 10 do mês SEGUINTE à competência.
+   *
+   * `month` vem 1-based do período (AAAA-MM) e o mês de `Date.UTC` é 0-based,
+   * então passar `month` sem subtrair 1 já cai no mês seguinte — é isso que faz
+   * a competência 2026-08 vencer em 10/09/2026. Parece um erro de índice e não é.
+   *
+   * Era dia 5. Mudou para 10 a pedido, e vale para todos os clientes.
+   *
+   * Como a mudança alcança as faturas que já existem: o upsert regrava
+   * `due_date` a cada recálculo, e o recálculo roda em toda abertura da fatura.
+   * Então competência ABERTA se ajusta sozinha na próxima leitura, sem migração.
+   * Competência FECHADA não muda, porque a guarda no topo desta função sai antes
+   * de chegar aqui — e isso é o certo: o valor e o documento dela já foram
+   * congelados, possivelmente já comunicados ao cliente.
+   */
+  const DIA_VENCIMENTO = 10;
+  const dueDate = new Date(Date.UTC(year, month, DIA_VENCIMENTO));
   const upsertRes = await client.query(`
     INSERT INTO public.invoices (uid, period, due_date, total_amount, status)
     VALUES ($1, $2, $3, 0, 'pending')
