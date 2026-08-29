@@ -1255,12 +1255,218 @@ async function seedInitialData() {
     }
 }
 
+/* ---------------------------------------------------------------------------
+ * UM único item de armazenamento inicial no catálogo.
+ *
+ * O QUE ESTAVA ERRADO. O catálogo tinha duas linhas para o MESMO plano de 1m³
+ * integral: 'Armazenamento Base (até 1m³)', criada pelo seed com
+ * type = 'base_storage', e 'Armazenamento Inicial (1m³)', cadastrada à mão pela
+ * tela "Adicionar Novo Serviço".
+ *
+ * POR QUE alguém cadastrou de novo: 'Armazenamento Inicial (1m³)' é exatamente o
+ * nome que o sistema imprime NA FATURA para o base_storage (STORAGE_LABELS em
+ * utils/billingRules.js). Quem viu esse nome na fatura foi procurar no catálogo,
+ * encontrou só "Armazenamento Base (até 1m³)" e concluiu que faltava cadastrar.
+ *
+ * O RISCO da linha cadastrada à mão: criada pela tela, ela nasce sem `type` de
+ * cobrança, e o faturamento só reconhece armazenamento por `type`. Cliente
+ * contratado nela NÃO É COBRADO de armazenamento — o mesmo defeito que já deixou
+ * um armazenamento de R$ 397 meses sem cobrança.
+ *
+ * O QUE ESTA ROTINA FAZ, e o que ela deliberadamente NÃO faz:
+ *
+ *   - Mantém como canônico o `base_storage` de menor id (o do seed), porque é
+ *     literalmente o que `ensureDefaultStorageContract` procura
+ *     (`WHERE type = 'base_storage' ORDER BY id ASC LIMIT 1`).
+ *   - Repontar antes de excluir: contrato e item de fatura antigos passam a
+ *     apontar para o canônico. `start_date` e `volume` do contrato são
+ *     PRESERVADOS — a data de início é o que mantém o proporcional e as
+ *     competências passadas corretos.
+ *   - NÃO altera valor de nenhuma fatura. O faturamento lê o preço de
+ *     `services.price` pelo `type`, não de `user_contracts.price`, e o canônico
+ *     mantém o preço que já tinha.
+ *   - NÃO cobra retroativamente quem ficou sem cobrança por estar na linha sem
+ *     `type`. Isso é decisão de negócio: a rotina só REGISTRA no log quem está
+ *     nessa situação, para revisão humana.
+ *   - NÃO renomeia o canônico. Catálogo continua "Base", fatura continua
+ *     "Inicial". Unificar o nome resolveria a causa de alguém recadastrar, mas é
+ *     mudança de rótulo visível e não foi pedida.
+ *
+ * Idempotente por marcador em system_settings e, ainda assim, pelas próprias
+ * condições: rodar de novo não encontra duplicado e não faz nada.
+ * ------------------------------------------------------------------------- */
+async function consolidarArmazenamentoInicial() {
+    const MARCADOR = 'catalogo_armazenamento_inicial_unico_v1';
+
+    try {
+        const feito = await db.query('SELECT 1 FROM public.system_settings WHERE key = $1', [MARCADOR]);
+        if (feito.rowCount > 0) return;
+
+        const client = await db.pool.connect();
+        try {
+            await client.query('BEGIN');
+
+            /* O canônico. Sem nenhum base_storage no catálogo a rotina não tem
+             * para onde repontar, e inventar um serviço aqui seria pior do que
+             * não fazer nada. */
+            const canonicoRes = await client.query(
+                `SELECT id, name, price FROM public.services
+                  WHERE type = 'base_storage' ORDER BY id ASC LIMIT 1`
+            );
+            if (canonicoRes.rowCount === 0) {
+                await client.query('ROLLBACK');
+                console.warn('   -> Catálogo sem serviço base_storage; consolidação do armazenamento inicial não executada.');
+                return;
+            }
+            const canonico = canonicoRes.rows[0];
+
+            /* Duplicados, por dois critérios distintos:
+             *
+             *   (a) outro `base_storage` — duplicidade inequívoca, mesmo type;
+             *   (b) linha SEM type cujo nome é de armazenamento inicial — a
+             *       cadastrada à mão, que nunca foi cobrada.
+             *
+             * O 50% | FULL fica FORA nos dois casos: `base_storage_50` é plano de
+             * verdade (metade do valor, operação Full), não duplicata. O
+             * `NOT ILIKE '%50%'` protege o critério (b), onde o type não ajuda a
+             * distinguir. */
+            const duplicadosRes = await client.query(
+                `SELECT id, name, type FROM public.services
+                  WHERE id <> $1
+                    AND (
+                          type = 'base_storage'
+                       OR (type IS NULL
+                           AND (name ILIKE 'Armazenamento Inicial%' OR name ILIKE 'Armazenamento Base%')
+                           AND name NOT ILIKE '%50%')
+                    )
+                  ORDER BY id`,
+                [canonico.id]
+            );
+
+            if (duplicadosRes.rowCount === 0) {
+                await client.query('COMMIT');
+                await marcarFeito(MARCADOR);
+                return;
+            }
+
+            const semCobranca = [];
+            let contratosRepontados = 0;
+            let contratosRemovidos = 0;
+            let itensRepontados = 0;
+            const excluidos = [];
+
+            for (const dup of duplicadosRes.rows) {
+                /* Quem estava numa linha sem type nunca teve armazenamento
+                 * faturado. Registrado ANTES de mexer, senão a informação se
+                 * perde junto com o vínculo. */
+                if (dup.type === null) {
+                    const afetados = await client.query(
+                        `SELECT u.uid, COALESCE(NULLIF(TRIM(u.name), ''), u.email) AS quem, uc.start_date
+                           FROM public.user_contracts uc
+                           JOIN public.users u ON u.uid = uc.uid
+                          WHERE uc.service_id = $1
+                          ORDER BY uc.start_date`,
+                        [dup.id]
+                    );
+                    for (const linha of afetados.rows) {
+                        semCobranca.push(`${linha.quem} (desde ${String(linha.start_date).slice(0, 10)})`);
+                    }
+                }
+
+                /* Cliente que tem o duplicado E o canônico: o duplicado é o
+                 * acidental (o canônico vem do cadastro automático). Some com o
+                 * acidental e o histórico do canônico fica intacto.
+                 *
+                 * Este DELETE também é o que torna o UPDATE seguinte possível:
+                 * `unique_contract UNIQUE (uid, service_id)` recusaria repontar
+                 * um contrato para um par que já existe. */
+                const removidos = await client.query(
+                    `DELETE FROM public.user_contracts uc
+                      WHERE uc.service_id = $1
+                        AND EXISTS (
+                              SELECT 1 FROM public.user_contracts c2
+                               WHERE c2.uid = uc.uid AND c2.service_id = $2
+                        )
+                      RETURNING uc.id`,
+                    [dup.id, canonico.id]
+                );
+                contratosRemovidos += removidos.rowCount;
+
+                /* Os que sobraram passam para o canônico. `start_date` e
+                 * `volume` NÃO entram no SET: são o histórico do cliente. O
+                 * `name`/`price` são cópias de exibição e passam a refletir o
+                 * serviço real. */
+                const repontados = await client.query(
+                    `UPDATE public.user_contracts
+                        SET service_id = $1, name = $2, price = $3
+                      WHERE service_id = $4
+                      RETURNING id`,
+                    [canonico.id, canonico.name, canonico.price, dup.id]
+                );
+                contratosRepontados += repontados.rowCount;
+
+                /* Item de fatura antigo aponta para o canônico em vez de virar
+                 * NULL pelo ON DELETE SET NULL. A descrição gravada e o valor
+                 * não são tocados: fatura passada continua exatamente como foi
+                 * emitida. */
+                const itens = await client.query(
+                    `UPDATE public.invoice_items SET service_id = $1
+                      WHERE service_id = $2 RETURNING id`,
+                    [canonico.id, dup.id]
+                );
+                itensRepontados += itens.rowCount;
+
+                await client.query('DELETE FROM public.services WHERE id = $1', [dup.id]);
+                excluidos.push(`${dup.name} (id ${dup.id}, type ${dup.type === null ? 'NULO' : dup.type})`);
+            }
+
+            await client.query('COMMIT');
+
+            console.log(`   -> Catálogo: armazenamento inicial consolidado em "${canonico.name}" (id ${canonico.id}).`);
+            console.log(`      Excluído(s): ${excluidos.join('; ')}.`);
+            console.log(`      ${contratosRepontados} contrato(s) repontado(s), ${contratosRemovidos} contrato(s) `
+                + `duplicado(s) removido(s), ${itensRepontados} item(ns) de fatura religado(s).`);
+            if (semCobranca.length > 0) {
+                console.warn('      ATENÇÃO: estes clientes estavam num item SEM tipo de cobrança e NÃO tiveram '
+                    + `armazenamento faturado nesse período: ${semCobranca.join(', ')}. `
+                    + 'Agora estão no plano correto, mas a cobrança das competências passadas é decisão humana.');
+            }
+
+            await marcarFeito(MARCADOR);
+        } catch (error) {
+            await client.query('ROLLBACK').catch(() => {});
+            throw error;
+        } finally {
+            client.release();
+        }
+    } catch (error) {
+        /* Nunca fatal: é limpeza de catálogo, não parte da prontidão. O marcador
+         * não é gravado e a próxima subida tenta de novo. */
+        console.warn(`   -> Consolidação do armazenamento inicial não concluída agora: ${error.message}`);
+    }
+}
+
+/** Marca uma correção de dado como já executada. */
+async function marcarFeito(key) {
+    await db.query(
+        `INSERT INTO public.system_settings (key, value, updated_at)
+         VALUES ($1, to_jsonb(NOW()::text), NOW())
+         ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value, updated_at = NOW()`,
+        [key]
+    );
+}
+
 async function initializeDatabase() {
     try {
         await syncDatabaseSchema();
         // Fora da transação de schema, para não disputar lock com as telas.
         await applyUnifiedSalesView();
         await seedInitialData();
+        /* Depois do seed, de propósito: o seed pode acabar de criar o
+         * base_storage canônico, e a consolidação precisa dele para ter para
+         * onde repontar. É rápida e roda antes de atender, para o master não ver
+         * o catálogo duplicado na primeira tela que abrir. */
+        await consolidarArmazenamentoInicial();
         console.log('✅ Banco de dados inicializado e pronto para uso.');
 
         /* Índices em segundo plano.
@@ -1284,4 +1490,7 @@ async function initializeDatabase() {
     }
 }
 
-module.exports = { initializeDatabase };
+/* `consolidarArmazenamentoInicial` sai junto para poder ser exercitada isolada,
+ * sem subir o banco inteiro. Correção que apaga linha de catálogo e reponta
+ * contrato precisa ser verificável sem depender de rodar em produção. */
+module.exports = { initializeDatabase, consolidarArmazenamentoInicial };
