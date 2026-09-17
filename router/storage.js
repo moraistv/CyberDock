@@ -12,6 +12,34 @@ const {
 const router = express.Router();
 const JWT_SECRET = process.env.JWT_SECRET || 'seu-segredo-super-secreto-para-jwt';
 
+/* --- Movimentação de estoque: tipos aceitos e normalização ---
+ *
+ * `stock_movements.movement_type` é VARCHAR(20) e recebia o valor do corpo da
+ * requisição sem nenhuma verificação. O problema não é teórico: a tela de
+ * histórico filtra com comparação exata (`movement_type === 'entrada'`), então
+ * uma linha gravada como "Entrada" ou " entrada" fica INVISÍVEL no filtro e
+ * ainda é exibida com sinal negativo, porque a tela trata "não é entrada" como
+ * saída. O estoque, esse, já teria sido alterado.
+ *
+ * Normalizar na borda e recusar o que não estiver na lista mantém uma grafia só
+ * no banco. O CHECK criado em utils/init-db.js fecha o mesmo furo do lado do
+ * banco, para o caso de alguém escrever por outro caminho. */
+const MOVEMENT_TYPES = ['entrada', 'saida'];
+
+const normalizeMovementType = (value) => String(value ?? '').trim().toLowerCase();
+
+/* Quantidade sempre inteiro >= 1.
+ *
+ * A validação antiga era só `!quantityChange`, que aceita -5 e "3". Um valor
+ * negativo inverte o sinal da operação: uma "saída" de -5 vira
+ * `quantidade - (-5)`, ou seja, ENTRADA de 5 registrada no histórico como
+ * saída. Devolve null quando o valor não serve, para o handler recusar. */
+const normalizeQuantityChange = (value) => {
+  const numero = Number(value);
+  if (!Number.isInteger(numero) || numero < 1) return null;
+  return numero;
+};
+
 // --- Middlewares ---
 const authenticateToken = (req, res, next) => {
   const authHeader = req.headers['authorization'];
@@ -602,6 +630,33 @@ router.post('/user/:userId/skus', authenticateToken, async (req, res) => {
 
     console.log('✅ [BACKEND] SKU/Kit criado com sucesso:', newSku);
 
+    /* ---------------- ENTRADA INICIAL NO HISTÓRICO ----------------
+     *
+     * O INSERT acima grava `quantidade` direto no saldo. Sem a movimentação
+     * abaixo, o SKU nasce com estoque e com histórico VAZIO — e aí a tela de
+     * histórico mostra só as saídas. Foi exatamente o que aconteceu com todo
+     * SKU cadastrado antes desta linha existir: saldo caindo até zero, nenhuma
+     * entrada registrada, e a pergunta "quando essas peças entraram?" sem
+     * resposta no sistema.
+     *
+     * Fica na MESMA transação do SKU de propósito. Saldo e histórico são a
+     * mesma informação contada de duas formas; se um gravar e o outro não, o
+     * estoque passa a mentir e ninguém descobre até alguém conferir na mão.
+     *
+     * Kit não entra: a quantidade dele é forçada a 0 acima porque kit não tem
+     * estoque físico — quem tem são os filhos.
+     */
+    const quantidadeInicial = is_kit ? 0 : Number(quantidade) || 0;
+    if (quantidadeInicial > 0) {
+      await client.query(
+        `INSERT INTO public.stock_movements
+           (sku_id, user_id, movement_type, quantity_change, reason)
+         VALUES ($1, $2, 'entrada', $3, $4)`,
+        [newSku.id, userId, quantidadeInicial, 'Entrada inicial do cadastro do SKU']
+      );
+      console.log(`✅ [BACKEND] Entrada inicial registrada: ${quantidadeInicial} un.`);
+    }
+
     if (is_kit && kit_components && kit_components.length > 0) {
       const newKitId = newSku.id;
       console.log('🔧 [BACKEND] Adicionando componentes ao kit:', kit_components.length);
@@ -882,10 +937,23 @@ router.get('/sku/:skuCode/movements', authenticateToken, requireMaster, async (r
 // Endpoint específico para ajuste de estoque de componentes
 router.post('/component/:skuCode/movements', authenticateToken, async (req, res) => {
   const { skuCode } = req.params;
-  const { userId, movementType, quantityChange, reason, forceComponent } = req.body;
+  const { userId, reason, forceComponent } = req.body;
+  const movementType = normalizeMovementType(req.body.movementType);
+  const quantityChange = normalizeQuantityChange(req.body.quantityChange);
 
-  if (!userId || !movementType || !quantityChange || !reason) {
+  // Ordem importa: `quantityChange` fica FORA do teste genérico porque um valor
+  // recusado pela normalização vira null, e null cairia no "campo obrigatório",
+  // escondendo de quem chamou o que estava errado de verdade no número.
+  if (!userId || !movementType || !reason) {
     return res.status(400).json({ error: 'Todos os campos são obrigatórios.' });
+  }
+
+  if (!MOVEMENT_TYPES.includes(movementType)) {
+    return res.status(400).json({ error: `movementType inválido. Use ${MOVEMENT_TYPES.join(' ou ')}.` });
+  }
+
+  if (quantityChange === null) {
+    return res.status(400).json({ error: 'quantityChange deve ser um número inteiro maior que zero.' });
   }
 
   if (!forceComponent) {
@@ -999,10 +1067,23 @@ router.post('/component/:skuCode/movements', authenticateToken, async (req, res)
 
 router.post('/sku/:skuCode/movements', authenticateToken, requireMaster, async (req, res) => {
   const { skuCode } = req.params;
-  const { userId, movementType, quantityChange, reason, relatedSaleId } = req.body;
+  const { userId, reason, relatedSaleId } = req.body;
+  const movementType = normalizeMovementType(req.body.movementType);
+  const quantityChange = normalizeQuantityChange(req.body.quantityChange);
 
-  if (!userId || !movementType || !quantityChange || !reason) {
+  // Mesmo motivo do endpoint de componente: `quantityChange` recusado vira null
+  // e precisa de mensagem própria, senão o erro que chega na tela é "campo
+  // obrigatório" para um campo que foi preenchido.
+  if (!userId || !movementType || !reason) {
     return res.status(400).json({ error: 'Todos os campos são obrigatórios.' });
+  }
+
+  if (!MOVEMENT_TYPES.includes(movementType)) {
+    return res.status(400).json({ error: `movementType inválido. Use ${MOVEMENT_TYPES.join(' ou ')}.` });
+  }
+
+  if (quantityChange === null) {
+    return res.status(400).json({ error: 'quantityChange deve ser um número inteiro maior que zero.' });
   }
 
   const client = await db.pool.connect();

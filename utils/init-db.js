@@ -1495,6 +1495,175 @@ async function consolidarArmazenamentoInicial() {
     }
 }
 
+/* ---------------------------------------------------------------------------
+ * Regularização do histórico de movimentação de estoque.
+ *
+ * O PROBLEMA. A criação de SKU gravava `quantidade` direto em public.skus e não
+ * lançava movimentação nenhuma. O saldo nascia cheio e o histórico nascia
+ * vazio. Todas as saídas posteriores (venda ML, Shopee, saída por kit) gravam
+ * normalmente, então o resultado visível é um SKU que só teve saídas: o
+ * histórico mostra o estoque descendo até zero sem nunca ter subido.
+ *
+ * Caso concreto que motivou isto: um kit de 2 unidades por peça teve 59 kits
+ * expedidos, 118 unidades saíram de cada filho, o saldo chegou a zero — e a aba
+ * "Entrada" do histórico ficava vazia, sem meio de responder quando as peças
+ * entraram nem quantas eram.
+ *
+ * A RECONSTRUÇÃO NÃO É CHUTE. A quantidade que entrou no cadastro é dedutível
+ * por identidade contábil:
+ *
+ *     inicial = saldo_atual + total_de_saídas − total_de_entradas_registradas
+ *
+ * Todo movimento posterior ao cadastro está gravado; o único lançamento que
+ * falta é justamente o inicial. A data usada é `skus.created_at`, que é o
+ * instante real em que aquele saldo passou a existir.
+ *
+ * O motivo do lançamento diz "reconstruída" de propósito. Quem abrir o
+ * histórico daqui a um ano precisa distinguir o que foi digitado por uma pessoa
+ * do que foi deduzido por esta rotina.
+ *
+ * O QUE ELA NÃO FAZ:
+ *   - Não toca em kit. Kit não tem estoque físico (a quantidade é forçada a 0 na
+ *     criação) e as linhas de movimentação do kit são informativas.
+ *   - Não lança nada quando a conta dá zero ou negativo. Zero significa que as
+ *     movimentações já explicam o saldo — inventar linha ali duplicaria estoque.
+ *     Negativo é inconsistência de outra natureza (saiu mais do que entrou), e
+ *     encobrir isso com um lançamento sintético é pior que deixar visível.
+ *   - Não recalcula saldo. `skus.quantidade` continua exatamente como está: a
+ *     rotina explica o saldo, não o corrige.
+ *
+ * Idempotente por marcador e, ainda assim, pelas próprias condições: o NOT
+ * EXISTS pelo motivo impede segundo lançamento no mesmo SKU.
+ * ------------------------------------------------------------------------- */
+const MOTIVO_ENTRADA_RECONSTRUIDA = 'Entrada inicial (reconstruída do cadastro)';
+
+async function regularizarMovimentacoesDeEstoque() {
+    const MARCADOR = 'stock_movements_entrada_inicial_reconstruida_v1';
+
+    try {
+        const feito = await db.query('SELECT 1 FROM public.system_settings WHERE key = $1', [MARCADOR]);
+        if (feito.rowCount > 0) return;
+
+        const client = await db.pool.connect();
+        try {
+            await client.query('BEGIN');
+            // A varredura é de tabela cheia e roda uma única vez na vida do
+            // sistema; o corte de 30s do pool não se aplica aqui.
+            await client.query('SET LOCAL statement_timeout = 0');
+
+            /* PASSO 1: grafia de `movement_type`.
+             *
+             * A coluna era VARCHAR livre e recebia o valor do corpo da
+             * requisição sem verificação. A tela filtra por igualdade exata, então
+             * "Entrada" ou " entrada" já ficariam invisíveis. Normalizar ANTES de
+             * somar é obrigatório: uma saída gravada como "Saida" não entraria na
+             * conta e a entrada reconstruída sairia menor do que deveria. */
+            const normalizados = await client.query(
+                `UPDATE public.stock_movements
+                    SET movement_type = lower(btrim(movement_type))
+                  WHERE movement_type <> lower(btrim(movement_type))`
+            );
+            if (normalizados.rowCount > 0) {
+                console.log(`   -> ${normalizados.rowCount} movimentação(ões) com grafia irregular normalizada(s).`);
+            }
+
+            /* PASSO 2: vocabulário.
+             *
+             * Se sobrou tipo fora de entrada/saida, a identidade do passo 3 não
+             * fecha — a linha desconhecida não conta nem de um lado nem do outro,
+             * e a entrada reconstruída sairia errada. Aqui a rotina PARA. Sem
+             * marcador, para retomar sozinha na próxima subida depois que alguém
+             * decidir o que fazer com essas linhas. Errar o estoque de um cliente
+             * é pior do que continuar sem o histórico inicial. */
+            const invalidos = await client.query(
+                `SELECT movement_type, COUNT(*)::int AS total
+                   FROM public.stock_movements
+                  WHERE movement_type NOT IN ('entrada', 'saida')
+                  GROUP BY movement_type`
+            );
+            if (invalidos.rowCount > 0) {
+                await client.query('ROLLBACK');
+                const lista = invalidos.rows.map((r) => `"${r.movement_type}" (${r.total}x)`).join(', ');
+                console.warn('   -> ATENÇÃO: public.stock_movements tem tipo(s) fora de entrada/saida: '
+                    + `${lista}. Reconstrução da entrada inicial NÃO executada, porque a soma por tipo `
+                    + 'ficaria incorreta. Revise essas linhas.');
+                return;
+            }
+
+            /* PASSO 3: o lançamento que falta.
+             *
+             * A aritmética fica FORA do LATERAL de propósito: referência externa
+             * misturada com agregado no mesmo SELECT é justamente o tipo de
+             * construção que o Postgres recusa por GROUP BY. O lateral só soma. */
+            const inseridos = await client.query(
+                `INSERT INTO public.stock_movements
+                       (sku_id, user_id, movement_type, quantity_change, reason, created_at)
+                 SELECT s.id, s.user_id, 'entrada',
+                        s.quantidade + calc.saidas - calc.entradas,
+                        $1, s.created_at
+                   FROM public.skus s
+                   CROSS JOIN LATERAL (
+                         SELECT COALESCE(SUM(CASE WHEN m.movement_type = 'saida'
+                                                  THEN m.quantity_change ELSE 0 END), 0) AS saidas,
+                                COALESCE(SUM(CASE WHEN m.movement_type = 'entrada'
+                                                  THEN m.quantity_change ELSE 0 END), 0) AS entradas
+                           FROM public.stock_movements m
+                          WHERE m.sku_id = s.id
+                   ) calc
+                  WHERE s.is_kit = false
+                    AND s.quantidade + calc.saidas - calc.entradas > 0
+                    AND NOT EXISTS (
+                          SELECT 1 FROM public.stock_movements m2
+                           WHERE m2.sku_id = s.id AND m2.reason = $1
+                    )
+                 RETURNING sku_id, quantity_change`,
+                [MOTIVO_ENTRADA_RECONSTRUIDA]
+            );
+
+            /* PASSO 4: trava o furo na origem, do lado do banco.
+             *
+             * A validação na rota cobre quem passa pela API; o CHECK cobre
+             * qualquer outro caminho de escrita, agora e depois. Vem por último
+             * porque só é aplicável com a coluna já limpa. */
+            await client.query(
+                `DO $$
+                 BEGIN
+                   IF NOT EXISTS (
+                         SELECT 1 FROM pg_constraint
+                          WHERE conrelid = 'public.stock_movements'::regclass
+                            AND conname = 'stock_movements_movement_type_check'
+                   ) THEN
+                     ALTER TABLE public.stock_movements
+                       ADD CONSTRAINT stock_movements_movement_type_check
+                       CHECK (movement_type IN ('entrada', 'saida'));
+                   END IF;
+                 END $$`
+            );
+
+            await client.query('COMMIT');
+
+            if (inseridos.rowCount > 0) {
+                const totalUnidades = inseridos.rows.reduce((soma, r) => soma + Number(r.quantity_change), 0);
+                console.log(`   -> Entrada inicial reconstruída em ${inseridos.rowCount} SKU(s), `
+                    + `${totalUnidades} unidade(s) no total.`);
+            } else {
+                console.log('   -> Nenhum SKU precisava de entrada inicial reconstruída.');
+            }
+
+            await marcarFeito(MARCADOR);
+        } catch (error) {
+            await client.query('ROLLBACK').catch(() => {});
+            throw error;
+        } finally {
+            client.release();
+        }
+    } catch (error) {
+        /* Nunca fatal: é histórico, não prontidão. Sem marcador, a próxima
+         * subida tenta de novo. */
+        console.warn(`   -> Regularização das movimentações de estoque não concluída agora: ${error.message}`);
+    }
+}
+
 /** Marca uma correção de dado como já executada. */
 async function marcarFeito(key) {
     await db.query(
@@ -1532,7 +1701,12 @@ async function initializeDatabase() {
              * paralelo com eles: as duas coisas escrevem nas mesmas tabelas e
              * disputariam I/O justamente enquanto as telas começam a ser usadas.
              * Cada uma já é tolerante a falha por conta própria. */
-            .then(() => applyLegacyBackfills());
+            .then(() => applyLegacyBackfills())
+            /* Por último, e em série: esta rotina varre skus x stock_movements
+             * inteiras uma única vez. Rodar junto com os backfills de vendas
+             * colocaria duas varreduras completas competindo por I/O no minuto
+             * seguinte ao deploy, que é quando as telas estão sendo abertas. */
+            .then(() => regularizarMovimentacoesDeEstoque());
     } catch (error) {
         console.error('Falha crítica ao inicializar o banco de dados. A aplicação não pode continuar.');
         process.exit(1);
@@ -1542,4 +1716,11 @@ async function initializeDatabase() {
 /* `consolidarArmazenamentoInicial` sai junto para poder ser exercitada isolada,
  * sem subir o banco inteiro. Correção que apaga linha de catálogo e reponta
  * contrato precisa ser verificável sem depender de rodar em produção. */
-module.exports = { initializeDatabase, consolidarArmazenamentoInicial };
+module.exports = {
+    initializeDatabase,
+    consolidarArmazenamentoInicial,
+    /* Sai junto pelo mesmo motivo: rotina que INSERE linha em histórico de
+     * estoque tem que ser exercitável sem subir o banco. */
+    regularizarMovimentacoesDeEstoque,
+    MOTIVO_ENTRADA_RECONSTRUIDA,
+};
