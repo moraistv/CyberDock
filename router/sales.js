@@ -331,6 +331,33 @@ const COUNT_SOURCES = [
       raw_api_data: 's.raw_api_data',
     },
   },
+  {
+    from: 'public.tiktok_sales s',
+    cols: {
+      marketplace: `'TikTok'::text`,
+      id: 's.order_id',
+      sku: 's.sku',
+      uid: 's.uid',
+      account_id: 's.shop_id::text',
+      account_nickname: 's.account_nickname',
+      sale_date: 's.sale_date',
+      product_title: 's.product_title',
+      quantity: 's.quantity',
+      shipping_mode: 's.shipping_mode',
+      shipping_deadline: 's.ship_by_date',
+      shipping_status: 's.shipping_status',
+      processed_at: 's.processed_at',
+      updated_at: 's.updated_at',
+      order_status: 's.order_status',
+      shipping_id: 'NULL::text',
+      product_thumbnail: `s.raw_api_data->'synced_item'->>'sku_image'`,
+      product_permalink: 'NULL::text',
+      item_id: `s.raw_api_data->'synced_item'->>'product_id'`,
+      buyer_name: 's.recipient_name',
+      buyer_nickname: 's.buyer_username',
+      raw_api_data: 's.raw_api_data',
+    },
+  },
 ];
 
 /**
@@ -420,11 +447,12 @@ function resolveBoundedTotal(counted) {
  */
 const HYDRATE_COLS = Object.keys(COUNT_SOURCES[0].cols);
 
-/* Filtro de chave por ramo, na ordem de COUNT_SOURCES. Os placeholders $1 e $2
- * são os primeiros parâmetros da consulta de hidratação. */
+/* Filtro de chave por ramo, na ordem de COUNT_SOURCES. Os placeholders $1, $2 e
+ * $3 são os primeiros parâmetros da consulta de hidratação (ML, Shopee e TikTok). */
 const HYDRATE_KEY_FILTERS = [
   's.id = ANY($1::bigint[])',
   's.order_sn = ANY($2::text[])',
+  's.order_id = ANY($3::text[])',
 ];
 
 function buildHydrateSource() {
@@ -1203,9 +1231,10 @@ router.get('/filter-options', authenticateToken, requireMaster, async (req, res)
       // Contas dos DOIS marketplaces. `accounts` continua sendo uma lista de
       // nicknames (compatibilidade com o filtro atual) e `accountsDetailed`
       // traz o marketplace de cada uma, para a tela exibir o logo correto.
-      const [mlResult, shopeeResult, userResult] = await Promise.all([
+      const [mlResult, shopeeResult, tiktokResult, userResult] = await Promise.all([
         db.query("SELECT DISTINCT nickname FROM public.ml_accounts WHERE nickname IS NOT NULL AND status = 'active' ORDER BY nickname"),
         db.query("SELECT DISTINCT shop_id, shop_name FROM public.shopee_accounts WHERE status = 'active' ORDER BY shop_name"),
+        db.query("SELECT DISTINCT shop_id, shop_name FROM public.tiktok_accounts WHERE COALESCE(status, 'active') <> 'reconnect_needed' ORDER BY shop_name"),
         db.query("SELECT DISTINCT name FROM public.users WHERE name IS NOT NULL AND active = true ORDER BY name"),
       ]);
 
@@ -1219,11 +1248,17 @@ router.get('/filter-options', authenticateToken, requireMaster, async (req, res)
         label: r.shop_name || String(r.shop_id),
         value: r.shop_name || String(r.shop_id),
       }));
+      const tiktokAccounts = tiktokResult.rows.map((r) => ({
+        marketplace: 'TikTok',
+        label: r.shop_name || String(r.shop_id),
+        value: r.shop_name || String(r.shop_id),
+      }));
+      const allAccounts = [...mlAccounts, ...shopeeAccounts, ...tiktokAccounts];
 
       return {
-        accounts: [...mlAccounts, ...shopeeAccounts].map((a) => a.label),
-        accountsDetailed: [...mlAccounts, ...shopeeAccounts],
-        marketplaces: ['ML', 'Shopee'],
+        accounts: allAccounts.map((a) => a.label),
+        accountsDetailed: allAccounts,
+        marketplaces: ['ML', 'Shopee', 'TikTok'],
         users: userResult.rows.map(r => r.name),
       };
     });
@@ -1346,14 +1381,16 @@ function buildSeparacaoWhere(req, skip = []) {
   // 3) Situação de despacho pelo status operacional canônico: no ML vem do
   //    shipping.status do payload e na Shopee do order_status, em vez de
   //    depender de um campo que só existe no ML.
+  // `in_transit` é o status do TikTok Shop para pedido já coletado pela
+  // transportadora. Nenhum outro canal usa esse valor.
   if (despacho === 'sim') {
-    conditions.push(`${U_OPERATIONAL_STATUS} IN ('shipped', 'delivered', 'completed')`);
+    conditions.push(`${U_OPERATIONAL_STATUS} IN ('shipped', 'delivered', 'completed', 'in_transit')`);
   } else if (despacho === 'todos') {
     // Todos (a despachar + despachados), mantendo a exclusão de cancelados/FULL
   } else {
     // Padrão: só o que falta separar (ainda não despachado)
     conditions.push(`${U_OPERATIONAL_STATUS} NOT IN
-      ('shipped', 'delivered', 'completed', 'not_delivered', 'cancelled', 'canceled')`);
+      ('shipped', 'delivered', 'completed', 'not_delivered', 'in_transit', 'cancelled', 'canceled')`);
   }
 
   const whereClause = conditions.length > 0 ? 'WHERE ' + conditions.join(' AND ') : '';
@@ -1399,7 +1436,7 @@ router.get('/separacao-facets', authenticateToken, requireMaster, async (req, re
         facet('userNickname', `COALESCE(NULLIF(TRIM(u.name), ''), u.email)`),
       ]);
 
-      const MK_LABEL = { ML: 'Mercado Livre', Shopee: 'Shopee' };
+      const MK_LABEL = { ML: 'Mercado Livre', Shopee: 'Shopee', TikTok: 'TikTok Shop' };
       return {
         marketplaces: marketplaces.rows.map((r) => ({
           value: r.value, label: MK_LABEL[r.value] || r.value, count: r.count,
@@ -1903,10 +1940,11 @@ router.get('/all', authenticateToken, requireMaster, async (req, res) => {
      *    degenerava para `sale_date IS NULL`.
      * 3) `s.id = ANY(...)` na view. Timeout em TODA página, pelo motivo acima.
      *
-     * Agora: `$1` são os id do ML e `$2` os order_sn da Shopee, cada um no seu
-     * ramo, contra a chave nativa da tabela. `page_rows` traz os pedidos da
-     * página inteiros (todos os SKUs de cada pedido), e a chave composta em `$4`
-     * mantém só as linhas que realmente estão na página.
+     * Agora: `$1` são os id do ML, `$2` os order_sn da Shopee e `$3` os order_id
+     * do TikTok, cada um no seu ramo, contra a chave nativa da tabela.
+     * `page_rows` traz os pedidos da página inteiros (todos os SKUs de cada
+     * pedido), e a chave composta em `$5` mantém só as linhas que realmente
+     * estão na página.
      *
      * A chave composta usa o separador de unidade (U+001F), que não aparece em
      * SKU nem em apelido de conta — diferente de '|' ou ':'. COALESCE(sku,'')
@@ -1978,7 +2016,7 @@ ${HYDRATE_SOURCE}
           AND UPPER(TRIM(sk.sku)) = UPPER(TRIM(s.sku))
       ) skm ON TRUE
       -- Descarta o SKU que veio junto do pedido mas não está nesta página.
-      WHERE (s.marketplace || $3 || s.id || $3 || COALESCE(s.sku, '') || $3 || s.uid) = ANY($4)
+      WHERE (s.marketplace || $4 || s.id || $4 || COALESCE(s.sku, '') || $4 || s.uid) = ANY($5)
       -- Mesmo NULLS LAST do recorte: se as duas ordenações discordassem, a
       -- página exibida sairia numa ordem diferente da que definiu quais linhas
       -- entram nela.
@@ -2033,10 +2071,13 @@ ${HYDRATE_SOURCE}
        */
       const mlIds = new Set();
       const shopeeIds = new Set();
+      const tiktokIds = new Set();
       for (const k of chaves) {
         const id = String(k.id);
         if (k.marketplace === 'ML') {
           if (/^\d+$/.test(id)) mlIds.add(id);
+        } else if (k.marketplace === 'TikTok') {
+          tiktokIds.add(id);
         } else {
           shopeeIds.add(id);
         }
@@ -2051,6 +2092,7 @@ ${HYDRATE_SOURCE}
       const dataResult = await db.query(dataQuery, [
         [...mlIds],
         [...shopeeIds],
+        [...tiktokIds],
         SEP,
         chaveKeys,
       ]);
@@ -2232,6 +2274,25 @@ const UNIFIED_AGG_SOURCE = `(
              NULL::text,
              s.ship_by_date
         FROM public.shopee_sales s
+      UNION ALL
+      SELECT 'TikTok'::text,
+             s.order_id,
+             s.sku,
+             s.uid,
+             s.shop_id::text,
+             s.account_nickname,
+             s.sale_date,
+             s.product_title,
+             s.quantity,
+             s.shipping_mode,
+             s.shipping_status,
+             s.processed_at,
+             s.order_status,
+             '{}'::jsonb,
+             NULL::timestamptz,
+             NULL::text,
+             s.ship_by_date
+        FROM public.tiktok_sales s
     ) b
 )`;
 
@@ -2264,6 +2325,7 @@ const U_SHIPPING_MODE = `COALESCE(
     END
   END,
   CASE WHEN s.marketplace = 'Shopee' THEN 'Shopee' END,
+  CASE WHEN s.marketplace = 'TikTok' THEN 'TikTok' END,
   'Sem modalidade'
 )`;
 const U_OPERATIONAL_STATUS = `LOWER(COALESCE(
@@ -2290,8 +2352,9 @@ const U_NOT_FULL = `NOT (
   OR (s.marketplace = 'ML'
       AND LOWER(COALESCE(s.raw_api_data->'shipping'->>'logistic_type', '')) = 'fulfillment')
 )`;
-// Estados em que o pedido já deixou a nossa operação.
-const U_SHIPPED_STATUSES = `('shipped', 'delivered', 'completed', 'not_delivered')`;
+// Estados em que o pedido já deixou a nossa operação. `in_transit` é o status
+// do TikTok Shop depois da coleta; nenhum outro canal usa esse valor.
+const U_SHIPPED_STATUSES = `('shipped', 'delivered', 'completed', 'not_delivered', 'in_transit')`;
 const U_PENDING = `(${U_NOT_FULL}
    AND NOT ${U_CANCELLED}
    AND ${U_OPERATIONAL_STATUS} NOT IN ${U_SHIPPED_STATUSES})`;
@@ -2683,7 +2746,7 @@ async function buildFacets(req, uid, options = {}) {
         .sort((a, b) => b.count - a.count);
     }
 
-    const MK_LABEL = { ML: 'Mercado Livre', Shopee: 'Shopee' };
+    const MK_LABEL = { ML: 'Mercado Livre', Shopee: 'Shopee', TikTok: 'TikTok Shop' };
     return {
       marketplaces: marketplaces.rows.map((r) => ({
         value: r.value, label: MK_LABEL[r.value] || r.value, count: r.count,
@@ -2913,11 +2976,16 @@ async function buildDashboardStats(req, uid, options = {}) {
 router.get('/raw/:marketplace/:id/:sku', authenticateToken, async (req, res) => {
   const { marketplace, id, sku } = req.params;
   const { uid, role } = req.user;
-  const isShopee = String(marketplace).toLowerCase() === 'shopee';
+  // Tabela e chave de cada canal. Canal desconhecido continua caindo no ML,
+  // que é o comportamento de sempre desta rota.
+  const SOURCES = {
+    shopee: { table: 'public.shopee_sales', idColumn: 'order_sn' },
+    tiktok: { table: 'public.tiktok_sales', idColumn: 'order_id' },
+  };
+  const source = SOURCES[String(marketplace).toLowerCase()] || { table: 'public.sales', idColumn: 'id' };
 
   try {
-    const table = isShopee ? 'public.shopee_sales' : 'public.sales';
-    const idColumn = isShopee ? 'order_sn' : 'id';
+    const { table, idColumn } = source;
 
     // Usuário comum só vê o próprio pedido; master vê de qualquer um.
     const conditions = [`${idColumn}::text = $1`, 'sku = $2'];
@@ -2975,12 +3043,23 @@ router.get('/user/:uid/stats', authenticateToken, requireOwnerOrMaster, async (r
           )::int AS expedited,
           COUNT(*) FILTER (WHERE processed_at IS NOT NULL)::int AS processed
         FROM public.shopee_sales WHERE uid = $1
+      ), tt AS (
+        SELECT
+          COUNT(*)::int AS total,
+          COUNT(*) FILTER (
+            WHERE LOWER(COALESCE(shipping_status, '')) IN
+                    ('custom_06_despachado', 'expedited', 'despachado', 'shipped', 'in_transit')
+               OR LOWER(COALESCE(order_status, '')) IN
+                    ('in_transit', 'shipped', 'delivered', 'completed', 'not_delivered')
+          )::int AS expedited,
+          COUNT(*) FILTER (WHERE processed_at IS NOT NULL)::int AS processed
+        FROM public.tiktok_sales WHERE uid = $1
       )
       SELECT
-        (ml.total + sp.total)         AS total_sales,
-        (ml.expedited + sp.expedited) AS expedited_count,
-        (ml.processed + sp.processed) AS processed_count
-      FROM ml, sp
+        (ml.total + sp.total + tt.total)             AS total_sales,
+        (ml.expedited + sp.expedited + tt.expedited) AS expedited_count,
+        (ml.processed + sp.processed + tt.processed) AS processed_count
+      FROM ml, sp, tt
     `, [uid]);
     res.json(rows[0] || { total_sales: 0, expedited_count: 0, processed_count: 0 });
   } catch (error) {

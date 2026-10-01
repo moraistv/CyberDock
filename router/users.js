@@ -232,6 +232,10 @@ router.delete('/:uid', authenticateToken, requireMaster, async (req, res) => {
 
         await client.query('DELETE FROM public.ml_accounts WHERE uid = $1', [uid]);
         await client.query('DELETE FROM public.sales WHERE uid = $1', [uid]);
+        // TikTok Shop: vendas sem FK saem aqui; conta, cursor, jobs e tentativas
+        // de OAuth também cairiam por CASCADE ao apagar o usuário.
+        await client.query('DELETE FROM public.tiktok_sales WHERE uid = $1', [uid]);
+        await client.query('DELETE FROM public.tiktok_accounts WHERE uid = $1', [uid]);
         await client.query('DELETE FROM public.skus WHERE user_id = $1', [uid]);
         await client.query('DELETE FROM public.stock_movements WHERE user_id = $1', [uid]);
         await client.query('DELETE FROM public.user_contracts WHERE uid = $1', [uid]);

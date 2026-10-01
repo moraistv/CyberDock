@@ -164,6 +164,114 @@ const schema = {
             processed_at TIMESTAMP WITH TIME ZONE,
             PRIMARY KEY (order_sn, sku, uid)
         );`,
+    /* ------------------------------ TikTok Shop ------------------------------
+     *
+     * Mesmo desenho das tabelas shopee_*, com três diferenças estruturais:
+     *
+     * - `shop_id` e `order_id` são VARCHAR. Os ids do TikTok são numéricos, mas
+     *   passam de 2^53 (ex.: 7494714703561852063) e virariam OUTRO número em
+     *   qualquer Number do JavaScript.
+     * - `shop_cipher` é coluna: o TikTok exige esse valor em toda chamada de
+     *   loja e ele entra na assinatura. Vem de /authorization/202309/shops.
+     * - `open_id` identifica a AUTORIZAÇÃO. Uma autorização pode cobrir várias
+     *   lojas com o mesmo par de tokens, e a renovação precisa gravar o par
+     *   novo em todas elas.
+     *
+     * As vendas (tiktok_sales) não têm FK para a conta, igual à Shopee: são
+     * histórico operacional e de faturamento e ficam se a loja for desconectada.
+     */
+    tiktok_oauth_attempts: `
+        CREATE TABLE IF NOT EXISTS public.tiktok_oauth_attempts (
+            state_hash CHAR(64) PRIMARY KEY,
+            uid VARCHAR(255) NOT NULL REFERENCES public.users(uid) ON DELETE CASCADE,
+            expires_at TIMESTAMP WITH TIME ZONE NOT NULL,
+            claim_id UUID,
+            claimed_at TIMESTAMP WITH TIME ZONE,
+            consumed_at TIMESTAMP WITH TIME ZONE,
+            shop_ids TEXT[],
+            created_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT CURRENT_TIMESTAMP
+        );
+        CREATE INDEX IF NOT EXISTS idx_tiktok_oauth_attempts_expires
+            ON public.tiktok_oauth_attempts (expires_at);`,
+    tiktok_accounts: `
+        CREATE TABLE public.tiktok_accounts (
+            uid VARCHAR(255) NOT NULL REFERENCES public.users(uid) ON DELETE CASCADE,
+            shop_id VARCHAR(64) NOT NULL,
+            shop_name VARCHAR(255),
+            shop_code VARCHAR(64),
+            shop_cipher TEXT,
+            region VARCHAR(16),
+            seller_name VARCHAR(255),
+            open_id VARCHAR(255),
+            access_token TEXT NOT NULL,
+            refresh_token TEXT NOT NULL,
+            expires_at TIMESTAMP WITH TIME ZONE,
+            refresh_expires_at TIMESTAMP WITH TIME ZONE,
+            status VARCHAR(50) DEFAULT 'active',
+            connected_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
+            updated_at TIMESTAMP WITH TIME ZONE,
+            PRIMARY KEY (uid, shop_id)
+        );`,
+    tiktok_sync_cursors: `
+        CREATE TABLE public.tiktok_sync_cursors (
+            uid VARCHAR(255) NOT NULL,
+            shop_id VARCHAR(64) NOT NULL,
+            update_time_scanned_through TIMESTAMP WITH TIME ZONE,
+            initial_backfill_completed_at TIMESTAMP WITH TIME ZONE,
+            last_deep_sweep_at TIMESTAMP WITH TIME ZONE,
+            last_attempt_at TIMESTAMP WITH TIME ZONE,
+            last_success_at TIMESTAMP WITH TIME ZONE,
+            status VARCHAR(20) NOT NULL DEFAULT 'idle',
+            last_error TEXT,
+            last_result JSONB,
+            job_id VARCHAR(100),
+            locked_until TIMESTAMP WITH TIME ZONE,
+            updated_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            PRIMARY KEY (uid, shop_id),
+            FOREIGN KEY (uid, shop_id) REFERENCES public.tiktok_accounts(uid, shop_id) ON DELETE CASCADE
+        );`,
+    tiktok_sync_jobs: `
+        CREATE TABLE public.tiktok_sync_jobs (
+            client_id VARCHAR(100) PRIMARY KEY,
+            requester_uid VARCHAR(255) NOT NULL,
+            uid VARCHAR(255) NOT NULL,
+            shop_id VARCHAR(64) NOT NULL,
+            status VARCHAR(20) NOT NULL DEFAULT 'running',
+            result JSONB,
+            error TEXT,
+            created_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            updated_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            expires_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT (CURRENT_TIMESTAMP + INTERVAL '1 day'),
+            FOREIGN KEY (uid, shop_id) REFERENCES public.tiktok_accounts(uid, shop_id) ON DELETE CASCADE
+        );`,
+    tiktok_sales: `
+        CREATE TABLE public.tiktok_sales (
+            order_id VARCHAR(64) NOT NULL,
+            sku VARCHAR(255) NOT NULL,
+            uid VARCHAR(255) NOT NULL,
+            shop_id VARCHAR(64) NOT NULL,
+            account_nickname VARCHAR(255),
+            sale_date TIMESTAMP WITH TIME ZONE,
+            product_title TEXT,
+            quantity INTEGER,
+            unit_price NUMERIC(10, 2),
+            total_amount NUMERIC(10, 2),
+            order_status VARCHAR(50),
+            buyer_username VARCHAR(255),
+            recipient_name VARCHAR(255),
+            tracking_number VARCHAR(255),
+            shipping_carrier VARCHAR(100),
+            shipping_mode VARCHAR(100),
+            shipping_type VARCHAR(20),
+            fulfillment_type VARCHAR(40),
+            package_ids TEXT[],
+            ship_by_date TIMESTAMP WITH TIME ZONE,
+            shipping_status VARCHAR(100) DEFAULT 'Pendente',
+            raw_api_data JSONB,
+            updated_at TIMESTAMP WITH TIME ZONE,
+            processed_at TIMESTAMP WITH TIME ZONE,
+            PRIMARY KEY (order_id, sku, uid)
+        );`,
     skus: `
         CREATE TABLE public.skus (
             id SERIAL PRIMARY KEY,
@@ -285,14 +393,18 @@ const schema = {
 };
 
 /* ---------------------------------------------------------------------------
- * View unificada de vendas (Mercado Livre + Shopee).
+ * View unificada de vendas (Mercado Livre + Shopee + TikTok Shop).
  *
  * As telas de venda/expedição são multi-marketplace: quem separa pedido precisa
- * de UMA fila, não de uma tela por canal. A view normaliza as duas tabelas num
+ * de UMA fila, não de uma tela por canal. A view normaliza as tabelas num
  * formato comum para que filtro, busca e paginação funcionem sobre o conjunto.
  *
- * `id` é TEXT porque o ML usa order_id numérico e a Shopee usa order_sn
- * alfanumérico. Coluna exclusiva de um canal vem NULL no outro.
+ * `id` é TEXT porque o ML usa order_id numérico, a Shopee usa order_sn
+ * alfanumérico e o TikTok usa um id numérico maior que 2^53, guardado como
+ * texto. Coluna exclusiva de um canal vem NULL nos outros.
+ *
+ * O espelho desta definição vive em router/sales.js (COUNT_SOURCES e
+ * UNIFIED_AGG_SOURCE): se a view mudar, mudar lá também.
  * ------------------------------------------------------------------------- */
 const UNIFIED_SALES_VIEW_SQL = `
     CREATE VIEW public.unified_sales AS
@@ -377,7 +489,36 @@ const UNIFIED_SALES_VIEW_SQL = `
         sp.recipient_name                       AS buyer_name,
         sp.buyer_username                       AS buyer_nickname,
         sp.raw_api_data                         AS raw_api_data
-    FROM public.shopee_sales sp;
+    FROM public.shopee_sales sp
+
+    UNION ALL
+
+    SELECT
+        'TikTok'::text                          AS marketplace,
+        tt.order_id                             AS id,
+        tt.sku,
+        tt.uid,
+        tt.shop_id::text                        AS account_id,
+        tt.account_nickname,
+        tt.sale_date,
+        tt.product_title,
+        tt.quantity,
+        -- Gravada no sync: 'FULL' para Fulfillment by TikTok (a expedição é do
+        -- TikTok, igual ao FULL do ML) e a transportadora nos demais casos.
+        tt.shipping_mode,
+        tt.ship_by_date                         AS shipping_deadline,
+        tt.shipping_status,
+        tt.processed_at,
+        tt.updated_at,
+        tt.order_status,
+        NULL::text                              AS shipping_id,
+        tt.raw_api_data->'synced_item'->>'sku_image'  AS product_thumbnail,
+        NULL::text                              AS product_permalink,
+        tt.raw_api_data->'synced_item'->>'product_id' AS item_id,
+        tt.recipient_name                       AS buyer_name,
+        tt.buyer_username                       AS buyer_nickname,
+        tt.raw_api_data                         AS raw_api_data
+    FROM public.tiktok_sales tt;
 `;
 
 /**
@@ -426,6 +567,16 @@ const PERFORMANCE_INDEXES = [
     'CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_shopee_sales_ship_by_date ON public.shopee_sales (ship_by_date)',
     'CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_shopee_sales_shipping_status ON public.shopee_sales (shipping_status)',
     'CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_shopee_sales_carrier ON public.shopee_sales (shipping_carrier)',
+    // TikTok Shop: os mesmos recortes da Shopee.
+    'CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_tiktok_sales_product_title_trgm ON public.tiktok_sales USING gin (product_title gin_trgm_ops)',
+    'CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_tiktok_sales_sku_trgm ON public.tiktok_sales USING gin (sku gin_trgm_ops)',
+    'CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_tiktok_sales_nickname_trgm ON public.tiktok_sales USING gin (account_nickname gin_trgm_ops)',
+    'CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_tiktok_sales_pending_processing ON public.tiktok_sales (uid, sale_date DESC) WHERE processed_at IS NULL',
+    'CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_tiktok_sales_done_processing ON public.tiktok_sales (uid, processed_at DESC) WHERE processed_at IS NOT NULL',
+    'CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_tiktok_sales_order_status ON public.tiktok_sales (order_status)',
+    'CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_tiktok_sales_ship_by_date ON public.tiktok_sales (ship_by_date)',
+    'CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_tiktok_sales_shipping_status ON public.tiktok_sales (shipping_status)',
+    'CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_tiktok_sales_carrier ON public.tiktok_sales (shipping_carrier)',
     // Cursores de sincronização.
     'CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_ml_sync_cursors_lookup ON public.ml_sync_cursors (uid, seller_id)',
     // Movimentações de estoque: a tabela não tinha NENHUM índice, e a tela de
@@ -455,6 +606,7 @@ async function applyPerformanceIndexes() {
     try {
         await db.query('ANALYZE public.sales');
         await db.query('ANALYZE public.shopee_sales');
+        await db.query('ANALYZE public.tiktok_sales');
     } catch (error) {
         console.warn(`   -> ANALYZE não concluído: ${error.message}`);
     }
@@ -707,7 +859,9 @@ async function syncDatabaseSchema() {
             'users', 'package_types', 'services', 'ml_accounts', 'ml_sync_cursors', 'system_settings',
             'user_statuses', 'user_contracts', 'skus', 'sku_kit_components', 'kit_parents', 'sales', 'stock_movements',
             'invoices', 'invoice_items', 'shopee_oauth_attempts', 'shopee_accounts',
-            'shopee_sync_cursors', 'shopee_sync_jobs', 'shopee_sales'
+            'shopee_sync_cursors', 'shopee_sync_jobs', 'shopee_sales',
+            'tiktok_oauth_attempts', 'tiktok_accounts', 'tiktok_sync_cursors',
+            'tiktok_sync_jobs', 'tiktok_sales'
         ];
 
         await client.query('BEGIN');
@@ -741,6 +895,15 @@ async function syncDatabaseSchema() {
                          WHERE last_deep_sweep_at IS NULL
                            AND update_time_scanned_through IS NOT NULL
                     `);
+                }
+                if (tableName === 'tiktok_sync_jobs') {
+                    // Quem abriu o EventSource pode ser o dono da loja ou um
+                    // master sincronizando para ele. O requester isola o canal
+                    // SSE; `uid` continua sendo o dono dos dados sincronizados.
+                    await client.query('ALTER TABLE public.tiktok_sync_jobs ADD COLUMN IF NOT EXISTS requester_uid VARCHAR(255);');
+                    await client.query('UPDATE public.tiktok_sync_jobs SET requester_uid = uid WHERE requester_uid IS NULL;');
+                    await client.query('ALTER TABLE public.tiktok_sync_jobs ALTER COLUMN requester_uid SET NOT NULL;');
+                    await client.query('CREATE INDEX IF NOT EXISTS idx_tiktok_sync_jobs_requester ON public.tiktok_sync_jobs(requester_uid, client_id);');
                 }
                 if (tableName === 'users') {
                     // Verifica e adiciona a coluna 'name' se não existir
@@ -1185,6 +1348,22 @@ async function syncDatabaseSchema() {
         await client.query('CREATE INDEX IF NOT EXISTS idx_shopee_sales_sale_date ON public.shopee_sales(sale_date DESC);');
         await client.query('CREATE INDEX IF NOT EXISTS idx_shopee_sales_uid_saledate ON public.shopee_sales(uid, sale_date DESC);');
         await client.query('CREATE INDEX IF NOT EXISTS idx_shopee_sales_uid_shop ON public.shopee_sales(uid, shop_id);');
+
+        console.log('   -> Verificando índices de public.tiktok_sales e public.tiktok_accounts...');
+        await client.query('CREATE INDEX IF NOT EXISTS idx_tiktok_sales_uid ON public.tiktok_sales(uid);');
+        await client.query('CREATE INDEX IF NOT EXISTS idx_tiktok_sales_shop_id ON public.tiktok_sales(shop_id);');
+        await client.query('CREATE INDEX IF NOT EXISTS idx_tiktok_sales_sale_date ON public.tiktok_sales(sale_date DESC);');
+        await client.query('CREATE INDEX IF NOT EXISTS idx_tiktok_sales_uid_saledate ON public.tiktok_sales(uid, sale_date DESC);');
+        await client.query('CREATE INDEX IF NOT EXISTS idx_tiktok_sales_uid_shop ON public.tiktok_sales(uid, shop_id);');
+        // Etiqueta, processamento e sync buscam todas as linhas de UM pedido.
+        await client.query('CREATE INDEX IF NOT EXISTS idx_tiktok_sales_uid_order ON public.tiktok_sales(uid, order_id);');
+        // Uma loja TikTok só pode pertencer a um tenant. Sem esta unicidade,
+        // dois usuários sincronizariam/processariam o mesmo pedido em paralelo.
+        await client.query('CREATE UNIQUE INDEX IF NOT EXISTS idx_tiktok_accounts_shop_owner ON public.tiktok_accounts(shop_id);');
+        // A renovação do token grava o par novo em todas as lojas da mesma autorização.
+        await client.query('CREATE INDEX IF NOT EXISTS idx_tiktok_accounts_open_id ON public.tiktok_accounts(uid, open_id);');
+        // Polling do SSE sempre cruza requester + client_id.
+        await client.query('CREATE INDEX IF NOT EXISTS idx_tiktok_sync_jobs_requester ON public.tiktok_sync_jobs(requester_uid, client_id);');
 
         // ------------------------------------------------------------------
         // Correção de fuso da DATA DA VENDA da Shopee (D-1).

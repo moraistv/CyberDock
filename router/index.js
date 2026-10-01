@@ -4,6 +4,7 @@ const router = express.Router();
 const authRouter = require('./auth');
 const mercadoLivreRouter = require('./mercadolivre');
 const shopeeRouter = require('./shopee');
+const tiktokRouter = require('./tiktok');
 const salesRouter = require('./sales');
 const usersRouter = require('./users');
 const settingsRouter = require('./settings');
@@ -20,6 +21,7 @@ router.get('/', (req, res) => {
 router.use('/auth', authRouter);
 router.use('/ml', mercadoLivreRouter);
 router.use('/shopee', shopeeRouter);
+router.use('/tiktok', tiktokRouter);
 router.use('/sales', salesRouter);
 router.use('/users', usersRouter);
 router.use('/settings', settingsRouter);
