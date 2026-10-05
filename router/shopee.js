@@ -40,6 +40,11 @@ const {
   downloadShopeeShippingDocument,
 } = require('../utils/shopeeClient');
 const { calculateShopeeFinancials, SHOPEE_FINANCIAL_RULE_VERSION } = require('../utils/shopeeFinance');
+const {
+  buildSaleLineKey,
+  isDuplicateSaleMovement,
+  duplicateSaleMovementError,
+} = require('../utils/saleProcessing');
 
 const router = express.Router();
 
@@ -2610,7 +2615,7 @@ router.get('/my-sales', authenticateToken, async (req, res) => {
 });
 
 /** Abatimento de estoque para pedidos Shopee — mesmo fluxo seguro de /sales/process. */
-router.post('/process', authenticateToken, requireMaster, async (req, res) => {
+router.post('/process', authenticateToken, async (req, res) => {
   const { salesToProcess } = req.body;
   const MAX_PROCESS_BATCH = 500;
 
@@ -2623,11 +2628,21 @@ router.post('/process', authenticateToken, requireMaster, async (req, res) => {
 
   // Quantidade enviada pelo navegador é deliberadamente ignorada. A fonte
   // autoritativa é a linha bloqueada em public.shopee_sales.
-  const sanitized = salesToProcess.map((sale) => ({
-    orderSn: String(sale.orderSn || sale.id || '').trim(),
-    sku: String(sale.sku || '').trim(),
-    uid: String(sale.uid || '').trim(),
-  }));
+  const sanitized = salesToProcess.map((sale) => {
+    const item = sale && typeof sale === 'object' && !Array.isArray(sale) ? sale : {};
+    const rawOrder = item.orderSn ?? item.id;
+    return {
+      orderSn: typeof rawOrder === 'string' || typeof rawOrder === 'number'
+        ? String(rawOrder).trim()
+        : '',
+      sku: typeof item.sku === 'string' ? item.sku.trim() : '',
+      uid: typeof item.uid === 'string' ? item.uid.trim() : '',
+    };
+  });
+
+  if (req.user.role !== 'master' && sanitized.some((sale) => sale.uid !== req.user.uid)) {
+    return res.status(403).json({ error: 'Você só pode processar vendas da sua própria conta.' });
+  }
 
   const results = { success: [], failed: [] };
 
@@ -2663,6 +2678,7 @@ router.post('/process', authenticateToken, requireMaster, async (req, res) => {
             orderSn: sale.order_sn,
             sku: sale.sku,
             alreadyProcessed: true,
+            processedAt: sale.processed_at,
           };
         }
 
@@ -2685,6 +2701,13 @@ router.post('/process', authenticateToken, requireMaster, async (req, res) => {
         if (skuResult.rowCount === 0) throw new Error(`SKU ativo '${sale.sku}' não encontrado no armazenamento.`);
         if (skuResult.rowCount > 1) throw new Error(`Há mais de um SKU ativo normalizado como '${sale.sku}'.`);
         const stock = skuResult.rows[0];
+        const movementKey = (movementSkuId) => buildSaleLineKey({
+          marketplace: 'shopee',
+          uid: sale.uid,
+          orderId: sale.order_sn,
+          soldSku: sale.sku,
+          movementSkuId,
+        });
 
         if (stock.is_kit) {
           const componentsResult = await client.query(
@@ -2717,9 +2740,17 @@ router.post('/process', authenticateToken, requireMaster, async (req, res) => {
             );
             await client.query(
               `INSERT INTO public.stock_movements
-                 (sku_id, user_id, movement_type, quantity_change, reason, related_sale_id, external_sale_id)
-               VALUES ($1, $2, 'saida', $3, $4, NULL, $5)`,
-              [component.child_sku_id, sale.uid, required, `Saída por Kit (Shopee) - Pedido ${sale.order_sn}`, sale.order_sn]
+                 (sku_id, user_id, movement_type, quantity_change, reason, related_sale_id,
+                  external_sale_id, sale_line_key)
+               VALUES ($1, $2, 'saida', $3, $4, NULL, $5, $6)`,
+              [
+                component.child_sku_id,
+                sale.uid,
+                required,
+                `Saída por Kit (Shopee) - Pedido ${sale.order_sn}`,
+                sale.order_sn,
+                movementKey(component.child_sku_id),
+              ]
             );
           }
 
@@ -2727,9 +2758,17 @@ router.post('/process', authenticateToken, requireMaster, async (req, res) => {
           // estoque físico é abatido exclusivamente dos componentes acima.
           await client.query(
             `INSERT INTO public.stock_movements
-               (sku_id, user_id, movement_type, quantity_change, reason, related_sale_id, external_sale_id)
-             VALUES ($1, $2, 'saida', $3, $4, NULL, $5)`,
-            [stock.id, sale.uid, quantity, `Saída por Venda Shopee - Pedido ${sale.order_sn}`, sale.order_sn]
+               (sku_id, user_id, movement_type, quantity_change, reason, related_sale_id,
+                external_sale_id, sale_line_key)
+             VALUES ($1, $2, 'saida', $3, $4, NULL, $5, $6)`,
+            [
+              stock.id,
+              sale.uid,
+              quantity,
+              `Saída por Venda Shopee - Pedido ${sale.order_sn}`,
+              sale.order_sn,
+              movementKey(stock.id),
+            ]
           );
         } else {
           if (Number(stock.quantidade) < quantity) {
@@ -2741,9 +2780,17 @@ router.post('/process', authenticateToken, requireMaster, async (req, res) => {
           );
           await client.query(
             `INSERT INTO public.stock_movements
-               (sku_id, user_id, movement_type, quantity_change, reason, related_sale_id, external_sale_id)
-             VALUES ($1, $2, 'saida', $3, $4, NULL, $5)`,
-            [stock.id, sale.uid, quantity, `Saída por Venda Shopee - Pedido ${sale.order_sn}`, sale.order_sn]
+               (sku_id, user_id, movement_type, quantity_change, reason, related_sale_id,
+                external_sale_id, sale_line_key)
+             VALUES ($1, $2, 'saida', $3, $4, NULL, $5, $6)`,
+            [
+              stock.id,
+              sale.uid,
+              quantity,
+              `Saída por Venda Shopee - Pedido ${sale.order_sn}`,
+              sale.order_sn,
+              movementKey(stock.id),
+            ]
           );
         }
 
@@ -2760,9 +2807,15 @@ router.post('/process', authenticateToken, requireMaster, async (req, res) => {
         if (updateResult.rowCount !== 1) throw new Error('Venda não pôde ser marcada como processada.');
 
         await client.query('COMMIT');
-        return { orderSn: sale.order_sn, sku: sale.sku, alreadyProcessed: false };
+        return {
+          orderSn: sale.order_sn,
+          sku: sale.sku,
+          alreadyProcessed: false,
+          processedAt: updateResult.rows[0].processed_at,
+        };
       } catch (error) {
         try { await client.query('ROLLBACK'); } catch { /* transação já encerrada */ }
+        if (isDuplicateSaleMovement(error)) throw duplicateSaleMovementError();
         throw error;
       }
     } finally {

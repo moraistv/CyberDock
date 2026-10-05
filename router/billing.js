@@ -12,6 +12,14 @@ const {
 } = require('../utils/billingRules');
 
 const asaas = require('../utils/asaasClient');
+const {
+  withBillingLock,
+  parseInvoiceReference,
+  assertPaymentMatchesInvoice,
+  isValidIsoDate,
+  hojeNoBrasil,
+  normalizeBillingType,
+} = require('../utils/billingSafety');
 
 const router = express.Router();
 
@@ -42,7 +50,30 @@ function responderErroAsaas(res, erro, contexto) {
    * Timeout e falha de rede também são 503 — são condição temporária do
    * provedor, e devolver 500 faria a tela sugerir bug nosso. */
   const indisponivel = ['not_configured', 'timeout', 'network_error'].includes(erro.code);
-  return res.status(indisponivel ? 503 : (erro.status || 502)).json({
+
+  /* 401/403 do ASAAS significam "chave recusada", e não "sessão do usuário
+   * expirada". Repassar o mesmo status faria qualquer tela que trata 401/403
+   * como logout derrubar a sessão do master por causa de uma chave errada. */
+  if (!indisponivel && (erro.status === 401 || erro.status === 403)) {
+    return res.status(502).json({
+      error: 'O Asaas recusou a chave de API. Confira ASAAS_API_KEY e ASAAS_ENV no servidor '
+        + `(detalhe do Asaas: ${erro.message})`,
+      code: 'provider_unauthorized',
+      provider: 'asaas',
+    });
+  }
+  if (!indisponivel && erro.status === 429) {
+    return res.status(503).json({
+      error: 'O Asaas limitou as requisições. Aguarde um minuto e tente de novo.',
+      code: 'provider_rate_limited',
+      provider: 'asaas',
+    });
+  }
+
+  const statusHttp = Number.isInteger(erro.status) && erro.status >= 400 && erro.status < 600
+    ? erro.status
+    : 502;
+  return res.status(indisponivel ? 503 : statusHttp).json({
     error: erro.message,
     code: erro.code || null,
     provider: 'asaas',
@@ -63,17 +94,33 @@ function responderErroAsaas(res, erro, contexto) {
  */
 router.get('/asaas/status', authenticateToken, requireMaster, async (req, res) => {
   const configuracao = asaas.describe();
+
+  /* Evento de webhook recebido e não aplicado = cliente que pode ter pago e
+   * continua aparecendo como devedor. Entra no diagnóstico para não depender de
+   * alguém lembrar de abrir a listagem de pendentes. `null` quando não dá para
+   * contar (por exemplo, tabela ainda não criada), nunca um zero mentiroso. */
+  let pendingWebhookEvents = null;
+  try {
+    const pendentes = await db.query(
+      'SELECT COUNT(*)::int AS total FROM public.asaas_webhook_events WHERE processed_at IS NULL'
+    );
+    pendingWebhookEvents = pendentes.rows[0].total;
+  } catch (erro) {
+    console.warn('[Cobrança] Não foi possível contar eventos de webhook pendentes:', erro.message);
+  }
+
   if (!configuracao.enabled) {
     return res.json({
       ...configuracao,
       reachable: false,
       motivo: 'ASAAS_API_KEY não configurada. A integração está desligada.',
+      pendingWebhookEvents,
     });
   }
 
   try {
     const teste = await asaas.ping();
-    return res.json({ ...configuracao, reachable: true, elapsedMs: teste.elapsedMs });
+    return res.json({ ...configuracao, reachable: true, elapsedMs: teste.elapsedMs, pendingWebhookEvents });
   } catch (erro) {
     // Credencial errada não é erro do sistema: é resposta útil do diagnóstico.
     return res.json({
@@ -82,6 +129,7 @@ router.get('/asaas/status', authenticateToken, requireMaster, async (req, res) =
       motivo: erro.message,
       code: erro.code || null,
       status: erro.status || null,
+      pendingWebhookEvents,
     });
   }
 });
@@ -106,104 +154,102 @@ router.post('/asaas/customers/:uid', authenticateToken, requireMaster, async (re
   const { uid } = req.params;
 
   try {
-    const { rows, rowCount } = await db.query(
-      `SELECT uid, name, email, cpf_cnpj, phone, asaas_customer_id,
-              postal_code, address, address_number, address_complement, province
-         FROM public.users WHERE uid = $1`,
-      [uid]
-    );
-    if (rowCount === 0) return res.status(404).json({ error: 'Cliente não encontrado.' });
-
-    const cliente = rows[0];
-    /* O endereço vai junto na criação E na atualização: é o que habilita boleto,
-     * e um cadastro criado sem ele continuaria recusando boleto para sempre se a
-     * gente só enviasse na criação. */
-    const endereco = {
-      postalCode: cliente.postal_code,
-      address: cliente.address,
-      addressNumber: cliente.address_number,
-      addressComplement: cliente.address_complement,
-      province: cliente.province,
-    };
-
-    /* Documento é obrigatório no provedor. Recusar aqui, com o nome do campo,
-     * evita a mensagem crua do Asaas — que fala em "cpfCnpj" e não diz onde
-     * preencher. GET /users/billing-info/pending lista quem falta. */
-    if (!cliente.cpf_cnpj || !String(cliente.cpf_cnpj).trim()) {
-      return res.status(422).json({
-        error: 'Este cliente não tem CPF/CNPJ cadastrado, e o provedor exige o documento do pagador.',
-        code: 'missing_billing_info',
-        /* `faltando` é o que permite à tela abrir o formulário já apontando o
-         * campo, em vez de mostrar a mensagem e deixar o master sem saída. */
-        faltando: ['cpfCnpj'],
-        field: 'cpfCnpj',
-      });
-    }
-
-    /* Já vinculado: em vez de sair sem fazer nada, SINCRONIZA o cadastro. É o
-     * que faz o endereço preenchido depois da vinculação chegar ao provedor —
-     * sem isso, quem vinculou antes de ter CEP nunca conseguiria emitir boleto. */
-    if (cliente.asaas_customer_id) {
-      await asaas.updateCustomer(cliente.asaas_customer_id, {
-        name: cliente.name || cliente.email,
-        cpfCnpj: cliente.cpf_cnpj,
-        email: cliente.email,
-        phone: cliente.phone,
-        ...endereco,
-      });
-      return res.json({
-        ok: true,
-        created: false,
-        updated: true,
-        customerId: cliente.asaas_customer_id,
-        boletoReady: Boolean(cliente.postal_code && cliente.address_number),
-        message: 'Cadastro do cliente atualizado no provedor.',
-      });
-    }
-
-    let remoto = await asaas.findCustomerByExternalReference(uid);
-    let criado = false;
-
-    if (!remoto) remoto = await asaas.findCustomerByCpfCnpj(cliente.cpf_cnpj);
-
-    if (!remoto) {
-      remoto = await asaas.createCustomer({
-        uid,
-        name: cliente.name || cliente.email,
-        cpfCnpj: cliente.cpf_cnpj,
-        email: cliente.email,
-        phone: cliente.phone,
-        ...endereco,
-      });
-      criado = true;
-    }
-
-    if (!remoto?.id) {
-      return res.status(502).json({ error: 'O provedor não devolveu o identificador do cliente.' });
-    }
-
-    /* O índice único parcial idx_users_asaas_customer impede o mesmo cadastro
-     * do provedor em dois clientes nossos. Traduzo a violação em vez de deixar
-     * virar 500. */
-    try {
-      await db.query(
-        'UPDATE public.users SET asaas_customer_id = $1, updated_at = NOW() WHERE uid = $2',
-        [remoto.id, uid]
+    return await withBillingLock('customer', uid, async (client) => {
+      const { rows, rowCount } = await client.query(
+        `SELECT uid, name, email, cpf_cnpj, phone, asaas_customer_id,
+                postal_code, address, address_number, address_complement, province
+           FROM public.users WHERE uid = $1`,
+        [uid]
       );
-    } catch (erro) {
-      if (erro.code === '23505' || erro.code === '23514') {
-        return res.status(409).json({
-          error: `O cadastro ${remoto.id} do provedor já está vinculado a outro cliente.`,
-          code: 'customer_already_linked',
+      if (rowCount === 0) return res.status(404).json({ error: 'Cliente não encontrado.' });
+
+      const cliente = rows[0];
+      const endereco = {
+        postalCode: cliente.postal_code,
+        address: cliente.address,
+        addressNumber: cliente.address_number,
+        addressComplement: cliente.address_complement,
+        province: cliente.province,
+      };
+
+      if (!cliente.cpf_cnpj || !String(cliente.cpf_cnpj).trim()) {
+        return res.status(422).json({
+          error: 'Este cliente não tem CPF/CNPJ cadastrado, e o provedor exige o documento do pagador.',
+          code: 'missing_billing_info',
+          faltando: ['cpfCnpj'],
+          field: 'cpfCnpj',
         });
       }
-      throw erro;
-    }
 
-    console.log(`[Cobrança] Cliente ${uid} ${criado ? 'criado' : 'vinculado'} no provedor como ${remoto.id} `
-      + `por ${req.user.email || req.user.uid}.`);
+      /* A mesma chave distribuída cobre duas abas e dois containers. Sem ela,
+       * ambos poderiam não encontrar o cadastro e criar dois customers reais. */
+      if (cliente.asaas_customer_id) {
+        try {
+          await asaas.updateCustomer(cliente.asaas_customer_id, {
+            name: cliente.name || cliente.email,
+            cpfCnpj: cliente.cpf_cnpj,
+            email: cliente.email,
+            phone: cliente.phone,
+            ...endereco,
+          });
+          return res.json({
+            ok: true,
+            created: false,
+            updated: true,
+            customerId: cliente.asaas_customer_id,
+            boletoReady: Boolean(cliente.postal_code && cliente.address_number),
+            message: 'Cadastro do cliente atualizado no provedor.',
+          });
+        } catch (erro) {
+          /* Vínculo local morto (customer apagado no painel do Asaas): limpa e
+           * continua pela busca por referência/documento em vez de prender o
+           * cliente para sempre num id que não existe. */
+          if (!(erro?.name === 'AsaasError' && erro.status === 404)) throw erro;
+          await client.query(
+            'UPDATE public.users SET asaas_customer_id = NULL, updated_at = NOW() WHERE uid = $1',
+            [uid]
+          );
+        }
+      }
 
-    res.json({ ok: true, created: criado, customerId: remoto.id });
+      let remoto = await asaas.findCustomerByExternalReference(uid);
+      let criado = false;
+      if (!remoto) remoto = await asaas.findCustomerByCpfCnpj(cliente.cpf_cnpj);
+      if (!remoto) {
+        remoto = await asaas.createCustomer({
+          uid,
+          name: cliente.name || cliente.email,
+          cpfCnpj: cliente.cpf_cnpj,
+          email: cliente.email,
+          phone: cliente.phone,
+          ...endereco,
+        });
+        criado = true;
+      }
+
+      if (!remoto?.id) {
+        return res.status(502).json({ error: 'O provedor não devolveu o identificador do cliente.' });
+      }
+
+      try {
+        await client.query(
+          'UPDATE public.users SET asaas_customer_id = $1, updated_at = NOW() WHERE uid = $2',
+          [remoto.id, uid]
+        );
+      } catch (erro) {
+        if (erro.code === '23505' || erro.code === '23514') {
+          return res.status(409).json({
+            error: `O cadastro ${remoto.id} do provedor já está vinculado a outro cliente.`,
+            code: 'customer_already_linked',
+          });
+        }
+        throw erro;
+      }
+
+      console.log(`[Cobrança] Cliente ${uid} ${criado ? 'criado' : 'vinculado'} no provedor como ${remoto.id} `
+        + `por ${req.user.email || req.user.uid}.`);
+      return res.json({ ok: true, created: criado, customerId: remoto.id });
+    });
   } catch (erro) {
     return responderErroAsaas(res, erro, `vincular cliente ${uid}`);
   }
@@ -786,49 +832,57 @@ router.post('/invoices/:uid/:period/close', authenticateToken, requireMaster, as
     return res.status(400).json({ error: 'Competência inválida. Use o formato AAAA-MM.' });
   }
 
-  const client = await db.pool.connect();
   try {
-    await client.query('BEGIN');
+    /* Mesmo lock da emissão/cancelamento (uid + competência). Sem ele, fechar
+     * podia correr junto com "emitir": a emissão lia a fatura já fechada e o
+     * fechamento seguia recalculando o total por baixo. */
+    return await withBillingLock('invoice', `${uid}:${period}`, async (client) => {
+      await client.query('BEGIN');
+      try {
+        const atual = await client.query(
+          'SELECT id, closed_at FROM public.invoices WHERE uid = $1 AND period = $2',
+          [uid, period]
+        );
+        if (atual.rowCount > 0 && atual.rows[0].closed_at) {
+          await client.query('ROLLBACK');
+          return res.status(409).json({
+            error: 'Esta competência já está fechada.',
+            code: 'already_closed',
+            closedAt: atual.rows[0].closed_at,
+          });
+        }
 
-    const atual = await client.query(
-      'SELECT id, closed_at FROM public.invoices WHERE uid = $1 AND period = $2',
-      [uid, period]
-    );
-    if (atual.rowCount > 0 && atual.rows[0].closed_at) {
-      await client.query('ROLLBACK');
-      return res.status(409).json({
-        error: 'Esta competência já está fechada.',
-        code: 'already_closed',
-        closedAt: atual.rows[0].closed_at,
-      });
-    }
+        // Último recálculo com o mês aberto: é o valor que vai ser congelado.
+        await calculateAndSaveInvoice(client, uid, period);
 
-    // Último recálculo com o mês aberto: é o valor que vai ser congelado.
-    await calculateAndSaveInvoice(client, uid, period);
+        const { rows, rowCount } = await client.query(`
+          UPDATE public.invoices
+             SET closed_at = NOW(), closed_by = $1
+           WHERE uid = $2 AND period = $3
+           RETURNING id, uid, period, total_amount, status, due_date, closed_at, closed_by;
+        `, [req.user.email || req.user.uid, uid, period]);
 
-    const { rows, rowCount } = await client.query(`
-      UPDATE public.invoices
-         SET closed_at = NOW(), closed_by = $1
-       WHERE uid = $2 AND period = $3
-       RETURNING id, uid, period, total_amount, status, due_date, closed_at, closed_by;
-    `, [req.user.email || req.user.uid, uid, period]);
+        if (rowCount === 0) {
+          await client.query('ROLLBACK');
+          return res.status(404).json({ error: 'Não há fatura desta competência para este cliente.' });
+        }
 
-    if (rowCount === 0) {
-      await client.query('ROLLBACK');
-      return res.status(404).json({ error: 'Não há fatura desta competência para este cliente.' });
-    }
-
-    await client.query('COMMIT');
-    const fatura = rows[0];
-    console.log(`[Cobrança] Competência ${period} de ${uid} fechada por ${fatura.closed_by} `
-      + `no valor de ${fatura.total_amount}.`);
-    res.json({ ok: true, invoice: { ...fatura, total_amount: parseFloat(fatura.total_amount) } });
+        await client.query('COMMIT');
+        const fatura = rows[0];
+        console.log(`[Cobrança] Competência ${period} de ${uid} fechada por ${fatura.closed_by} `
+          + `no valor de ${fatura.total_amount}.`);
+        return res.json({ ok: true, invoice: { ...fatura, total_amount: parseFloat(fatura.total_amount) } });
+      } catch (err) {
+        await client.query('ROLLBACK').catch(() => {});
+        throw err;
+      }
+    });
   } catch (err) {
-    await client.query('ROLLBACK').catch(() => {});
+    if (err?.name === 'AsaasError' && err.code === 'billing_busy') {
+      return responderErroAsaas(res, err, `fechar competência ${period} de ${uid}`);
+    }
     console.error(`Erro ao fechar a competência ${period} de ${uid}:`, err);
-    res.status(500).json({ error: 'Erro interno ao fechar a competência.' });
-  } finally {
-    client.release();
+    return res.status(500).json({ error: 'Erro interno ao fechar a competência.' });
   }
 });
 
@@ -851,38 +905,47 @@ router.post('/invoices/:uid/:period/reopen', authenticateToken, requireMaster, a
   }
 
   try {
-    const atual = await db.query(
-      'SELECT id, closed_at, asaas_payment_id, status FROM public.invoices WHERE uid = $1 AND period = $2',
-      [uid, period]
-    );
-    if (atual.rowCount === 0) {
-      return res.status(404).json({ error: 'Não há fatura desta competência para este cliente.' });
-    }
-    if (!atual.rows[0].closed_at) {
-      return res.json({ ok: true, alreadyOpen: true, message: 'Esta competência já está aberta.' });
-    }
-    if (atual.rows[0].asaas_payment_id && !force) {
-      return res.status(409).json({
-        error: 'Esta competência já tem cobrança emitida. Reabrir faz o total voltar a mudar e ele pode '
-          + 'divergir do documento enviado ao cliente. Repita com force=1 para assumir isso.',
-        code: 'has_external_charge',
-        paymentId: atual.rows[0].asaas_payment_id,
-      });
-    }
+    /* A checagem "já tem cobrança?" e o UPDATE acontecem sob o mesmo lock da
+     * emissão. Sem isso, a reabertura passava na checagem enquanto uma emissão
+     * em andamento criava a cobrança, e a competência ficava aberta COM
+     * cobrança emitida, sem o aviso de force=1. */
+    return await withBillingLock('invoice', `${uid}:${period}`, async (client) => {
+      const atual = await client.query(
+        'SELECT id, closed_at, asaas_payment_id, status FROM public.invoices WHERE uid = $1 AND period = $2',
+        [uid, period]
+      );
+      if (atual.rowCount === 0) {
+        return res.status(404).json({ error: 'Não há fatura desta competência para este cliente.' });
+      }
+      if (!atual.rows[0].closed_at) {
+        return res.json({ ok: true, alreadyOpen: true, message: 'Esta competência já está aberta.' });
+      }
+      if (atual.rows[0].asaas_payment_id && !force) {
+        return res.status(409).json({
+          error: 'Esta competência já tem cobrança emitida. Reabrir faz o total voltar a mudar e ele pode '
+            + 'divergir do documento enviado ao cliente. Repita com force=1 para assumir isso.',
+          code: 'has_external_charge',
+          paymentId: atual.rows[0].asaas_payment_id,
+        });
+      }
 
-    const { rows } = await db.query(`
-      UPDATE public.invoices
-         SET closed_at = NULL, closed_by = NULL
-       WHERE uid = $1 AND period = $2
-       RETURNING id, uid, period, total_amount, status, closed_at;
-    `, [uid, period]);
+      const { rows } = await client.query(`
+        UPDATE public.invoices
+           SET closed_at = NULL, closed_by = NULL
+         WHERE uid = $1 AND period = $2
+         RETURNING id, uid, period, total_amount, status, closed_at;
+      `, [uid, period]);
 
-    console.log(`[Cobrança] Competência ${period} de ${uid} REABERTA por ${req.user.email || req.user.uid}`
-      + `${force ? ' (forçado, havia cobrança emitida)' : ''}.`);
-    res.json({ ok: true, invoice: { ...rows[0], total_amount: parseFloat(rows[0].total_amount) } });
+      console.log(`[Cobrança] Competência ${period} de ${uid} REABERTA por ${req.user.email || req.user.uid}`
+        + `${force ? ' (forçado, havia cobrança emitida)' : ''}.`);
+      return res.json({ ok: true, invoice: { ...rows[0], total_amount: parseFloat(rows[0].total_amount) } });
+    });
   } catch (err) {
+    if (err?.name === 'AsaasError' && err.code === 'billing_busy') {
+      return responderErroAsaas(res, err, `reabrir competência ${period} de ${uid}`);
+    }
     console.error(`Erro ao reabrir a competência ${period} de ${uid}:`, err);
-    res.status(500).json({ error: 'Erro interno ao reabrir a competência.' });
+    return res.status(500).json({ error: 'Erro interno ao reabrir a competência.' });
   }
 });
 
@@ -1205,16 +1268,11 @@ async function recalculateDuplicatedStorageInvoices() {
  * CONFIRMED conta como pago, e isso importa: no cartão de crédito o RECEIVED só
  * chega 32 dias depois do CONFIRMED (o dinheiro fica retido). Esperar RECEIVED
  * deixaria quem pagou com cartão aparecendo como devedor por um mês. */
-const ASAAS_PAGO = ['CONFIRMED', 'RECEIVED', 'RECEIVED_IN_CASH'];
+const ASAAS_PAGO = ['CONFIRMED', 'RECEIVED', 'RECEIVED_IN_CASH', 'DUNNING_RECEIVED'];
 
-/* Estorno e chargeback DESFAZEM a baixa. É o único caso em que o provedor pode
- * rebaixar uma fatura paga: OVERDUE não rebaixa nada, senão uma fatura que o
- * cliente pagou por PIX fora do sistema e o master baixou na mão voltaria
- * sozinha para pendente. */
-const ASAAS_ESTORNADO = [
-  'REFUNDED', 'REFUND_REQUESTED', 'REFUND_IN_PROGRESS',
-  'CHARGEBACK_REQUESTED', 'CHARGEBACK_DISPUTE', 'AWAITING_CHARGEBACK_REVERSAL',
-];
+/* Só estado FINAL desfaz a baixa. Pedido de estorno e disputa de chargeback
+ * ainda podem ser revertidos; reabrir a fatura nessa fase cobraria duas vezes. */
+const ASAAS_ESTORNADO = ['REFUNDED'];
 
 /**
  * Grava na fatura local o que o provedor diz sobre a cobrança.
@@ -1224,32 +1282,51 @@ const ASAAS_ESTORNADO = [
  * baixa manual do master é preservada.
  */
 async function aplicarCobrancaNaFatura(client, { uid, period, cobranca }) {
-  const statusProvedor = String(cobranca?.status || '').toUpperCase();
-  const pago = ASAAS_PAGO.includes(statusProvedor);
-  const estornado = ASAAS_ESTORNADO.includes(statusProvedor);
+  /* A conferência mora no ÚNICO ponto que aplica estado do Asaas. Assim emissão,
+   * sync, alteração e webhook não conseguem esquecer cliente/referência/valor.
+   * FOR UPDATE serializa o efeito dentro da transação local. */
+  const faturaResult = await client.query(`
+    SELECT i.id, i.uid, i.period, i.total_amount, i.asaas_payment_id,
+           u.asaas_customer_id
+      FROM public.invoices i
+      JOIN public.users u ON u.uid = i.uid
+     WHERE i.uid = $1 AND i.period = $2
+     FOR UPDATE OF i
+  `, [uid, period]);
+  if (faturaResult.rowCount === 0) {
+    throw new asaas.AsaasError('Fatura não encontrada para aplicar a cobrança.', {
+      status: 404,
+      code: 'invoice_not_found',
+    });
+  }
+  const fatura = faturaResult.rows[0];
+  assertPaymentMatchesInvoice(cobranca, fatura);
+
+  const removida = cobranca?.deleted === true;
+  const statusProvedor = removida ? 'DELETED' : String(cobranca?.status || '').toUpperCase();
+  const pago = !removida && ASAAS_PAGO.includes(statusProvedor);
+  const estornado = !removida && ASAAS_ESTORNADO.includes(statusProvedor);
 
   await client.query(`
     UPDATE public.invoices
        SET asaas_payment_id = $1,
            asaas_status = $2,
-           asaas_invoice_url = $3,
+           asaas_invoice_url = COALESCE($3, asaas_invoice_url),
            asaas_synced_at = NOW()
-     WHERE uid = $4 AND period = $5
-  `, [cobranca.id, statusProvedor || null, cobranca.invoiceUrl || null, uid, period]);
+     WHERE id = $4
+  `, [cobranca.id, statusProvedor || null, cobranca.invoiceUrl || null, fatura.id]);
 
   if (pago) {
-    /* `paid_by` recebe 'asaas' e não um e-mail: quem deu a baixa foi o
-     * provedor, e essa distinção é o que permite auditar depois se o valor
-     * entrou de fato ou se alguém marcou à mão. `paymentDate` do provedor
-     * quando vier; senão, hoje. */
+    const paymentDate = [cobranca.paymentDate, cobranca.clientPaymentDate, cobranca.confirmedDate]
+      .find(isValidIsoDate) || null;
     await client.query(`
       UPDATE public.invoices
          SET status = 'paid',
              payment_date = COALESCE($1::date, CURRENT_DATE),
              paid_at = COALESCE(paid_at, NOW()),
              paid_by = COALESCE(paid_by, 'asaas')
-       WHERE uid = $2 AND period = $3
-    `, [cobranca.paymentDate || cobranca.clientPaymentDate || null, uid, period]);
+       WHERE id = $2
+    `, [paymentDate, fatura.id]);
     return { statusLocal: 'paid', statusProvedor };
   }
 
@@ -1257,8 +1334,8 @@ async function aplicarCobrancaNaFatura(client, { uid, period, cobranca }) {
     await client.query(`
       UPDATE public.invoices
          SET status = 'pending', payment_date = NULL, paid_at = NULL, paid_by = NULL
-       WHERE uid = $1 AND period = $2
-    `, [uid, period]);
+       WHERE id = $1
+    `, [fatura.id]);
     return { statusLocal: 'pending', statusProvedor };
   }
 
@@ -1266,8 +1343,8 @@ async function aplicarCobrancaNaFatura(client, { uid, period, cobranca }) {
 }
 
 /** Carrega a fatura com o que a emissão precisa validar. */
-async function carregarFaturaParaCobranca(uid, period) {
-  const { rows } = await db.query(`
+async function carregarFaturaParaCobranca(uid, period, executor = db) {
+  const { rows } = await executor.query(`
     SELECT i.id, i.uid, i.period, i.due_date, i.total_amount, i.status, i.closed_at,
            i.asaas_payment_id, i.asaas_status, i.asaas_invoice_url,
            u.name AS client_name, u.email AS client_email, u.asaas_customer_id
@@ -1307,8 +1384,23 @@ router.post('/invoices/:uid/:period/charge', authenticateToken, requireMaster, a
     return res.status(400).json({ error: 'Competência inválida. Use o formato AAAA-MM.' });
   }
 
+  const forma = normalizeBillingType(billingType);
+  if (!forma) {
+    return res.status(400).json({
+      error: 'Forma de cobrança inválida. Use UNDEFINED, BOLETO, CREDIT_CARD ou PIX.',
+      code: 'invalid_billing_type',
+    });
+  }
+  if (description !== undefined && description !== null && typeof description !== 'string') {
+    return res.status(400).json({ error: 'A descrição da cobrança deve ser um texto.' });
+  }
+  if (description && description.length > 500) {
+    return res.status(400).json({ error: 'A descrição da cobrança deve ter no máximo 500 caracteres.' });
+  }
+
   try {
-    const fatura = await carregarFaturaParaCobranca(uid, period);
+    return await withBillingLock('invoice', `${uid}:${period}`, async (lockClient) => {
+      const fatura = await carregarFaturaParaCobranca(uid, period, lockClient);
     if (!fatura) {
       return res.status(404).json({ error: 'Não há fatura desta competência para este cliente.' });
     }
@@ -1348,12 +1440,12 @@ router.post('/invoices/:uid/:period/charge', authenticateToken, requireMaster, a
     /* Vencimento no passado é recusado pelo provedor. Em vez de trocar a data em
      * silêncio — o que faria a cobrança vencer num dia diferente do que a tela
      * mostra — a rota recusa e pede a data nova explicitamente. */
-    const hoje = new Date().toISOString().slice(0, 10);
+    const hoje = hojeNoBrasil();
     const vencimentoFatura = new Date(fatura.due_date).toISOString().slice(0, 10);
     const vencimento = vencimentoInformado || vencimentoFatura;
 
-    if (!/^\d{4}-\d{2}-\d{2}$/.test(vencimento)) {
-      return res.status(400).json({ error: 'Data de vencimento inválida. Use AAAA-MM-DD.' });
+    if (!isValidIsoDate(vencimento)) {
+      return res.status(400).json({ error: 'Data de vencimento inválida. Use uma data real em AAAA-MM-DD.' });
     }
     if (vencimento < hoje) {
       return res.status(422).json({
@@ -1368,24 +1460,52 @@ router.post('/invoices/:uid/:period/charge', authenticateToken, requireMaster, a
     const descricao = description
       || `CyberDock - Fatura ${period} - ${fatura.client_name || fatura.client_email}`;
 
+    // Consulta antes do dry-run: prova chave/rede e detecta a cobrança criada
+    // cujo vínculo local se perdeu. Ela só é adotada se cliente, referência e
+    // valor forem exatamente os desta fatura.
+    const existente = await asaas.findPaymentByInvoice(uid, period);
+    if (existente) assertPaymentMatchesInvoice(existente, fatura);
+
     if (dryRun) {
+      let clienteRemoto;
+      try {
+        clienteRemoto = await asaas.getCustomer(fatura.asaas_customer_id);
+      } catch (erro) {
+        if (!(erro?.name === 'AsaasError' && erro.status === 404)) throw erro;
+        return res.status(422).json({
+          error: 'O cadastro vinculado deste cliente não existe mais no Asaas. Vincule novamente antes de emitir.',
+          code: 'remote_customer_missing',
+        });
+      }
+      if (clienteRemoto?.deleted === true) {
+        return res.status(422).json({
+          error: 'O cadastro vinculado deste cliente foi removido no Asaas. Vincule novamente antes de emitir.',
+          code: 'remote_customer_missing',
+        });
+      }
       return res.json({
         dryRun: true,
+        environment: asaas.describe().environment,
+        client: { name: fatura.client_name || null, email: fatura.client_email || null },
         wouldSend: {
           customer: fatura.asaas_customer_id,
           value: valor,
           dueDate: vencimento,
           description: descricao,
-          billingType: billingType || 'UNDEFINED',
+          billingType: forma,
           externalReference: asaas.invoiceReference(uid, period),
         },
-        message: 'Nada foi criado no provedor e ninguém foi notificado.',
+        existingCharge: existente
+          ? { id: existente.id, status: existente.status, matches: true }
+          : null,
+        message: existente
+          ? 'Já existe uma cobrança desta competência no Asaas; a emissão real vai vinculá-la, sem criar outra.'
+          : 'Nada foi criado no provedor e ninguém foi notificado.',
       });
     }
 
-    // Camada 2 da idempotência: o provedor pode já ter a cobrança.
-    let cobranca = await asaas.findPaymentByInvoice(uid, period);
-    let adotada = Boolean(cobranca);
+    let cobranca = existente;
+    const adotada = Boolean(cobranca);
 
     if (!cobranca) {
       cobranca = await asaas.createPayment({
@@ -1395,7 +1515,7 @@ router.post('/invoices/:uid/:period/charge', authenticateToken, requireMaster, a
         description: descricao,
         uid,
         period,
-        ...(billingType ? { billingType } : {}),
+        billingType: forma,
       });
     }
 
@@ -1403,11 +1523,10 @@ router.post('/invoices/:uid/:period/charge', authenticateToken, requireMaster, a
       return res.status(502).json({ error: 'O provedor não devolveu o identificador da cobrança.' });
     }
 
-    const client = await db.pool.connect();
     try {
-      await client.query('BEGIN');
-      const aplicado = await aplicarCobrancaNaFatura(client, { uid, period, cobranca });
-      await client.query('COMMIT');
+      await lockClient.query('BEGIN');
+      const aplicado = await aplicarCobrancaNaFatura(lockClient, { uid, period, cobranca });
+      await lockClient.query('COMMIT');
 
       console.log(`[Cobrança] ${adotada ? 'Adotada' : 'Emitida'} cobrança ${cobranca.id} para ${uid} ${period} `
         + `no valor de ${valor} por ${req.user.email || req.user.uid}.`);
@@ -1424,7 +1543,8 @@ router.post('/invoices/:uid/:period/charge', authenticateToken, requireMaster, a
         dueDate: vencimento,
       });
     } catch (erro) {
-      await client.query('ROLLBACK').catch(() => {});
+      await lockClient.query('ROLLBACK').catch(() => {});
+      if (erro?.name === 'AsaasError') throw erro;
       /* A cobrança EXISTE no provedor e o vínculo não foi gravado. Não é 500
        * silencioso: a resposta entrega o id para não perder o rastro, e uma nova
        * tentativa vai adotá-la pela camada 2 em vez de duplicar. */
@@ -1435,9 +1555,8 @@ router.post('/invoices/:uid/:period/charge', authenticateToken, requireMaster, a
         code: 'link_failed',
         paymentId: cobranca.id,
       });
-    } finally {
-      client.release();
     }
+    });
   } catch (erro) {
     return responderErroAsaas(res, erro, `emitir cobrança de ${uid} ${period}`);
   }
@@ -1458,37 +1577,38 @@ router.post('/invoices/:uid/:period/charge/sync', authenticateToken, requireMast
   }
 
   try {
-    const fatura = await carregarFaturaParaCobranca(uid, period);
-    if (!fatura) return res.status(404).json({ error: 'Fatura não encontrada.' });
-    if (!fatura.asaas_payment_id) {
-      return res.status(409).json({
-        error: 'Esta competência não tem cobrança emitida.',
-        code: 'not_charged',
-      });
-    }
+    return await withBillingLock('invoice', `${uid}:${period}`, async (client) => {
+      const fatura = await carregarFaturaParaCobranca(uid, period, client);
+      if (!fatura) return res.status(404).json({ error: 'Fatura não encontrada.' });
+      if (!fatura.asaas_payment_id) {
+        return res.status(409).json({
+          error: 'Esta competência não tem cobrança emitida.',
+          code: 'not_charged',
+        });
+      }
 
-    const cobranca = await asaas.getPayment(fatura.asaas_payment_id);
+      // I/O ocorre sem transação aberta, mas ainda sob o lock distribuído.
+      const cobranca = await asaas.getPayment(fatura.asaas_payment_id);
+      assertPaymentMatchesInvoice(cobranca, fatura);
 
-    const client = await db.pool.connect();
-    try {
-      await client.query('BEGIN');
-      const aplicado = await aplicarCobrancaNaFatura(client, { uid, period, cobranca });
-      await client.query('COMMIT');
-      return res.json({
-        ok: true,
-        paymentId: cobranca.id,
-        status: cobranca.status,
-        statusLocal: aplicado.statusLocal,
-        invoiceUrl: cobranca.invoiceUrl || null,
-        value: cobranca.value,
-        dueDate: cobranca.dueDate,
-      });
-    } catch (erro) {
-      await client.query('ROLLBACK').catch(() => {});
-      throw erro;
-    } finally {
-      client.release();
-    }
+      try {
+        await client.query('BEGIN');
+        const aplicado = await aplicarCobrancaNaFatura(client, { uid, period, cobranca });
+        await client.query('COMMIT');
+        return res.json({
+          ok: true,
+          paymentId: cobranca.id,
+          status: cobranca.status,
+          statusLocal: aplicado.statusLocal,
+          invoiceUrl: cobranca.invoiceUrl || null,
+          value: cobranca.value,
+          dueDate: cobranca.dueDate,
+        });
+      } catch (erro) {
+        await client.query('ROLLBACK').catch(() => {});
+        throw erro;
+      }
+    });
   } catch (erro) {
     return responderErroAsaas(res, erro, `sincronizar cobrança de ${uid} ${period}`);
   }
@@ -1512,59 +1632,72 @@ router.patch('/invoices/:uid/:period/charge', authenticateToken, requireMaster, 
   if (!PERIODO_VALIDO.test(period)) {
     return res.status(400).json({ error: 'Competência inválida. Use o formato AAAA-MM.' });
   }
-  if (!/^\d{4}-\d{2}-\d{2}$/.test(String(dueDate || ''))) {
-    return res.status(400).json({ error: 'Informe a nova data de vencimento em AAAA-MM-DD.' });
+  if (!isValidIsoDate(dueDate)) {
+    return res.status(400).json({ error: 'Informe a nova data de vencimento em AAAA-MM-DD (uma data real).' });
   }
-  if (dueDate < new Date().toISOString().slice(0, 10)) {
+  if (dueDate < hojeNoBrasil()) {
     return res.status(422).json({ error: 'A nova data de vencimento não pode estar no passado.' });
   }
 
   try {
-    const fatura = await carregarFaturaParaCobranca(uid, period);
-    if (!fatura) return res.status(404).json({ error: 'Fatura não encontrada.' });
-    if (!fatura.asaas_payment_id) {
-      return res.status(409).json({ error: 'Esta competência não tem cobrança emitida.', code: 'not_charged' });
-    }
-    if (ASAAS_PAGO.includes(String(fatura.asaas_status || '').toUpperCase())) {
-      return res.status(409).json({
-        error: 'Esta cobrança já foi paga; o vencimento não muda mais.',
-        code: 'already_paid',
+    return await withBillingLock('invoice', `${uid}:${period}`, async (client) => {
+      const fatura = await carregarFaturaParaCobranca(uid, period, client);
+      if (!fatura) return res.status(404).json({ error: 'Fatura não encontrada.' });
+      if (!fatura.asaas_payment_id) {
+        return res.status(409).json({ error: 'Esta competência não tem cobrança emitida.', code: 'not_charged' });
+      }
+
+      /* A decisão usa o estado ATUAL do Asaas, não o cache local: o pagamento
+       * pode ter entrado enquanto o webhook estava pendente. */
+      const atual = await asaas.getPayment(fatura.asaas_payment_id);
+      assertPaymentMatchesInvoice(atual, fatura);
+      if (atual.deleted === true) {
+        return res.status(409).json({
+          error: 'Esta cobrança foi removida no Asaas. Cancele o vínculo local antes de emitir novamente.',
+          code: 'payment_deleted_remote',
+        });
+      }
+      if (ASAAS_PAGO.includes(String(atual.status || '').toUpperCase())) {
+        await client.query('BEGIN');
+        try {
+          await aplicarCobrancaNaFatura(client, { uid, period, cobranca: atual });
+          await client.query('COMMIT');
+        } catch (erro) {
+          await client.query('ROLLBACK').catch(() => {});
+          throw erro;
+        }
+        return res.status(409).json({
+          error: 'Esta cobrança já foi paga; o vencimento não muda mais. A baixa local foi sincronizada.',
+          code: 'already_paid',
+        });
+      }
+
+      const cobranca = await asaas.updatePayment(fatura.asaas_payment_id, {
+        value: atual.value,
+        dueDate,
+        description: atual.description,
+        billingType: atual.billingType,
       });
-    }
+      assertPaymentMatchesInvoice(cobranca, fatura);
 
-    /* O provedor exige valor e forma de pagamento nesta chamada mesmo quando não
-     * mudam, então releio a cobrança para reenviar o que já está lá — mandar o
-     * total local poderia sobrescrever um valor ajustado no painel do Asaas. */
-    const atual = await asaas.getPayment(fatura.asaas_payment_id);
-    const cobranca = await asaas.updatePayment(fatura.asaas_payment_id, {
-      value: atual.value,
-      dueDate,
-      description: atual.description,
-      billingType: atual.billingType,
+      try {
+        await client.query('BEGIN');
+        await aplicarCobrancaNaFatura(client, { uid, period, cobranca });
+        await client.query(
+          'UPDATE public.invoices SET due_date = $1::date WHERE uid = $2 AND period = $3',
+          [dueDate, uid, period]
+        );
+        await client.query('COMMIT');
+      } catch (erro) {
+        await client.query('ROLLBACK').catch(() => {});
+        throw erro;
+      }
+
+      console.log(`[Cobrança] Vencimento da cobrança ${fatura.asaas_payment_id} (${uid} ${period}) alterado `
+        + `para ${dueDate} por ${req.user.email || req.user.uid}.`);
+
+      return res.json({ ok: true, paymentId: cobranca.id, dueDate, status: cobranca.status });
     });
-
-    const client = await db.pool.connect();
-    try {
-      await client.query('BEGIN');
-      await aplicarCobrancaNaFatura(client, { uid, period, cobranca });
-      /* O vencimento local acompanha: a competência está fechada, então
-       * calculateAndSaveInvoice não vai sobrescrever isto depois. */
-      await client.query(
-        'UPDATE public.invoices SET due_date = $1::date WHERE uid = $2 AND period = $3',
-        [dueDate, uid, period]
-      );
-      await client.query('COMMIT');
-    } catch (erro) {
-      await client.query('ROLLBACK').catch(() => {});
-      throw erro;
-    } finally {
-      client.release();
-    }
-
-    console.log(`[Cobrança] Vencimento da cobrança ${fatura.asaas_payment_id} (${uid} ${period}) alterado `
-      + `para ${dueDate} por ${req.user.email || req.user.uid}.`);
-
-    return res.json({ ok: true, paymentId: cobranca.id, dueDate, status: cobranca.status });
   } catch (erro) {
     return responderErroAsaas(res, erro, `alterar cobrança de ${uid} ${period}`);
   }
@@ -1591,49 +1724,163 @@ router.delete('/invoices/:uid/:period/charge', authenticateToken, requireMaster,
   }
 
   try {
-    const fatura = await carregarFaturaParaCobranca(uid, period);
-    if (!fatura) return res.status(404).json({ error: 'Fatura não encontrada.' });
-    if (!fatura.asaas_payment_id) {
-      return res.json({ ok: true, alreadyClear: true, message: 'Esta competência não tem cobrança emitida.' });
-    }
-    if (ASAAS_PAGO.includes(String(fatura.asaas_status || '').toUpperCase())) {
-      return res.status(409).json({
-        error: 'Esta cobrança já foi paga e não pode ser cancelada. Estorno é feito no painel do provedor.',
-        code: 'already_paid',
-        paymentId: fatura.asaas_payment_id,
-      });
-    }
-
-    const paymentId = fatura.asaas_payment_id;
-
-    /* Cobrança que não existe mais no provedor (apagada no painel) devolve 404.
-     * Isso não impede limpar o vínculo daqui — insistir deixaria a fatura presa
-     * a um id morto, sem poder reemitir. */
-    try {
-      await asaas.deletePayment(paymentId);
-    } catch (erro) {
-      if (erro?.name === 'AsaasError' && erro.status === 404) {
-        console.warn(`[Cobrança] ${paymentId} não existe mais no provedor; limpando o vínculo local.`);
-      } else {
-        throw erro;
+    return await withBillingLock('invoice', `${uid}:${period}`, async (client) => {
+      const fatura = await carregarFaturaParaCobranca(uid, period, client);
+      if (!fatura) return res.status(404).json({ error: 'Fatura não encontrada.' });
+      if (!fatura.asaas_payment_id) {
+        return res.json({ ok: true, alreadyClear: true, message: 'Esta competência não tem cobrança emitida.' });
       }
-    }
 
-    await db.query(`
-      UPDATE public.invoices
-         SET asaas_payment_id = NULL, asaas_status = NULL,
-             asaas_invoice_url = NULL, asaas_synced_at = NOW()
-       WHERE uid = $1 AND period = $2
-    `, [uid, period]);
+      const paymentId = fatura.asaas_payment_id;
+      let remota = null;
+      try {
+        remota = await asaas.getPayment(paymentId);
+      } catch (erro) {
+        if (!(erro?.name === 'AsaasError' && erro.status === 404)) throw erro;
+        console.warn(`[Cobrança] ${paymentId} não existe mais no provedor; limpando o vínculo local.`);
+      }
 
-    console.log(`[Cobrança] Cobrança ${paymentId} de ${uid} ${period} cancelada por `
-      + `${req.user.email || req.user.uid}.`);
+      if (remota) {
+        // Para cancelar, valor divergente pode ser justamente o defeito a corrigir;
+        // identidade (id, referência e cliente) continua obrigatória.
+        assertPaymentMatchesInvoice(remota, fatura, { checkValue: false });
+        if (ASAAS_PAGO.includes(String(remota.status || '').toUpperCase())) {
+          // Traz a baixa atrasada, mas só depois da conferência COMPLETA do valor.
+          assertPaymentMatchesInvoice(remota, fatura);
+          try {
+            await client.query('BEGIN');
+            await aplicarCobrancaNaFatura(client, { uid, period, cobranca: remota });
+            await client.query('COMMIT');
+          } catch (erro) {
+            await client.query('ROLLBACK').catch(() => {});
+            throw erro;
+          }
+          return res.status(409).json({
+            error: 'Esta cobrança já foi paga e não pode ser cancelada. Estorno é feito no painel do provedor. '
+              + 'A baixa local foi sincronizada.',
+            code: 'already_paid',
+            paymentId,
+          });
+        }
+        if (remota.deleted !== true) await asaas.deletePayment(paymentId);
+      }
 
-    return res.json({ ok: true, paymentId, message: 'Cobrança cancelada e vínculo desfeito.' });
+      await client.query(`
+        UPDATE public.invoices
+           SET asaas_payment_id = NULL, asaas_status = NULL,
+               asaas_invoice_url = NULL, asaas_synced_at = NOW()
+         WHERE uid = $1 AND period = $2
+      `, [uid, period]);
+
+      console.log(`[Cobrança] Cobrança ${paymentId} de ${uid} ${period} cancelada por `
+        + `${req.user.email || req.user.uid}.`);
+
+      return res.json({ ok: true, paymentId, message: 'Cobrança cancelada e vínculo desfeito.' });
+    });
   } catch (erro) {
     return responderErroAsaas(res, erro, `cancelar cobrança de ${uid} ${period}`);
   }
 });
+
+/** Marca um evento armazenado como concluído (aplicado ou ignorado com motivo). */
+async function concluirEventoAsaas(executor, eventId, nota = null, referencia = null, paymentId = null) {
+  await executor.query(`
+    UPDATE public.asaas_webhook_events
+       SET processed_at = NOW(), error = $2,
+           uid = COALESCE($3, uid), period = COALESCE($4, period),
+           payment_id = COALESCE($5, payment_id)
+     WHERE event_id = $1
+  `, [eventId, nota, referencia?.uid || null, referencia?.period || null, paymentId]);
+}
+
+/**
+ * Reprocessável: relê a cobrança, deriva a fatura da referência RELIDA e só
+ * abre transação depois da chamada ao Asaas. Nunca confia no uid/período do
+ * body do webhook para dar baixa.
+ */
+async function processarEventoAsaas(eventId) {
+  const eventoResult = await db.query(`
+    SELECT event_id, event_type, payload, processed_at
+      FROM public.asaas_webhook_events
+     WHERE event_id = $1
+  `, [eventId]);
+  const evento = eventoResult.rows[0];
+  if (!evento) return { ok: false, error: 'Evento não encontrado.' };
+  if (evento.processed_at) return { ok: true, outcome: 'already_processed' };
+
+  const payload = evento.payload && typeof evento.payload === 'object' ? evento.payload : {};
+  const pagamentoBody = payload.payment && typeof payload.payment === 'object' ? payload.payment : {};
+  const paymentId = typeof pagamentoBody.id === 'string' ? pagamentoBody.id.slice(0, 40) : '';
+  if (!paymentId) {
+    await concluirEventoAsaas(db, eventId, 'Ignorado: evento sem cobrança.');
+    return { ok: true, outcome: 'ignored' };
+  }
+
+  try {
+    // I/O externo acontece ANTES de BEGIN.
+    const remota = await asaas.getPayment(paymentId, { timeoutMs: 10000 });
+    const referencia = parseInvoiceReference(remota?.externalReference);
+    if (!referencia) {
+      await concluirEventoAsaas(db, eventId, 'Ignorado: cobrança sem referência do CyberDock.', null, paymentId);
+      return { ok: true, outcome: 'ignored_foreign' };
+    }
+
+    const referenciaBody = parseInvoiceReference(pagamentoBody.externalReference);
+    if (referenciaBody
+      && (referenciaBody.uid !== referencia.uid || referenciaBody.period !== referencia.period)) {
+      throw new asaas.AsaasError(
+        'A referência da cobrança relida no Asaas diverge do evento. Nada foi alterado.',
+        { status: 409, code: 'payment_mismatch' }
+      );
+    }
+
+    return await withBillingLock('invoice', `${referencia.uid}:${referencia.period}`, async (client) => {
+      const local = await carregarFaturaParaCobranca(referencia.uid, referencia.period, client);
+      if (!local) {
+        throw new asaas.AsaasError('A fatura indicada pela cobrança não existe no CyberDock.', {
+          status: 404,
+          code: 'invoice_not_found',
+        });
+      }
+
+      /* Evento velho não pode religar cobrança cancelada/substituída. Cobrança
+       * viva sem vínculo pode ser adotada: é a recuperação do caso em que o
+       * Asaas criou e a gravação local falhou. */
+      if (local.asaas_payment_id && local.asaas_payment_id !== remota.id) {
+        await concluirEventoAsaas(client, eventId, 'Ignorado: a fatura já está vinculada a outra cobrança.', referencia, remota.id);
+        return { ok: true, outcome: 'ignored_old_payment' };
+      }
+      if (!local.asaas_payment_id && remota.deleted === true) {
+        await concluirEventoAsaas(client, eventId, 'Ignorado: cobrança cancelada e sem vínculo local.', referencia, remota.id);
+        return { ok: true, outcome: 'ignored_deleted' };
+      }
+
+      try {
+        await client.query('BEGIN');
+        const aplicado = await aplicarCobrancaNaFatura(client, {
+          uid: referencia.uid,
+          period: referencia.period,
+          cobranca: remota,
+        });
+        await concluirEventoAsaas(client, eventId, null, referencia, remota.id);
+        await client.query('COMMIT');
+        console.log(`[Cobrança] Webhook ${evento.event_type} aplicado a ${referencia.uid} ${referencia.period} `
+          + `(status ${aplicado.statusProvedor}).`);
+        return { ok: true, outcome: 'applied' };
+      } catch (erro) {
+        await client.query('ROLLBACK').catch(() => {});
+        throw erro;
+      }
+    });
+  } catch (erro) {
+    await db.query(
+      'UPDATE public.asaas_webhook_events SET error = $2 WHERE event_id = $1 AND processed_at IS NULL',
+      [eventId, String(erro?.message || erro).slice(0, 2000)]
+    ).catch(() => {});
+    console.error(`[Cobrança] Webhook ${eventId} recebido e NÃO aplicado: ${erro.message}`);
+    return { ok: false, error: erro.message };
+  }
+}
 
 /**
  * ===== Webhook do provedor =====
@@ -1652,13 +1899,14 @@ router.delete('/invoices/:uid/:period/charge', authenticateToken, requireMaster,
  * 2. Grava o evento com ON CONFLICT (event_id) DO NOTHING. A entrega é "at least
  *    once": o MESMO evento chega mais de uma vez, e a chave primária torna
  *    processar duas vezes impossível por construção.
- * 3. Responde 200 IMEDIATAMENTE. Depois de 15 falhas consecutivas o provedor
- *    pausa a fila, e evento não entregue se perde em 14 dias.
- * 4. Só então processa. Falha no processamento deixa `processed_at` nulo com o
- *    motivo em `error`, e não custa a fila.
+ * 3. Só confirma 200 DEPOIS de persistir. Falha de banco responde 500 para o
+ *    Asaas reenviar; confirmar sem armazenar perderia o pagamento para sempre.
+ * 4. Responde antes da chamada de rede (o Asaas espera no máximo 10 segundos).
+ * 5. Evento novo e duplicata ainda pendente são processados. A cobrança é
+ *    relida, e uid/período vêm da referência relida — nunca do body.
  *
- * Evento de qualquer erro responde 200 também: só o token errado responde 401.
- * Devolver erro por problema NOSSO é o caminho para a fila pausada.
+ * Trade-off conhecido: depois de 15 falhas consecutivas o Asaas pausa a fila.
+ * Se o banco ficar fora por tempo longo, é preciso reativá-la no painel.
  */
 router.post('/webhook/asaas', async (req, res) => {
   if (!asaas.isValidWebhookToken(req.get('asaas-access-token'))) {
@@ -1666,26 +1914,20 @@ router.post('/webhook/asaas', async (req, res) => {
     return res.status(401).json({ error: 'Token de webhook inválido.' });
   }
 
-  const evento = req.body || {};
-  const eventId = String(evento.id || '').slice(0, 120);
-  const eventType = String(evento.event || '').slice(0, 60) || null;
-  const cobranca = evento.payment || null;
+  const evento = req.body && typeof req.body === 'object' && !Array.isArray(req.body) ? req.body : {};
+  const eventId = typeof evento.id === 'string' ? evento.id.trim().slice(0, 120) : '';
+  const eventType = typeof evento.event === 'string' ? evento.event.slice(0, 60) : null;
+  const cobranca = evento.payment && typeof evento.payment === 'object' ? evento.payment : {};
 
-  /* Evento sem id não tem como ser deduplicado. Aceito e registro, porque
-   * recusar faria o provedor reenviar para sempre. */
   if (!eventId) {
     console.warn(`[Cobrança] Webhook sem id (event=${eventType}); nada a deduplicar.`);
     return res.status(200).json({ received: true, ignored: 'missing_event_id' });
   }
 
-  /* A referência externa é o que separa o que é nosso do que não é: no Asaas
-   * TUDO é payment, inclusive transferência recebida e PIX avulso que nada tem
-   * a ver com fatura. Sem o nosso prefixo, o evento é só arquivado. */
-  const referencia = String(cobranca?.externalReference || '');
-  const nosso = referencia.startsWith('cyberdock:invoice:');
-  const [, , uidEvento, periodoEvento] = nosso ? referencia.split(':') : [];
-
+  // A referência do body só ajuda a localizar o evento; a baixa usa a cobrança relida.
+  const referenciaBody = parseInvoiceReference(cobranca.externalReference);
   let novo = false;
+  let jaProcessado = false;
   try {
     const gravado = await db.query(`
       INSERT INTO public.asaas_webhook_events
@@ -1693,63 +1935,38 @@ router.post('/webhook/asaas', async (req, res) => {
       VALUES ($1, $2, $3, $4, $5, $6)
       ON CONFLICT (event_id) DO NOTHING
       RETURNING event_id
-    `, [eventId, eventType, cobranca?.id || null, uidEvento || null,
-      periodoEvento || null, JSON.stringify(evento)]);
+    `, [
+      eventId,
+      eventType,
+      typeof cobranca.id === 'string' ? cobranca.id.slice(0, 40) : null,
+      referenciaBody?.uid || null,
+      referenciaBody?.period || null,
+      JSON.stringify(evento),
+    ]);
     novo = gravado.rowCount > 0;
-  } catch (erro) {
-    // Não conseguir gravar não justifica derrubar a fila do provedor.
-    console.error('[Cobrança] Falha ao registrar evento de webhook:', erro.message);
-    return res.status(200).json({ received: true, stored: false });
-  }
-
-  // 200 antes de processar. Nada abaixo daqui pode alterar a resposta.
-  res.status(200).json({ received: true, duplicate: !novo });
-
-  if (!novo) return;
-  if (!nosso || !uidEvento || !periodoEvento) {
-    await db.query(
-      `UPDATE public.asaas_webhook_events SET processed_at = NOW(), error = $2 WHERE event_id = $1`,
-      [eventId, 'Evento sem referência do CyberDock; nenhuma fatura envolvida.']
-    ).catch(() => {});
-    return;
-  }
-
-  const client = await db.pool.connect();
-  try {
-    await client.query('BEGIN');
-
-    /* A verdade vem de getPayment, não do corpo do evento.
-     *
-     * A entrega é "at least once" e a retentativa pode inverter a ordem: dá para
-     * receber RECEIVED antes de CONFIRMED. Reler a cobrança pelo id elimina o
-     * problema de ordem inteiro — o provedor sempre responde o estado de agora. */
-    const atual = cobranca?.id ? await asaas.getPayment(cobranca.id) : null;
-    const efetiva = atual || cobranca;
-
-    if (efetiva?.id) {
-      await aplicarCobrancaNaFatura(client, {
-        uid: uidEvento, period: periodoEvento, cobranca: efetiva,
-      });
+    if (!novo) {
+      const existente = await db.query(
+        'SELECT processed_at FROM public.asaas_webhook_events WHERE event_id = $1',
+        [eventId]
+      );
+      jaProcessado = Boolean(existente.rows[0]?.processed_at);
     }
-
-    await client.query(
-      `UPDATE public.asaas_webhook_events SET processed_at = NOW(), error = NULL WHERE event_id = $1`,
-      [eventId]
-    );
-    await client.query('COMMIT');
-    console.log(`[Cobrança] Webhook ${eventType} aplicado a ${uidEvento} ${periodoEvento} `
-      + `(status ${efetiva?.status}).`);
   } catch (erro) {
-    await client.query('ROLLBACK').catch(() => {});
-    /* `processed_at` fica nulo com o motivo gravado: é o que permite
-     * reprocessar sem depender de o provedor reenviar. */
-    await db.query(
-      `UPDATE public.asaas_webhook_events SET error = $2 WHERE event_id = $1`,
-      [eventId, String(erro.message || erro).slice(0, 2000)]
-    ).catch(() => {});
-    console.error(`[Cobrança] Webhook ${eventId} recebido e NÃO aplicado: ${erro.message}`);
-  } finally {
-    client.release();
+    /* Sem persistência não existe garantia de recuperação. Responder 200 aqui
+     * descartava pagamentos para sempre; 500 faz o Asaas reenviar. */
+    console.error('[Cobrança] Falha ao registrar evento de webhook:', erro.message);
+    return res.status(500).json({ received: false, stored: false });
+  }
+
+  // Confirma rápido; processamento pode fazer chamada de rede.
+  res.status(200).json({ received: true, duplicate: !novo });
+  if (jaProcessado) return;
+
+  // Evento novo OU duplicata ainda pendente: ambos podem ser processados.
+  try {
+    await processarEventoAsaas(eventId);
+  } catch (erro) {
+    console.error(`[Cobrança] Erro inesperado ao processar webhook ${eventId}:`, erro.message);
   }
 });
 
@@ -1773,6 +1990,47 @@ router.get('/webhook/asaas/pending', authenticateToken, requireMaster, async (re
   } catch (erro) {
     console.error('Erro ao listar eventos de webhook pendentes:', erro);
     res.status(500).json({ error: 'Erro ao listar eventos pendentes.' });
+  }
+});
+
+/** Reprocessa pendentes em série, relendo cada cobrança no Asaas. */
+router.post('/webhook/asaas/reprocess', authenticateToken, requireMaster, async (req, res) => {
+  const requested = Number.parseInt(req.body?.limit, 10);
+  const limit = Number.isFinite(requested) ? Math.min(Math.max(requested, 1), 100) : 25;
+  try {
+    const { rows } = await db.query(`
+      SELECT event_id, event_type
+        FROM public.asaas_webhook_events
+       WHERE processed_at IS NULL
+       ORDER BY received_at ASC
+       LIMIT $1
+    `, [limit]);
+
+    const results = [];
+    for (const event of rows) {
+      const result = await processarEventoAsaas(event.event_id);
+      results.push({
+        eventId: event.event_id,
+        eventType: event.event_type,
+        ok: result.ok,
+        outcome: result.outcome || (result.ok ? 'processed' : 'failed'),
+        ...(result.error ? { error: result.error } : {}),
+      });
+    }
+    const remaining = await db.query(
+      'SELECT COUNT(*)::int AS total FROM public.asaas_webhook_events WHERE processed_at IS NULL'
+    );
+    return res.json({
+      ok: true,
+      attempted: results.length,
+      processed: results.filter((item) => item.ok).length,
+      failed: results.filter((item) => !item.ok).length,
+      remaining: remaining.rows[0].total,
+      results,
+    });
+  } catch (erro) {
+    console.error('Erro ao reprocessar eventos de webhook pendentes:', erro);
+    return res.status(500).json({ error: 'Erro ao reprocessar eventos pendentes.' });
   }
 });
 

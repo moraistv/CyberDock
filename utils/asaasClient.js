@@ -1,9 +1,9 @@
 /**
  * Adaptador HTTP do Asaas.
  *
- * Este arquivo é a ÚNICA parte do sistema que sabe que o Asaas existe. Nenhuma
- * rota o usa ainda: ele entra primeiro, isolado e desligado, para que a decisão
- * de ligar seja de configuração e não de código.
+ * Este arquivo é a ÚNICA parte do sistema que sabe como falar HTTP com o Asaas.
+ * As rotas de cobrança usam apenas estas funções; ligar ou desligar continua
+ * sendo decisão do ambiente, nunca de segredo gravado no código.
  *
  * Três regras que valem para qualquer coisa que mova dinheiro:
  *
@@ -37,11 +37,28 @@ function ambiente() {
 }
 
 function baseUrl() {
-  return process.env.ASAAS_BASE_URL || AMBIENTES[ambiente()];
+  const override = String(process.env.ASAAS_BASE_URL || '').trim().replace(/\/$/, '');
+  /* Override existe só para mock local. Em produção, permitir outro host faria a
+   * chave sair no header access_token para um endereço arbitrário por erro de
+   * configuração. */
+  if (override && String(process.env.NODE_ENV || '').toLowerCase() !== 'production') {
+    return override;
+  }
+  return AMBIENTES[ambiente()];
 }
 
 function apiKey() {
   return (process.env.ASAAS_API_KEY || '').trim();
+}
+
+function webhookToken() {
+  return (process.env.ASAAS_WEBHOOK_TOKEN || '').trim();
+}
+
+function hasValidWebhookToken() {
+  const token = webhookToken();
+  const bytes = Buffer.byteLength(token, 'utf8');
+  return bytes >= 32 && bytes <= 255;
 }
 
 /** Integração utilizável? Sem chave, nada é tentado. */
@@ -58,7 +75,8 @@ function describe() {
     baseUrl: baseUrl(),
     // Só o suficiente para conferir que é a chave certa, sem expor o segredo.
     apiKeyPreview: chave ? `...${chave.slice(-4)}` : null,
-    webhookTokenConfigured: Boolean((process.env.ASAAS_WEBHOOK_TOKEN || '').trim()),
+    webhookTokenConfigured: hasValidWebhookToken(),
+    webhookTokenInvalid: Boolean(webhookToken()) && !hasValidWebhookToken(),
   };
 }
 
@@ -104,6 +122,7 @@ async function request(method, path, { body = null, query = null, timeoutMs = 20
   const timer = setTimeout(() => controller.abort(), timeoutMs);
 
   let resposta;
+  let texto;
   try {
     resposta = await fetch(url.toString(), {
       method,
@@ -117,6 +136,10 @@ async function request(method, path, { body = null, query = null, timeoutMs = 20
       body: body ? JSON.stringify(body) : undefined,
       signal: controller.signal,
     });
+    /* O timeout só pode acabar DEPOIS do body. Antes ele era limpo assim que os
+     * headers chegavam; um servidor que entregasse headers e travasse o corpo
+     * segurava a requisição para sempre. */
+    texto = await resposta.text();
   } catch (error) {
     const abortou = error.name === 'AbortError';
     throw new AsaasError(
@@ -129,7 +152,6 @@ async function request(method, path, { body = null, query = null, timeoutMs = 20
     clearTimeout(timer);
   }
 
-  const texto = await resposta.text();
   let dados = null;
   if (texto) {
     try { dados = JSON.parse(texto); } catch { dados = { raw: texto }; }
@@ -175,6 +197,11 @@ async function findCustomerByCpfCnpj(cpfCnpj) {
   return dados?.data?.[0] || null;
 }
 
+/** Relê um cadastro já vinculado; usado pelo diagnóstico/dry-run. */
+async function getCustomer(customerId, { timeoutMs = 10000 } = {}) {
+  return request('GET', `/customers/${encodeURIComponent(customerId)}`, { timeoutMs });
+}
+
 /* Endereço do pagador.
  *
  * Obrigatório para BOLETO: sem CEP e número o provedor recusa a emissão. PIX e
@@ -211,7 +238,7 @@ async function updateCustomer(customerId, {
   name, cpfCnpj, email, phone,
   postalCode, address, addressNumber, addressComplement, province,
 }) {
-  return request('POST', `/customers/${encodeURIComponent(customerId)}`, {
+  return request('PUT', `/customers/${encodeURIComponent(customerId)}`, {
     body: {
       name,
       cpfCnpj,
@@ -267,8 +294,8 @@ async function createPayment({
   });
 }
 
-async function getPayment(paymentId) {
-  return request('GET', `/payments/${encodeURIComponent(paymentId)}`);
+async function getPayment(paymentId, { timeoutMs = 20000 } = {}) {
+  return request('GET', `/payments/${encodeURIComponent(paymentId)}`, { timeoutMs });
 }
 
 /**
@@ -321,8 +348,10 @@ async function ping() {
  * Comparação de tamanho fixo para não vazar o token pelo tempo de resposta.
  */
 function isValidWebhookToken(recebido) {
-  const esperado = (process.env.ASAAS_WEBHOOK_TOKEN || '').trim();
-  if (!esperado) return false;
+  const esperado = webhookToken();
+  /* O Asaas aceita token de 32 a 255 caracteres. Recusar configuração curta é
+   * melhor que transformar "abc" numa credencial de baixa financeira. */
+  if (!hasValidWebhookToken()) return false;
 
   const a = Buffer.from(String(recebido || ''));
   const b = Buffer.from(esperado);
@@ -342,6 +371,7 @@ module.exports = {
   invoiceReference,
   findCustomerByExternalReference,
   findCustomerByCpfCnpj,
+  getCustomer,
   createCustomer,
   updateCustomer,
   findPaymentByInvoice,

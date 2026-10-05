@@ -23,6 +23,13 @@
 const crypto = require('crypto');
 const fetch = require('node-fetch');
 const db = require('./postgres');
+const {
+  normalizeTikTokError,
+  isAuthFailure,
+  sanitizeProviderText,
+  describeTikTokError,
+  toLastErrorText,
+} = require('./tiktokErrors');
 
 const TIKTOK_AUTH_HOST = 'https://auth.tiktok-shops.com';
 const TIKTOK_API_HOST = 'https://open-api.tiktokglobalshop.com';
@@ -68,16 +75,49 @@ function missingTikTokCredentials() {
  * `retryable` cobre throttling (HTTP 429 ou código 36009002, que a doc trata
  * como o MESMO sinal), 5xx, timeout e falha de rede. Erro funcional não é
  * repetido: repetir não muda a resposta e só gasta cota da loja.
+ *
+ * `.message` é SEMPRE a mensagem PT-BR normalizada (utils/tiktokErrors.js) e
+ * pode ir para a tela. O texto cru do provedor (inglês) não entra nela: o
+ * primeiro argumento, ou `providerMessage` quando informado, vira a propriedade
+ * `providerMessage`, já sanitizada (sem segredos nem query string), SÓ para log.
+ * `category`, `errorCode` e `userMessage` servem para o chamador forçar a
+ * classificação de falhas que não vieram do envelope do TikTok (rede, timeout).
  */
 class TikTokApiError extends Error {
-  constructor(message, { httpStatus = null, code = null, retryAfterMs = null, requestId = null, retryable = false } = {}) {
-    super(message);
+  constructor(message, {
+    httpStatus = null,
+    code = null,
+    retryAfterMs = null,
+    requestId = null,
+    retryable = false,
+    providerMessage = null,
+    category = null,
+    errorCode = null,
+    userMessage = null,
+    operation = null,
+  } = {}) {
+    const normalized = normalizeTikTokError({
+      name: 'TikTokApiError',
+      httpStatus,
+      code,
+      requestId,
+      retryable,
+      category,
+      errorCode,
+      userMessage,
+      providerMessage: providerMessage ?? message ?? '',
+    }, { operation });
+    super(normalized.userMessage);
     this.name = 'TikTokApiError';
     this.httpStatus = httpStatus;
     this.code = code;
     this.retryAfterMs = retryAfterMs;
-    this.requestId = requestId;
-    this.retryable = retryable;
+    this.requestId = normalized.requestId;
+    this.retryable = normalized.retryable;
+    this.providerMessage = normalized.providerMessage;
+    this.category = normalized.category;
+    this.errorCode = normalized.errorCode;
+    this.userMessage = normalized.userMessage;
   }
 
   get isRateLimited() {
@@ -96,7 +136,8 @@ class TikTokApiError extends Error {
    * assinatura também conta, porque a doc devolve 401 para token vencido.
    */
   get isInvalidToken() {
-    if (this.isSignatureError) return false;
+    // Falta de escopo (105005) está na família 105xxx, mas renovar o token não resolve.
+    if (this.isSignatureError || this.category === 'permission') return false;
     if (this.code !== null && this.code >= 105000 && this.code < 106000) return true;
     return this.httpStatus === 401;
   }
@@ -164,27 +205,37 @@ async function fetchEnvelope(url, init, operation, timeoutMs) {
 
   try {
     let response;
+    let text;
     try {
       response = await fetch(url, { ...init, signal: controller.signal });
+      // O corpo também pode estourar o timeout (AbortError) ou cair no meio da leitura.
+      text = await response.text();
     } catch (error) {
-      const timedOut = error?.name === 'AbortError';
-      throw new TikTokApiError(
-        timedOut
-          ? `TikTok ${operation}: tempo limite de ${Math.ceil(timeoutMs / 1000)}s excedido.`
-          : `TikTok ${operation}: falha de rede (${error.message}).`,
-        { retryable: true }
-      );
+      const timedOut = error?.name === 'AbortError' || error?.type === 'aborted' || error?.type === 'body-timeout';
+      // error.message do node-fetch traz a URL COMPLETA (sign, app_secret, tokens na
+      // query): vai só para providerMessage, que sanitiza. Nunca para o .message.
+      const reason = timedOut ? `tempo limite de ${Math.ceil(timeoutMs / 1000)}s excedido` : 'falha de rede';
+      throw new TikTokApiError(reason, {
+        retryable: true,
+        category: timedOut ? 'timeout' : 'network',
+        providerMessage: `${reason}: ${error?.message || error?.code || 'sem detalhe'}`,
+        operation,
+      });
     }
 
-    const text = await response.text();
     let payload = null;
     if (text) {
       try {
         payload = JSON.parse(text);
       } catch {
-        throw new TikTokApiError(`TikTok ${operation}: resposta JSON inválida (HTTP ${response.status}).`, {
+        // Corpo que não é JSON (página de gateway/WAF): o HTTP 401/403 dele não é falha
+        // do token do vendedor, então a categoria é forçada em vez de inferida pelo status.
+        throw new TikTokApiError(`resposta JSON inválida (HTTP ${response.status})`, {
           httpStatus: response.status,
           retryable: response.status === 429 || response.status >= 500,
+          category: response.status === 429 ? 'rate_limit' : 'provider',
+          errorCode: response.status === 429 ? null : 'TIKTOK_INVALID_RESPONSE',
+          operation,
         });
       }
     }
@@ -194,24 +245,27 @@ async function fetchEnvelope(url, init, operation, timeoutMs) {
     const requestId = typeof payload?.request_id === 'string' ? payload.request_id : null;
 
     if (!response.ok || (code !== null && code !== 0)) {
-      const detail = payload?.message ? ` - ${payload.message}` : '';
-      const error = new TikTokApiError(
-        `TikTok ${operation}: HTTP ${response.status} código ${code ?? '-'}${detail}`,
-        {
-          httpStatus: response.status,
-          code,
-          retryAfterMs,
-          requestId,
-          retryable: response.status === 429 || response.status >= 500 || code === 36009002,
-        }
-      );
-      throw error;
+      // `payload.message` é o texto em inglês do TikTok: só providerMessage (log).
+      throw new TikTokApiError(`HTTP ${response.status} código ${code ?? '-'}`, {
+        httpStatus: response.status,
+        code,
+        retryAfterMs,
+        requestId,
+        retryable: response.status === 429 || response.status >= 500 || code === 36009002,
+        providerMessage: typeof payload?.message === 'string' && payload.message
+          ? payload.message
+          : null,
+        operation,
+      });
     }
 
     if (payload === null) {
-      throw new TikTokApiError(`TikTok ${operation}: resposta vazia.`, {
+      throw new TikTokApiError('resposta vazia', {
         httpStatus: response.status,
         retryable: true,
+        category: 'provider',
+        errorCode: 'TIKTOK_INVALID_RESPONSE',
+        operation,
       });
     }
 
@@ -241,7 +295,12 @@ async function tiktokApiCall({
 }) {
   const { appKey, appSecret } = getTikTokCredentials();
   if (!appKey || !appSecret) {
-    throw new TikTokApiError('Credenciais TikTok Shop ausentes no servidor.', { retryable: false });
+    throw new TikTokApiError('credenciais do aplicativo ausentes no servidor', {
+      retryable: false,
+      category: 'unknown',
+      errorCode: 'TIKTOK_SERVER_CONFIG',
+      operation,
+    });
   }
 
   // Serializa UMA vez: a mesma string é assinada e enviada em todas as tentativas.
@@ -251,7 +310,11 @@ async function tiktokApiCall({
   for (let attempt = 0; attempt <= maxRetries; attempt += 1) {
     const remainingMs = deadlineAt - Date.now();
     if (remainingMs <= 0) {
-      const deadlineError = new TikTokApiError(`TikTok ${operation}: prazo total da sincronização excedido.`);
+      const deadlineError = new TikTokApiError(`prazo total da sincronização excedido em ${operation}`, {
+        category: 'timeout',
+        errorCode: 'TIKTOK_JOB_TIMEOUT',
+        operation,
+      });
       deadlineError.code = 'TIKTOK_JOB_TIMEOUT';
       throw deadlineError;
     }
@@ -331,7 +394,11 @@ function resolveExpiry(value, marginSeconds = 300) {
 async function tokenCall(path, params, operation) {
   const { appKey, appSecret } = getTikTokCredentials();
   if (!appKey || !appSecret) {
-    throw new TikTokApiError('Credenciais TikTok Shop ausentes no servidor.');
+    throw new TikTokApiError('credenciais do aplicativo ausentes no servidor', {
+      category: 'unknown',
+      errorCode: 'TIKTOK_SERVER_CONFIG',
+      operation,
+    });
   }
 
   const url = new URL(`${TIKTOK_AUTH_HOST}${path}`);
@@ -346,7 +413,11 @@ async function tokenCall(path, params, operation) {
   const accessToken = nonEmptyString(data.access_token);
   const refreshToken = nonEmptyString(data.refresh_token);
   if (!accessToken || !refreshToken) {
-    throw new TikTokApiError(`TikTok ${operation}: resposta sem access_token/refresh_token.`);
+    throw new TikTokApiError('resposta sem os tokens de acesso', {
+      category: 'provider',
+      errorCode: 'TIKTOK_INVALID_RESPONSE',
+      operation,
+    });
   }
 
   return {
@@ -374,6 +445,36 @@ function refreshTikTokAccessToken(refreshToken) {
     refresh_token: refreshToken,
     grant_type: 'refresh_token',
   }, 'renovar token');
+}
+
+/** Falha que não desconecta a conta: o chamador pode tentar de novo depois. */
+function markRetryable(error) {
+  if (error && typeof error === 'object') error.retryable = true;
+  return error;
+}
+
+/**
+ * Registra o último erro (PT-BR) nos cursores de sincronização da loja e das
+ * irmãs que dividem a mesma autorização. tiktok_accounts não tem coluna
+ * last_error; o cursor é o que o /last-sync já expõe. Melhor esforço: uma falha
+ * aqui vira só aviso e nunca mascara o erro original.
+ */
+async function recordAccountLastError(executor, account, openId, failure) {
+  try {
+    await executor.query(
+      `UPDATE public.tiktok_sync_cursors
+          SET last_error = $4, updated_at = NOW()
+        WHERE uid = $1
+          AND shop_id IN (
+            SELECT shop_id
+              FROM public.tiktok_accounts
+             WHERE uid = $1 AND (shop_id = $2 OR ($3::text IS NOT NULL AND open_id = $3))
+          )`,
+      [account.uid, account.shopId, openId, toLastErrorText(failure)]
+    );
+  } catch (writeError) {
+    console.warn(`[tiktok] não foi possível registrar o último erro da loja ${account.shopId}: ${writeError.code || 'falha no banco'}`);
+  }
 }
 
 /**
@@ -410,7 +511,12 @@ async function ensureTikTokAccessToken(account, { force = false } = {}) {
     );
     const row = current.rows[0];
     if (!row) {
-      throw new TikTokApiError('Loja TikTok Shop não encontrada para renovar o token.');
+      throw new TikTokApiError('loja não encontrada para renovar o token', {
+        category: 'not_found',
+        errorCode: 'TIKTOK_ACCOUNT_NOT_FOUND',
+        userMessage: 'A loja TikTok Shop não foi encontrada no CyberDock. Atualize a página e, se persistir, reconecte a conta.',
+        operation: 'renovar token',
+      });
     }
 
     const storedExpiry = row.expires_at ? new Date(row.expires_at).getTime() : 0;
@@ -428,16 +534,29 @@ async function ensureTikTokAccessToken(account, { force = false } = {}) {
     try {
       refreshed = await refreshTikTokAccessToken(row.refresh_token);
     } catch (error) {
-      // Refresh recusado: a autorização precisa ser refeita pelo vendedor.
-      const permanent = !error.retryable;
-      await client.query(
-        `UPDATE public.tiktok_accounts
-            SET status = $3, updated_at = NOW()
-          WHERE uid = $1 AND (shop_id = $2 OR ($4::text IS NOT NULL AND open_id = $4))`,
-        [account.uid, account.shopId, permanent ? 'reconnect_needed' : 'error', row.open_id]
-      );
+      // Só a recusa da AUTORIZAÇÃO (refresh token inválido, vencido ou revogado) exige
+      // que o vendedor autorize de novo. Rede, 5xx, limite de requisições, validação e
+      // configuração do servidor NÃO desconectam a conta: a próxima tentativa pode dar
+      // certo. Antes, qualquer erro não repetível virava 'reconnect_needed'.
+      const failure = normalizeTikTokError(error, { operation: 'renovar token' });
+      const needsReconnect = isAuthFailure(failure);
+      if (needsReconnect) {
+        await client.query(
+          `UPDATE public.tiktok_accounts
+              SET status = 'reconnect_needed', updated_at = NOW()
+            WHERE uid = $1 AND (shop_id = $2 OR ($3::text IS NOT NULL AND open_id = $3))`,
+          [account.uid, account.shopId, row.open_id]
+        );
+      }
       await client.query('COMMIT');
-      throw error;
+      console.warn(
+        `[tiktok] renovação do token da loja ${account.shopId} falhou ` +
+        `(${needsReconnect ? 'reconexão necessária' : 'conta mantida'}): ` +
+        describeTikTokError(error, { operation: 'renovar token' })
+      );
+      // Fora da transação (já encerrada): melhor esforço, nunca mascara o erro original.
+      await recordAccountLastError(client, account, row.open_id, failure);
+      throw needsReconnect ? error : markRetryable(error);
     }
 
     await client.query(
@@ -632,10 +751,14 @@ async function downloadTikTokDocument(docUrl) {
     const contentType = String(response.headers.get('content-type') || 'application/pdf').toLowerCase();
     return { ok: true, buffer, contentType };
   } catch (error) {
-    const timedOut = error?.name === 'AbortError';
+    const timedOut = error?.name === 'AbortError' || error?.type === 'aborted' || error?.type === 'body-timeout';
     return {
       ok: false,
-      message: timedOut ? 'Tempo limite ao baixar a etiqueta do TikTok Shop.' : `Falha de rede: ${error.message}`,
+      message: timedOut
+        ? 'Tempo limite ao baixar a etiqueta do TikTok Shop.'
+        : 'Falha de rede ao baixar a etiqueta do TikTok Shop.',
+      // error.message do node-fetch traz a URL assinada do documento: só sanitizado, só para log.
+      providerMessage: sanitizeProviderText(error?.message || error?.code || '') || null,
     };
   } finally {
     clearTimeout(timer);

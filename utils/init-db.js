@@ -17,7 +17,8 @@ const schema = {
             price NUMERIC(10,2) NOT NULL,
             description TEXT,
             type VARCHAR(50),
-            config JSONB
+            config JSONB,
+            unit VARCHAR(30)
         );`,
     users: `
         CREATE TABLE public.users (
@@ -28,8 +29,21 @@ const schema = {
             active BOOLEAN DEFAULT TRUE,
             created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
             updated_at TIMESTAMP WITH TIME ZONE,
-            password_hash VARCHAR(255)
-        );`,
+            password_hash VARCHAR(255),
+            cpf_cnpj VARCHAR(14),
+            phone VARCHAR(20),
+            asaas_customer_id VARCHAR(40),
+            postal_code VARCHAR(8),
+            address VARCHAR(255),
+            address_number VARCHAR(20),
+            address_complement VARCHAR(100),
+            province VARCHAR(100),
+            city_name VARCHAR(100),
+            state VARCHAR(2)
+        );
+        CREATE UNIQUE INDEX idx_users_asaas_customer
+            ON public.users(asaas_customer_id)
+         WHERE asaas_customer_id IS NOT NULL;`,
     ml_accounts: `
         CREATE TABLE public.ml_accounts (
             uid VARCHAR(255) NOT NULL,
@@ -300,6 +314,7 @@ const schema = {
             external_sale_id VARCHAR(100),
             package_type_id INTEGER REFERENCES public.package_types(id),
             package_type_context TEXT,
+            sale_line_key TEXT,
             created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
         );`,
     user_contracts: `
@@ -329,8 +344,19 @@ const schema = {
             total_amount NUMERIC(10, 2) NOT NULL,
             status VARCHAR(50) NOT NULL DEFAULT 'pending',
             created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
+            paid_at TIMESTAMP WITH TIME ZONE,
+            paid_by VARCHAR(255),
+            closed_at TIMESTAMP WITH TIME ZONE,
+            closed_by VARCHAR(255),
+            asaas_payment_id VARCHAR(40),
+            asaas_status VARCHAR(40),
+            asaas_invoice_url TEXT,
+            asaas_synced_at TIMESTAMP WITH TIME ZONE,
             UNIQUE(uid, period)
-        );`,
+        );
+        CREATE UNIQUE INDEX idx_invoices_asaas_payment
+            ON public.invoices(asaas_payment_id)
+         WHERE asaas_payment_id IS NOT NULL;`,
     invoice_items: `
         CREATE TABLE public.invoice_items (
             id SERIAL PRIMARY KEY,
@@ -340,8 +366,11 @@ const schema = {
             unit_price NUMERIC(10, 2) NOT NULL,
             total_price NUMERIC(10, 2) NOT NULL,
             type VARCHAR(50) NOT NULL,
-            service_date DATE
-        );`,
+            service_date DATE,
+            service_id INTEGER REFERENCES public.services(id) ON DELETE SET NULL,
+            unit VARCHAR(30)
+        );
+        CREATE INDEX idx_invoice_items_invoice ON public.invoice_items(invoice_id);`,
     sku_kit_components: `
         CREATE TABLE public.sku_kit_components (
             id SERIAL PRIMARY KEY,
@@ -389,7 +418,13 @@ const schema = {
             received_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT CURRENT_TIMESTAMP,
             processed_at TIMESTAMP WITH TIME ZONE,
             error TEXT
-        );`
+        );
+        CREATE INDEX idx_asaas_webhook_pending
+            ON public.asaas_webhook_events (received_at DESC)
+         WHERE processed_at IS NULL;
+        CREATE INDEX idx_asaas_webhook_payment
+            ON public.asaas_webhook_events (payment_id)
+         WHERE payment_id IS NOT NULL;`
 };
 
 /* ---------------------------------------------------------------------------
@@ -583,6 +618,10 @@ const PERFORMANCE_INDEXES = [
     // armazenamento pagina por usuário e data.
     'CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_stock_movements_user_created ON public.stock_movements (user_id, created_at DESC)',
     'CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_stock_movements_sku ON public.stock_movements (sku_id)',
+    /* Uma linha de venda pode gerar vários movimentos (kit pai + filhos), então
+     * a chave inclui o SKU afetado. O índice parcial ignora todo o histórico:
+     * não inventa chave, não apaga duplicata antiga e não bloqueia o deploy. */
+    'CREATE UNIQUE INDEX CONCURRENTLY IF NOT EXISTS idx_stock_movements_sale_line_key ON public.stock_movements (sale_line_key) WHERE sale_line_key IS NOT NULL',
 ];
 
 async function applyPerformanceIndexes() {
@@ -858,7 +897,7 @@ async function syncDatabaseSchema() {
         const tablesInOrder = [
             'users', 'package_types', 'services', 'ml_accounts', 'ml_sync_cursors', 'system_settings',
             'user_statuses', 'user_contracts', 'skus', 'sku_kit_components', 'kit_parents', 'sales', 'stock_movements',
-            'invoices', 'invoice_items', 'shopee_oauth_attempts', 'shopee_accounts',
+            'invoices', 'invoice_items', 'asaas_webhook_events', 'shopee_oauth_attempts', 'shopee_accounts',
             'shopee_sync_cursors', 'shopee_sync_jobs', 'shopee_sales',
             'tiktok_oauth_attempts', 'tiktok_accounts', 'tiktok_sync_cursors',
             'tiktok_sync_jobs', 'tiktok_sales'
@@ -1206,6 +1245,15 @@ async function syncDatabaseSchema() {
                     if (externalSaleIdColRes.rowCount === 0) {
                         console.log(`   -> Adicionando coluna 'external_sale_id' à tabela: public.stock_movements`);
                         await client.query('ALTER TABLE public.stock_movements ADD COLUMN external_sale_id VARCHAR(100);');
+                    }
+
+                    /* Defesa persistente contra baixa duplicada. O valor só é
+                     * preenchido pelos fluxos novos; movimentos históricos
+                     * ficam NULL e não são apagados nem deduplicados no boot. */
+                    const saleLineKeyColRes = await client.query(`SELECT 1 FROM information_schema.columns WHERE table_schema = 'public' AND table_name = 'stock_movements' AND column_name = 'sale_line_key'`);
+                    if (saleLineKeyColRes.rowCount === 0) {
+                        console.log(`   -> Adicionando coluna 'sale_line_key' à tabela: public.stock_movements`);
+                        await client.query('ALTER TABLE public.stock_movements ADD COLUMN sale_line_key TEXT;');
                     }
                 }
             }

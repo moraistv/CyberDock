@@ -18,6 +18,12 @@ services:
       - FIREBASE_CLIENT_EMAIL=${FIREBASE_CLIENT_EMAIL}
       - FIREBASE_PRIVATE_KEY=${FIREBASE_PRIVATE_KEY}
       - FIREBASE_DB_URL=${FIREBASE_DB_URL}
+      # Cobrança Asaas: sem estas linhas, uma variável configurada no Coolify
+      # pode existir no projeto e ainda assim não entrar no container Compose.
+      - ASAAS_ENV=${ASAAS_ENV:-sandbox}
+      - ASAAS_API_KEY=${ASAAS_API_KEY}
+      - ASAAS_WEBHOOK_TOKEN=${ASAAS_WEBHOOK_TOKEN}
+      - ASAAS_BASE_URL=${ASAAS_BASE_URL:-}
     restart: always
 
   # Optional: PostgreSQL if not using a separate Coolify DB resource

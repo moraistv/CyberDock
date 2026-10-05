@@ -4,6 +4,11 @@ const db = require('../utils/postgres');
 const { authenticateToken, requireMaster, requireOwnerOrMaster } = require('../utils/authMiddleware');
 const fetch = require('node-fetch');
 const { mlFetch } = require('../utils/mlClient');
+const {
+  buildSaleLineKey,
+  isDuplicateSaleMovement,
+  duplicateSaleMovementError,
+} = require('../utils/saleProcessing');
 
 const router = express.Router();
 
@@ -3463,13 +3468,22 @@ router.put('/status', authenticateToken, requireMaster, async (req, res) => {
       const saleQ = `
         SELECT id, sku, uid, quantity, processed_at
           FROM public.sales
-         WHERE id = $1 AND sku = $2 AND uid = $3
+         WHERE id = $1
+           AND UPPER(TRIM(sku)) = UPPER(TRIM($2))
+           AND uid = $3
          FOR UPDATE;
       `;
       const saleR = await client.query(saleQ, [saleId, sku, uid]);
       if (saleR.rowCount === 0) {
         await client.query('ROLLBACK');
         return res.status(404).json({ error: 'Venda não encontrada.' });
+      }
+      if (saleR.rowCount > 1) {
+        await client.query('ROLLBACK');
+        return res.status(409).json({
+          error: `A venda possui SKU duplicado normalizado: '${sku}'. Nada foi processado.`,
+          code: 'duplicate_sale_line',
+        });
       }
 
       const sale = saleR.rows[0];
@@ -3515,6 +3529,13 @@ router.put('/status', authenticateToken, requireMaster, async (req, res) => {
       }
 
       const stock = skuR.rows[0];
+      const movementKey = (movementSkuId) => buildSaleLineKey({
+        marketplace: 'mercadolivre',
+        uid: sale.uid,
+        orderId: sale.id,
+        soldSku: sale.sku,
+        movementSkuId,
+      });
 
       // A embalagem faturada sempre pertence ao SKU efetivamente vendido.
       // Um SKU individual pode participar de vários kits, mas essa relação
@@ -3567,15 +3588,17 @@ router.put('/status', authenticateToken, requireMaster, async (req, res) => {
           
           // Record movement for child SKU
           const insertChildMovementQuery = `
-            INSERT INTO public.stock_movements (sku_id, user_id, movement_type, quantity_change, reason, related_sale_id)
-            VALUES ($1, $2, 'saida', $3, $4, $5)
+            INSERT INTO public.stock_movements
+              (sku_id, user_id, movement_type, quantity_change, reason, related_sale_id, sale_line_key)
+            VALUES ($1, $2, 'saida', $3, $4, $5, $6)
           `;
           await client.query(insertChildMovementQuery, [
-            component.child_sku_id, 
-            uid, 
-            requiredQuantity, 
-            `Saída por Kit: Saída por Venda - ID: ${saleId}`, 
-            saleId
+            component.child_sku_id,
+            uid,
+            requiredQuantity,
+            `Saída por Kit: Saída por Venda - ID: ${saleId}`,
+            saleId,
+            movementKey(component.child_sku_id),
           ]);
         }
 
@@ -3583,8 +3606,9 @@ router.put('/status', authenticateToken, requireMaster, async (req, res) => {
         // apenas movimentos físicos e não geram outra cobrança de embalagem.
         const insertKitMovementQuery = `
           INSERT INTO public.stock_movements
-            (sku_id, user_id, movement_type, quantity_change, reason, related_sale_id, package_type_id, package_type_context)
-          VALUES ($1, $2, 'saida', $3, $4, $5, $6, $7)
+            (sku_id, user_id, movement_type, quantity_change, reason, related_sale_id,
+             package_type_id, package_type_context, sale_line_key)
+          VALUES ($1, $2, 'saida', $3, $4, $5, $6, $7, $8)
         `;
         await client.query(insertKitMovementQuery, [
           stock.id,
@@ -3593,7 +3617,8 @@ router.put('/status', authenticateToken, requireMaster, async (req, res) => {
           `Saída por Venda - ID: ${saleId}`,
           saleId,
           stock.package_type_id,
-          `Kit vendido: ${stock.sku_code}`
+          `Kit vendido: ${stock.sku_code}`,
+          movementKey(stock.id),
         ]);
       } else {
         // Regular SKU logic
@@ -3610,9 +3635,13 @@ router.put('/status', authenticateToken, requireMaster, async (req, res) => {
         const reason = `Saída por Venda - ID: ${saleId}`;
         await client.query(
           `INSERT INTO public.stock_movements
-             (sku_id, user_id, movement_type, quantity_change, reason, related_sale_id, package_type_id, package_type_context)
-           VALUES ($1, $2, 'saida', $3, $4, $5, $6, $7)`,
-          [stock.id, uid, quantitySold, reason, saleId, stock.package_type_id, 'SKU vendido diretamente']
+             (sku_id, user_id, movement_type, quantity_change, reason, related_sale_id,
+              package_type_id, package_type_context, sale_line_key)
+           VALUES ($1, $2, 'saida', $3, $4, $5, $6, $7, $8)`,
+          [
+            stock.id, uid, quantitySold, reason, saleId,
+            stock.package_type_id, 'SKU vendido diretamente', movementKey(stock.id),
+          ]
         );
       }
 
@@ -3632,6 +3661,10 @@ router.put('/status', authenticateToken, requireMaster, async (req, res) => {
       return res.json({ message: 'Status atualizado e estoque abatido.', sale: rows[0] });
     } catch (err) {
       try { await client.query('ROLLBACK'); } catch (e) { /* ignore */ }
+      if (isDuplicateSaleMovement(err)) {
+        const duplicate = duplicateSaleMovementError();
+        return res.status(409).json({ error: duplicate.message, code: duplicate.code });
+      }
       return res.status(400).json({ error: err.message || 'Erro interno ao processar despacho.' });
     } finally {
       client.release();
@@ -3656,18 +3689,26 @@ router.put('/status', authenticateToken, requireMaster, async (req, res) => {
   }
 });
 
-router.post('/process', authenticateToken, requireMaster, async (req, res) => {
+router.post('/process', authenticateToken, async (req, res) => {
   const { salesToProcess } = req.body;
 
   if (!Array.isArray(salesToProcess) || salesToProcess.length === 0) {
     return res.status(400).json({ error: 'Nenhuma venda para processar.' });
   }
 
-  const sanitized = salesToProcess.map((sale) => ({
-    id: sale.id,
-    sku: String(sale.sku || '').trim(),
-    uid: sale.uid,
-  }));
+  const sanitized = salesToProcess.map((sale) => {
+    const item = sale && typeof sale === 'object' && !Array.isArray(sale) ? sale : {};
+    const id = typeof item.id === 'string' || typeof item.id === 'number' ? item.id : null;
+    return {
+      id,
+      sku: typeof item.sku === 'string' ? item.sku.trim() : '',
+      uid: typeof item.uid === 'string' ? item.uid.trim() : '',
+    };
+  });
+
+  if (req.user.role !== 'master' && sanitized.some((sale) => sale.uid !== req.user.uid)) {
+    return res.status(403).json({ error: 'Você só pode processar vendas da sua própria conta.' });
+  }
 
   if (sanitized.length > MAX_PROCESS_BATCH) {
     return res.status(413).json({
@@ -3705,7 +3746,12 @@ router.post('/process', authenticateToken, requireMaster, async (req, res) => {
         const sale = saleResult.rows[0];
         if (sale.processed_at) {
           await client.query('COMMIT');
-          return { saleId: sale.id, sku: sale.sku, alreadyProcessed: true };
+          return {
+            saleId: sale.id,
+            sku: sale.sku,
+            alreadyProcessed: true,
+            processedAt: sale.processed_at,
+          };
         }
 
         sale.quantity = Number(sale.quantity);
@@ -3728,6 +3774,14 @@ router.post('/process', authenticateToken, requireMaster, async (req, res) => {
         if (skuResult.rowCount > 1) throw new Error(`SKU '${sale.sku}' está duplicado no armazenamento.`);
 
         const stock = skuResult.rows[0];
+        const movementKey = (movementSkuId) => buildSaleLineKey({
+          marketplace: 'mercadolivre',
+          uid: sale.uid,
+          orderId: sale.id,
+          soldSku: sale.sku,
+          movementSkuId,
+        });
+
         if (stock.is_kit) {
           const kitComponents = await client.query(
             `SELECT child_sku_id, quantity_per_kit
@@ -3762,9 +3816,16 @@ router.post('/process', authenticateToken, requireMaster, async (req, res) => {
             );
             await client.query(
               `INSERT INTO public.stock_movements
-                 (sku_id, user_id, movement_type, quantity_change, reason, related_sale_id)
-               VALUES ($1, $2, 'saida', $3, $4, $5)`,
-              [component.child_sku_id, sale.uid, required, `Saída por Kit: Venda Mercado Livre - ID ${sale.id}`, sale.id]
+                 (sku_id, user_id, movement_type, quantity_change, reason, related_sale_id, sale_line_key)
+               VALUES ($1, $2, 'saida', $3, $4, $5, $6)`,
+              [
+                component.child_sku_id,
+                sale.uid,
+                required,
+                `Saída por Kit: Venda Mercado Livre - ID ${sale.id}`,
+                sale.id,
+                movementKey(component.child_sku_id),
+              ]
             );
           }
 
@@ -3772,8 +3833,9 @@ router.post('/process', authenticateToken, requireMaster, async (req, res) => {
           // dos filhos representam somente a baixa do estoque compartilhado.
           await client.query(
             `INSERT INTO public.stock_movements
-               (sku_id, user_id, movement_type, quantity_change, reason, related_sale_id, package_type_id, package_type_context)
-             VALUES ($1, $2, 'saida', $3, $4, $5, $6, $7)`,
+               (sku_id, user_id, movement_type, quantity_change, reason, related_sale_id,
+                package_type_id, package_type_context, sale_line_key)
+             VALUES ($1, $2, 'saida', $3, $4, $5, $6, $7, $8)`,
             [
               stock.id,
               sale.uid,
@@ -3781,7 +3843,8 @@ router.post('/process', authenticateToken, requireMaster, async (req, res) => {
               `Saída por Venda Mercado Livre - ID ${sale.id}`,
               sale.id,
               stock.package_type_id,
-              `Kit vendido: ${stock.sku}`
+              `Kit vendido: ${stock.sku}`,
+              movementKey(stock.id),
             ]
           );
         } else {
@@ -3795,8 +3858,9 @@ router.post('/process', authenticateToken, requireMaster, async (req, res) => {
           );
           await client.query(
             `INSERT INTO public.stock_movements
-               (sku_id, user_id, movement_type, quantity_change, reason, related_sale_id, package_type_id, package_type_context)
-             VALUES ($1, $2, 'saida', $3, $4, $5, $6, $7)`,
+               (sku_id, user_id, movement_type, quantity_change, reason, related_sale_id,
+                package_type_id, package_type_context, sale_line_key)
+             VALUES ($1, $2, 'saida', $3, $4, $5, $6, $7, $8)`,
             [
               stock.id,
               sale.uid,
@@ -3804,7 +3868,8 @@ router.post('/process', authenticateToken, requireMaster, async (req, res) => {
               `Saída por Venda Mercado Livre - ID ${sale.id}`,
               sale.id,
               stock.package_type_id,
-              'SKU vendido diretamente'
+              'SKU vendido diretamente',
+              movementKey(stock.id),
             ]
           );
         }
@@ -3819,9 +3884,16 @@ router.post('/process', authenticateToken, requireMaster, async (req, res) => {
         if (updatedSale.rowCount === 0) throw new Error('Venda já processada por outra operação.');
 
         await client.query('COMMIT');
-        return { saleId: sale.id, sku: sale.sku, quantity: sale.quantity };
+        return {
+          saleId: sale.id,
+          sku: sale.sku,
+          quantity: sale.quantity,
+          alreadyProcessed: false,
+          processedAt: updatedSale.rows[0].processed_at,
+        };
       } catch (error) {
         try { await client.query('ROLLBACK'); } catch { /* ignore */ }
+        if (isDuplicateSaleMovement(error)) throw duplicateSaleMovementError();
         throw error;
       }
     } finally {

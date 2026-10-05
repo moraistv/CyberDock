@@ -32,6 +32,8 @@ const {
 const { stampLabelLines, buildItemLines } = require('../utils/labelStamp');
 const {
   TikTokApiError,
+  TIKTOK_SHIPPING_QUEUE_STATUS,
+  TIKTOK_NOT_READY_STATUS,
   missingTikTokCredentials,
   buildTikTokAuthorizeUrl,
   exchangeTikTokAuthCode,
@@ -43,8 +45,79 @@ const {
   getTikTokPackageShippingDocument,
   downloadTikTokDocument,
 } = require('../utils/tiktokClient');
+const {
+  normalizeTikTokError,
+  sanitizeProviderText,
+  describeTikTokError,
+  toLastErrorText,
+} = require('../utils/tiktokErrors');
+const {
+  buildSaleLineKey,
+  isDuplicateSaleMovement,
+  duplicateSaleMovementError,
+} = require('../utils/saleProcessing');
 
 const router = express.Router();
+
+/* ------------------------- Rede de segurança async ------------------------- *
+ *
+ * Express 4 não trata a rejeição de um handler async: uma exceção fora de
+ * try/catch (ex.: `String({ toString: 1 })` com `?code[toString]=1`) vira
+ * unhandledRejection e derruba o processo Node. Todo handler registrado neste
+ * router passa por aqui, então a falha vira resposta 500 em PT-BR e uma linha de
+ * log, nunca a queda do servidor. Vale também para rotas adicionadas depois.
+ */
+function respondUnexpectedError(error, req, res) {
+  try {
+    const failure = normalizeTikTokError(error, { operation: 'interno' });
+    console.error(
+      `[TikTok] Erro inesperado em ${req.method} ${req.baseUrl || ''}${req.path}: ` +
+      `${describeTikTokError(error, { operation: 'interno' })} ` +
+      `pilha="${sanitizeProviderText(error && error.stack, 1200)}"`
+    );
+    if (!res.headersSent) {
+      res.status(failure.httpStatus).json({
+        error: failure.userMessage,
+        code: failure.errorCode,
+        retryable: failure.retryable,
+      });
+    } else if (!res.writableEnded) {
+      res.end();
+    }
+  } catch (secondary) {
+    console.error('[TikTok] Falha ao responder a um erro inesperado:', secondary && secondary.message);
+  }
+}
+
+function guardHandler(handler) {
+  // Middleware de erro (4 argumentos) e valores inválidos ficam como estão.
+  if (typeof handler !== 'function' || handler.length === 4) return handler;
+  return function guardedHandler(req, res, next) {
+    try {
+      const result = handler.call(this, req, res, next);
+      if (result && typeof result.then === 'function') {
+        result.then(undefined, (error) => respondUnexpectedError(error, req, res));
+      }
+      return result;
+    } catch (error) {
+      respondUnexpectedError(error, req, res);
+      return undefined;
+    }
+  };
+}
+
+function protectAsyncHandlers(target) {
+  for (const method of ['get', 'post', 'put', 'patch', 'delete']) {
+    const original = target[method];
+    target[method] = function registerGuarded(path, ...handlers) {
+      return original.call(this, path, ...handlers.map((handler) => (
+        Array.isArray(handler) ? handler.map(guardHandler) : guardHandler(handler)
+      )));
+    };
+  }
+}
+
+protectAsyncHandlers(router);
 
 const FRONTEND_URL = process.env.FRONTEND_URL || 'https://cyberdock.com.br';
 const TIKTOK_OAUTH_ATTEMPT_TTL_MS = 20 * 60 * 1000;
@@ -87,6 +160,42 @@ function roundCurrency(value) {
 /** Id de loja ou pedido do TikTok: numérico e longo, sempre tratado como texto. */
 function isValidTikTokId(value) {
   return typeof value === 'string' && /^[\w-]{1,64}$/.test(value);
+}
+
+/**
+ * Lê um parâmetro de texto vindo do cliente (query, body ou params).
+ *
+ * O parser de query do Express (qs) transforma `?code[toString]=1` em objeto e
+ * `?code=a&code=b` em array; `String()`/`.trim()` nesses valores lança exceção, e
+ * em handler async isso derrubava o processo. Aqui só string vale.
+ *
+ * Devolve `''` quando o parâmetro não veio e `null` quando veio com tipo ou
+ * tamanho inválido: o chamador responde 400.
+ */
+function readText(value, maxLength = 255) {
+  if (value === undefined || value === null) return '';
+  if (typeof value !== 'string') return null;
+  const text = value.trim();
+  return text.length <= maxLength ? text : null;
+}
+
+/** Primeiro valor presente entre aliases (`orderId`/`order_id`...), validado por readText. */
+function readAliasedText(values, maxLength = 255) {
+  const present = values.find((value) => value !== undefined && value !== null && value !== '');
+  return readText(present, maxLength);
+}
+
+/** Erro com texto já em PT-BR, seguro para a tela: o normalizador o repassa como está. */
+function userFacingError(message, extra = {}) {
+  const error = new Error(message);
+  error.userMessage = message;
+  return Object.assign(error, extra);
+}
+
+/** Texto do SSE/resposta sempre começa com a loja: `[Loja] mensagem`, sem duplicar o prefixo. */
+function withShopPrefix(nickname, message) {
+  const prefix = `[${nickname}]`;
+  return message.startsWith(prefix) ? message : `${prefix} ${message}`;
 }
 
 /** Resposta padrão quando faltam as credenciais do app no servidor. */
@@ -181,7 +290,10 @@ function syncStreamKey(requesterUid, clientId) {
 
 /** EventSource não envia Authorization; aceita o mesmo JWT somente em ?token=. */
 function authenticateTikTokSse(req, res, next) {
-  const token = getBearerToken(req) || String(req.query.token || '');
+  // `?token[x]=1` chega como objeto; só string vale.
+  const queryToken = readText(req.query.token, 4096);
+  if (queryToken === null) return res.status(400).json({ error: 'Token de acesso inválido.' });
+  const token = getBearerToken(req) || queryToken;
   if (!token) return res.status(401).json({ error: 'Token de acesso requerido' });
   try {
     const user = verifyAccessToken(token);
@@ -408,6 +520,18 @@ async function loadCompletedAttemptAccounts(uid, shopIds) {
 }
 
 /**
+ * Consentimento negado ou interrompido: em vez de `code`, o TikTok devolve
+ * `error` (e `error_description`). O texto do TikTok nunca vai para a tela; só
+ * decidimos entre "o usuário recusou" e "a autorização não terminou".
+ */
+function oauthDeniedMessage(providerError) {
+  if (/denied|cancel|reject|refus|declin/i.test(providerError)) {
+    return 'Você não autorizou o CyberDock no TikTok Shop. Para conectar a loja, clique em Conectar TikTok e aceite as permissões.';
+  }
+  return 'O TikTok Shop não concluiu a autorização. Clique em Conectar TikTok e tente novamente.';
+}
+
+/**
  * Identifica o dono da conexão pela tentativa (corpo, `state` ou cookie).
  *
  * Diferente da Shopee, NÃO existe caminho só com JWT: a tentativa é o que
@@ -416,10 +540,20 @@ async function loadCompletedAttemptAccounts(uid, shopIds) {
  */
 async function resolveTikTokConnectIdentity(req, res, next) {
   const requestId = crypto.randomUUID();
-  const stateFromBody = req.body?.oauthState || req.body?.state;
+  const body = rec(req.body);
+  // Só string vale: objeto/array no corpo não pode virar tentativa nem código.
+  const stateFromBody = readText(body.oauthState || body.state, 256);
+  const codeFromBody = readText(body.code, 2048);
+  if (stateFromBody === null || codeFromBody === null) {
+    return res.status(400).json({
+      error: 'Os dados do retorno do TikTok Shop são inválidos. Clique em Conectar TikTok e autorize novamente.',
+      restartRequired: true,
+      requestId,
+    });
+  }
   const oauthState = stateFromBody || readTikTokOAuthCookie(req);
   const bearerToken = getBearerToken(req);
-  const code = typeof req.body?.code === 'string' ? req.body.code.trim() : '';
+  const code = codeFromBody;
   let sessionUser = null;
 
   console.log(
@@ -429,6 +563,11 @@ async function resolveTikTokConnectIdentity(req, res, next) {
   );
 
   if (!code) {
+    const providerError = readText(body.error, 200);
+    if (providerError) {
+      console.warn(`[TikTok Connect ${requestId}] Autorização recusada no TikTok (error=${sanitizeProviderText(providerError, 100)}).`);
+      return res.status(400).json({ error: oauthDeniedMessage(providerError), restartRequired: true, requestId });
+    }
     return res.status(400).json({ error: 'O TikTok Shop não devolveu o código de autorização.', requestId });
   }
 
@@ -694,10 +833,26 @@ function tiktokConnectResponse(accounts, req, res, replayed = false) {
 function connectFailureMessage(error) {
   if (error?.code === 'TIKTOK_SERVER_CONFIG') return 'A integração TikTok Shop não está configurada corretamente no servidor.';
   if (error?.phase === 'persistence') return 'O TikTok Shop autorizou a loja, mas o CyberDock não conseguiu gravá-la. Inicie uma nova conexão.';
+  // Falha da API do TikTok (troca do código, descoberta das lojas): texto PT-BR
+  // normalizado por categoria, nunca a mensagem em inglês do provedor.
+  if (error instanceof TikTokApiError) return normalizeTikTokError(error, { operation: 'oauth' }).userMessage;
   if (error?.userMessage) return error.userMessage;
   if (error?.phase === 'token_exchange') return 'O TikTok Shop recusou o código de autorização. Ele vale uma única vez: clique em Conectar TikTok e autorize novamente.';
-  if (error instanceof TikTokApiError && error.isSignatureError) return 'O TikTok Shop recusou a assinatura da chamada. Confira TIKTOK_APP_KEY e TIKTOK_APP_SECRET no servidor.';
   return 'Não foi possível concluir a conexão com o TikTok Shop. Tente novamente.';
+}
+
+/**
+ * Status da resposta de /connect. Em TikTokApiError `httpStatus` é o do TIKTOK
+ * (podia ser 200 com erro de negócio, e o frontend tratava a resposta como
+ * sucesso; 401/403 o mandaria para o login). Vale o status normalizado, e o que
+ * o usuário corrige refazendo a autorização (409/404/422) sai como 400.
+ */
+function connectFailureStatus(error, serverSide) {
+  if (error instanceof TikTokApiError) {
+    const { httpStatus } = normalizeTikTokError(error, { operation: 'oauth' });
+    return [404, 409, 422].includes(httpStatus) ? 400 : httpStatus;
+  }
+  return error?.httpStatus || (serverSide ? 500 : 400);
 }
 
 router.post('/connect', resolveTikTokConnectIdentity, async (req, res) => {
@@ -723,10 +878,10 @@ router.post('/connect', resolveTikTokConnectIdentity, async (req, res) => {
   } catch (error) {
     await releaseTikTokOAuthClaim(req.tiktokOAuthAttempt, requestId);
     const phase = error.phase || 'unknown';
-    console.error(`[TikTok Connect ${requestId}] Erro na fase ${phase}:`, error.message);
+    console.error(`[TikTok Connect ${requestId}] Erro na fase ${phase}: ${describeTikTokError(error, { operation: 'oauth' })}`);
 
     const serverSide = phase === 'persistence' || error?.code === 'TIKTOK_SERVER_CONFIG';
-    const status = error?.httpStatus || (serverSide ? 500 : 400);
+    const status = connectFailureStatus(error, serverSide);
     return res.status(status).json({
       error: connectFailureMessage(error),
       restartRequired: Boolean(error?.restartRequired || phase !== 'configuration'),
@@ -742,15 +897,35 @@ router.post('/connect', resolveTikTokConnectIdentity, async (req, res) => {
  */
 router.get('/callback', async (req, res) => {
   const requestId = crypto.randomUUID();
-  const code = String(req.query.code || req.query.auth_code || '').trim();
   const contas = `${FRONTEND_URL}/contas`;
   const failure = (message) => res.redirect(`${contas}?error=${encodeURIComponent(message)}`);
   const success = (message) => res.redirect(`${contas}?success=${encodeURIComponent(message)}`);
 
-  const oauthState = String(req.query.state || '').trim() || readTikTokOAuthCookie(req);
+  // Rota anônima: `?code[toString]=1` chega como objeto e `?code=a&code=b` como array.
+  // `String()`/`.trim()` neles lançam exceção, e aqui isso derrubava o processo Node.
+  const codeParam = readText(req.query.code, 2048);
+  const authCodeParam = readText(req.query.auth_code, 2048);
+  const stateParam = readText(req.query.state, 512);
+  const providerError = readText(req.query.error, 200);
+  if ([codeParam, authCodeParam, stateParam, providerError].includes(null)) {
+    return res.status(400).json({
+      error: 'O retorno do TikTok Shop veio com parâmetros inválidos. Clique em Conectar TikTok e tente novamente.',
+      requestId,
+    });
+  }
+  const code = codeParam || authCodeParam;
+
+  const oauthState = stateParam || readTikTokOAuthCookie(req);
   console.log(`[TikTok Callback ${requestId}] Retorno: tentativa=${oauthState ? 'presente' : 'nenhuma'}.`);
 
   if (!code) {
+    // Consentimento negado: o TikTok devolve `error` (e `error_description`) no lugar do
+    // `code`. Mesmo redirecionamento dos demais erros, com texto nosso em PT-BR.
+    if (providerError) {
+      clearTikTokOAuthCookie(res);
+      console.warn(`[TikTok Callback ${requestId}] Autorização recusada no TikTok (error=${sanitizeProviderText(providerError, 100)}).`);
+      return failure(oauthDeniedMessage(providerError));
+    }
     return failure('Autorização do TikTok Shop falhou: o código de autorização não foi devolvido.');
   }
 
@@ -804,7 +979,7 @@ router.get('/callback', async (req, res) => {
     return success(`TikTok Shop conectado: ${names}.`);
   } catch (error) {
     await releaseTikTokOAuthClaim(attempt, requestId);
-    console.error(`[TikTok Callback ${requestId}] Erro na fase ${error.phase || 'unknown'}:`, error.message);
+    console.error(`[TikTok Callback ${requestId}] Erro na fase ${error.phase || 'unknown'}: ${describeTikTokError(error, { operation: 'oauth' })}`);
     clearTikTokOAuthCookie(res);
     return failure(connectFailureMessage(error));
   }
@@ -880,7 +1055,7 @@ router.delete('/contas/:shopId', authenticateToken, async (req, res) => {
  */
 router.delete('/contas/:uid/:shopId', authenticateToken, requireMaster, async (req, res) => {
   const { uid, shopId } = req.params;
-  if (!uid || !isValidTikTokId(shopId)) {
+  if (!uid || uid.length > 255 || !isValidTikTokId(shopId)) {
     return res.status(400).json({ error: 'Informe o usuário e a loja TikTok Shop a excluir.' });
   }
 
@@ -921,33 +1096,69 @@ const TIKTOK_AWAITING_SHIPMENT_REASON = 'O TikTok Shop ainda não gerou o códig
   + 'A etiqueta só é liberada depois que o envio é organizado (coleta ou postagem) no Seller Center do TikTok Shop. '
   + 'Organize o envio e sincronize as vendas para atualizar aqui.';
 
-/** Texto em português para a recusa do TikTok, sem inglês cru como mensagem. */
+/**
+ * Teto de pacotes por pedido numa única checagem/impressão. Cada pacote custa de
+ * 2 a 3 chamadas ao TikTok dentro de UMA requisição HTTP, então existe um limite
+ * de segurança. Ele nunca corta em silêncio (antes `slice(0, 10)` descartava os
+ * demais pacotes sem avisar): acima dele a resposta leva `truncated: true` e
+ * manda imprimir pelo Seller Center.
+ */
+const MAX_LABEL_PACKAGES = configInt('TIKTOK_LABEL_MAX_PACKAGES', 50, 1, 200);
+
+function packageLimitWarning(order) {
+  if (order.packageIds.length <= MAX_LABEL_PACKAGES) return null;
+  return `Este pedido tem ${order.packageIds.length} pacotes e o limite por impressão é ${MAX_LABEL_PACKAGES}. `
+    + 'Imprima as etiquetas pelo Seller Center do TikTok Shop.';
+}
+
+/** Pacote cancelado no TikTok não tem etiqueta válida para imprimir. */
+const TIKTOK_CANCELLED_PACKAGE_STATUS = new Set(['CANCELLED', 'CANCELED']);
+
+function isCancelledPackage(state) {
+  return TIKTOK_CANCELLED_PACKAGE_STATUS.has(String(state?.packageStatus || '').toUpperCase());
+}
+
+function cancelledPackageReason(state) {
+  return `O pacote ${state.packageId} deste pedido foi cancelado no TikTok Shop e não tem etiqueta válida. `
+    + 'Sincronize as vendas e tente novamente.';
+}
+
+/** Texto em português para a falha do TikTok; nunca repassa o texto cru (inglês) do provedor. */
 function tiktokLabelMessage(error, fallback) {
-  if (error instanceof TikTokApiError) {
-    if (error.isSignatureError) {
-      return 'O TikTok Shop recusou a assinatura da chamada. Confira TIKTOK_APP_KEY e TIKTOK_APP_SECRET no servidor.';
-    }
-    if (error.isInvalidToken) {
-      return 'A autorização desta loja no TikTok Shop expirou ou foi revogada. Reconecte a loja em Contas.';
-    }
-    if (error.isRateLimited) {
-      return 'O TikTok Shop limitou as chamadas desta loja agora. Tente novamente em alguns segundos.';
-    }
-    const detail = [error.message, error.code ? `código ${error.code}` : null].filter(Boolean).join(' · ');
-    return `O TikTok Shop recusou a etiqueta deste pedido. Resposta do TikTok: ${detail}`;
-  }
+  if (error instanceof TikTokApiError) return normalizeTikTokError(error, { operation: 'etiqueta' }).userMessage;
   return fallback || 'Não foi possível obter a etiqueta no TikTok Shop agora.';
 }
 
-function readLabelQuery(req) {
-  // Só o master pode imprimir em nome de outro dono; para os demais vale o UID do token.
-  const requestedOwner = String(req.query.ownerUid || req.query.owner_uid || '').trim();
-  const ownerUid = req.user.role === 'master' && requestedOwner ? requestedOwner : req.user.uid;
+/**
+ * Falha ao checar ou baixar a etiqueta: status coerente com a categoria e corpo
+ * `{ error, code, retryable }` (+ `requestId` do TikTok, para o suporte). Falha
+ * que não veio da API do TikTok sai como 500 com texto genérico.
+ */
+function labelFailure(error, fallbackMessage) {
+  const failure = normalizeTikTokError(error, { operation: 'etiqueta' });
+  const message = tiktokLabelMessage(error, fallbackMessage);
   return {
-    ownerUid,
-    orderId: String(req.query.orderId || req.query.order_id || req.query.orderSn || '').trim(),
-    shopId: String(req.query.shopId || req.query.shop_id || '').trim(),
+    status: error instanceof TikTokApiError ? failure.httpStatus : 500,
+    body: {
+      error: message,
+      code: failure.errorCode,
+      retryable: failure.retryable,
+      ...(failure.requestId ? { requestId: failure.requestId } : {}),
+    },
   };
+}
+
+function readLabelQuery(req) {
+  // Parâmetros só valem como texto (`?orderId[x]=1` chega como objeto e `String()` nele lança).
+  const requestedOwner = readAliasedText([req.query.ownerUid, req.query.owner_uid], 255);
+  const orderId = readAliasedText([req.query.orderId, req.query.order_id, req.query.orderSn], 64);
+  const shopId = readAliasedText([req.query.shopId, req.query.shop_id], 64);
+  if (requestedOwner === null || orderId === null || shopId === null) {
+    return { invalid: true, ownerUid: '', orderId: '', shopId: '' };
+  }
+  // Só o master pode imprimir em nome de outro dono; para os demais vale o UID do token.
+  const ownerUid = req.user.role === 'master' && requestedOwner ? requestedOwner : req.user.uid;
+  return { invalid: false, ownerUid, orderId, shopId };
 }
 
 /** Conta da loja com token utilizável. */
@@ -1023,10 +1234,11 @@ function labelBlockReason(order) {
   if (order.orderStatus === 'CANCELLED') {
     return { status: 'blocked', reason: 'Pedido cancelado no TikTok Shop: não há etiqueta para imprimir.' };
   }
-  if (order.orderStatus === 'UNPAID') {
-    return { status: 'blocked', reason: 'O pedido ainda não foi pago no TikTok Shop.' };
-  }
-  if (order.orderStatus === 'ON_HOLD') {
+  // UNPAID e ON_HOLD: o pedido ainda não pode ser expedido (TIKTOK_NOT_READY_STATUS).
+  if (TIKTOK_NOT_READY_STATUS.has(order.orderStatus)) {
+    if (order.orderStatus === 'UNPAID') {
+      return { status: 'blocked', reason: 'O pedido ainda não foi pago no TikTok Shop.' };
+    }
     return {
       status: 'blocked',
       reason: 'O pedido está no período de retenção do TikTok Shop, em que o comprador ainda pode cancelar. '
@@ -1034,10 +1246,18 @@ function labelBlockReason(order) {
     };
   }
   if (order.packageIds.length === 0) {
+    // Na fila de expedição a falta do pacote é espera: o TikTok ainda vai criá-lo. Fora
+    // dela (em trânsito, entregue...) é lacuna de dado do CyberDock, não espera.
+    if (TIKTOK_SHIPPING_QUEUE_STATUS.has(order.orderStatus)) {
+      return {
+        status: 'awaiting_shipment',
+        awaitingShipment: true,
+        reason: 'O TikTok Shop ainda não criou o pacote deste pedido. Sincronize as vendas e tente novamente.',
+      };
+    }
     return {
-      status: 'awaiting_shipment',
-      awaitingShipment: true,
-      reason: 'O TikTok Shop ainda não criou o pacote deste pedido. Sincronize as vendas e tente novamente.',
+      status: 'blocked',
+      reason: 'Este pedido não tem pacote registrado no CyberDock. Sincronize as vendas desta loja e tente novamente.',
     };
   }
   return null;
@@ -1084,8 +1304,8 @@ async function readPackageState(account, packageId) {
  * pode, por quê — em português, para a tela mostrar direto ao operador.
  */
 router.get('/label-info', authenticateToken, async (req, res) => {
-  const { ownerUid, orderId, shopId } = readLabelQuery(req);
-  if (!isValidTikTokId(orderId) || !isValidTikTokId(shopId)) {
+  const { invalid, ownerUid, orderId, shopId } = readLabelQuery(req);
+  if (invalid || !isValidTikTokId(orderId) || !isValidTikTokId(shopId)) {
     return res.status(400).json({ error: 'Informe orderId e shopId válidos.' });
   }
 
@@ -1111,9 +1331,36 @@ router.get('/label-info', authenticateToken, async (req, res) => {
       return res.json({ canPrint: false, requiresInvoice: false, code: null, ...block });
     }
 
+    // TODOS os pacotes entram na checagem (antes `slice(0, 10)` ignorava o excedente sem
+    // avisar). Acima do teto de segurança a resposta diz que foi truncado, não corta calada.
+    const limitWarning = packageLimitWarning(order);
+    if (limitWarning) {
+      return res.json({
+        canPrint: false,
+        requiresInvoice: false,
+        status: 'blocked',
+        code: null,
+        truncated: true,
+        reason: limitWarning,
+      });
+    }
+
     const states = [];
-    for (const packageId of order.packageIds.slice(0, 10)) {
+    for (const packageId of order.packageIds) {
       states.push(await readPackageState(account, packageId));
+    }
+
+    // Pacote cancelado vem antes do rastreio: sem etiqueta válida, e o rastreio vazio dele
+    // não é "envio por organizar".
+    const cancelledPackage = states.find(isCancelledPackage);
+    if (cancelledPackage) {
+      return res.json({
+        canPrint: false,
+        requiresInvoice: false,
+        status: 'blocked',
+        code: null,
+        reason: cancelledPackageReason(cancelledPackage),
+      });
     }
 
     if (states.some((state) => !state.trackingNumber)) {
@@ -1137,14 +1384,14 @@ router.get('/label-info', authenticateToken, async (req, res) => {
         : 'Etiqueta pronta para baixar.',
     });
   } catch (error) {
-    console.error(`[TikTok Label] Falha ao checar a etiqueta do pedido ${orderId}:`, error.message);
-    const fromApi = error instanceof TikTokApiError;
-    return res.status(fromApi ? 200 : 500).json({
-      canPrint: false,
-      status: 'blocked',
-      code: fromApi ? error.code : null,
-      reason: tiktokLabelMessage(error, 'Não foi possível checar a etiqueta no TikTok Shop agora.'),
-    });
+    console.error(`[TikTok Label] Falha ao checar a etiqueta do pedido ${orderId}: ${describeTikTokError(error, { operation: 'etiqueta' })}`);
+    // Antes a falha do TikTok voltava com HTTP 200. Agora o status acompanha a categoria
+    // (409 reconectar, 429 limite, 502 provedor, 503 rede/timeout). O frontend lê a
+    // resposta por useApi, que em não-2xx lança com `err.data` = este corpo, e a tela
+    // mostra `error.data.error`; `reason`/`canPrint`/`status` seguem no corpo por
+    // compatibilidade com quem lê o formato antigo.
+    const { status, body } = labelFailure(error, 'Não foi possível checar a etiqueta no TikTok Shop agora.');
+    return res.status(status).json({ canPrint: false, status: 'blocked', reason: body.error, ...body });
   }
 });
 
@@ -1167,8 +1414,8 @@ async function mergePdfBuffers(buffers) {
 
 /** Baixa a etiqueta de todos os pacotes do pedido, com o SKU estampado. */
 router.get('/download-label', authenticateToken, async (req, res) => {
-  const { ownerUid, orderId, shopId } = readLabelQuery(req);
-  if (!isValidTikTokId(orderId) || !isValidTikTokId(shopId)) {
+  const { invalid, ownerUid, orderId, shopId } = readLabelQuery(req);
+  if (invalid || !isValidTikTokId(orderId) || !isValidTikTokId(shopId)) {
     return res.status(400).json({ error: 'Informe orderId e shopId válidos.' });
   }
 
@@ -1193,7 +1440,13 @@ router.get('/download-label', authenticateToken, async (req, res) => {
     const block = labelBlockReason(order);
     if (block) return fail(409, block.reason, { awaitingShipment: Boolean(block.awaitingShipment) });
 
-    const packageIds = order.packageIds.slice(0, 10);
+    // TODOS os pacotes entram no PDF (antes `slice(0, 10)` entregava o PDF sem os demais e
+    // sem avisar). Acima do teto de segurança recusa com `truncated: true` em vez de imprimir
+    // pela metade. Um pacote por vez: cada um já custa 2-3 chamadas e o TikTok limita a taxa.
+    const limitWarning = packageLimitWarning(order);
+    if (limitWarning) return fail(409, limitWarning, { truncated: true });
+
+    const packageIds = order.packageIds;
     const documents = [];
 
     for (const packageId of packageIds) {
@@ -1206,13 +1459,15 @@ router.get('/download-label', authenticateToken, async (req, res) => {
         if (!(error instanceof TikTokApiError)) throw error;
         /* Recusa com o pacote ainda sem rastreio é o caso comum: o envio não
          * foi organizado no Seller Center. Vale a mensagem que diz o que fazer,
-         * não o texto cru da API. */
+         * não o texto cru da API. Pacote cancelado tem mensagem própria. */
         const state = await readPackageState(account, packageId).catch(() => null);
+        if (isCancelledPackage(state)) return fail(409, cancelledPackageReason(state));
         if (state && !state.trackingNumber) {
           return fail(409, TIKTOK_AWAITING_SHIPMENT_REASON, { awaitingShipment: true });
         }
-        console.warn(`[TikTok Label] Pedido ${orderId}, pacote ${packageId}: ${error.message}`);
-        return fail(409, tiktokLabelMessage(error), { code: error.code || null });
+        console.warn(`[TikTok Label] Pedido ${orderId}, pacote ${packageId}: ${describeTikTokError(error, { operation: 'etiqueta' })}`);
+        const { status, body } = labelFailure(error);
+        return fail(status, body.error, { code: body.code, retryable: body.retryable, requestId: body.requestId });
       }
 
       if (!document.docUrl) {
@@ -1221,8 +1476,11 @@ router.get('/download-label', authenticateToken, async (req, res) => {
 
       const download = await downloadTikTokDocument(document.docUrl);
       if (!download.ok) {
-        console.warn(`[TikTok Label] Download recusado no pedido ${orderId}: ${download.message}`);
-        return fail(409, `Não foi possível baixar a etiqueta do TikTok Shop: ${download.message}`);
+        console.warn(`[TikTok Label] Download recusado no pedido ${orderId}: ${download.message}${download.providerMessage ? ` (${download.providerMessage})` : ''}`);
+        return fail(502, `Não foi possível baixar a etiqueta do TikTok Shop: ${download.message}`, {
+          code: 'TIKTOK_PROVIDER_ERROR',
+          retryable: true,
+        });
       }
       documents.push({ packageId, ...download });
     }
@@ -1269,9 +1527,9 @@ router.get('/download-label', authenticateToken, async (req, res) => {
     res.setHeader('Cache-Control', 'no-store');
     return res.send(labelBuffer);
   } catch (error) {
-    console.error(`[TikTok Label] Falha ao baixar a etiqueta do pedido ${orderId}:`, error.message);
-    const fromApi = error instanceof TikTokApiError;
-    return fail(fromApi ? 409 : 500, tiktokLabelMessage(error), { code: fromApi ? error.code : null });
+    console.error(`[TikTok Label] Falha ao baixar a etiqueta do pedido ${orderId}: ${describeTikTokError(error, { operation: 'etiqueta' })}`);
+    const { status, body } = labelFailure(error);
+    return fail(status, body.error, { code: body.code, retryable: body.retryable, requestId: body.requestId });
   }
 });
 
@@ -1316,9 +1574,10 @@ async function mapWithConcurrency(items, limit, mapper) {
 
 function assertJobDeadline(deadlineAt, phase) {
   if (Date.now() >= deadlineAt) {
-    const error = new Error(`Sincronização TikTok Shop excedeu o limite durante ${phase}. Tente novamente; o próximo ciclo continua do último checkpoint.`);
-    error.code = 'TIKTOK_JOB_TIMEOUT';
-    throw error;
+    throw userFacingError(
+      `Sincronização TikTok Shop excedeu o limite durante ${phase}. Tente novamente; o próximo ciclo continua do último checkpoint.`,
+      { code: 'TIKTOK_JOB_TIMEOUT' }
+    );
   }
 }
 
@@ -1355,13 +1614,13 @@ async function fetchWindowOrders(account, from, to, deadlineAt) {
 
     if (!result.nextPageToken) return Array.from(byId.values());
     if (seenTokens.has(result.nextPageToken)) {
-      throw new Error('O TikTok Shop repetiu o page_token da listagem; sincronização interrompida para evitar loop infinito.');
+      throw userFacingError('O TikTok Shop repetiu a página da listagem de pedidos; a sincronização foi interrompida para evitar um ciclo infinito. Tente novamente em alguns minutos.');
     }
     seenTokens.add(result.nextPageToken);
     pageToken = result.nextPageToken;
   }
 
-  throw new Error(`A janela de pedidos passou de ${MAX_PAGES_PER_WINDOW} páginas; o checkpoint não será avançado.`);
+  throw userFacingError(`A janela de pedidos passou de ${MAX_PAGES_PER_WINDOW} páginas; o checkpoint não será avançado.`);
 }
 
 function isCancelledLineItem(lineItem) {
@@ -1633,9 +1892,17 @@ async function updateOrderMetadata(orderId, uid, row, executor) {
 
 /* --------------------------- Sincronização (SSE) --------------------------- */
 router.post('/sync-account', authenticateToken, async (req, res) => {
-  const { shopId, clientId: rawClientId, force, clientUid } = req.body || {};
+  const body = rec(req.body);
+  // Só string vale: um objeto no corpo faria String()/trim() lançar fora do try.
+  const shopId = readText(body.shopId, 64);
+  const rawClientId = readText(body.clientId, 100);
+  const clientUid = readText(body.clientUid, 255);
+  const force = [true, 'true', 1, '1'].includes(body.force);
+  if (shopId === null || rawClientId === null || clientUid === null) {
+    return res.status(400).json({ error: 'Parâmetros inválidos para a sincronização.' });
+  }
   const requesterUid = String(req.user.uid || '');
-  const clientId = String(rawClientId || '').trim();
+  const clientId = rawClientId;
   const streamKey = syncStreamKey(requesterUid, clientId);
   let targetUid = clientUid || requesterUid;
   let nickname = String(shopId || 'TikTok Shop');
@@ -1806,14 +2073,14 @@ router.post('/sync-account', authenticateToken, async (req, res) => {
     }, 30000);
 
     const ensureLease = () => {
-      if (leaseLost) throw new Error('A sincronização perdeu o lock da loja e foi interrompida com segurança.');
+      if (leaseLost) throw userFacingError('A sincronização perdeu o lock da loja e foi interrompida com segurança.');
     };
 
     res.status(202).json({ message: 'Sincronização TikTok Shop iniciada. Acompanhe status.' });
     sendEvent(streamKey, { progress: 10, message: `[${nickname}] Preparando sincronização...`, type: 'info' });
 
     if (!accRow.shop_cipher) {
-      throw new Error(`[${nickname}] Loja sem shop_cipher gravado. Reconecte a loja TikTok Shop em Contas.`);
+      throw userFacingError('Esta loja foi gravada sem os identificadores de acesso do TikTok Shop. Reconecte a loja em Contas.');
     }
 
     const account = {
@@ -2040,7 +2307,7 @@ router.post('/sync-account', authenticateToken, async (req, res) => {
         [upperBound, mode, isDeepSweep || mode !== 'incremental', JSON.stringify(terminalPayload),
           targetUid, normalizedShopId, clientId]
       );
-      if (cursorUpdate.rowCount !== 1) throw new Error('A sincronização perdeu a posse do lock antes da conclusão.');
+      if (cursorUpdate.rowCount !== 1) throw userFacingError('A sincronização perdeu a posse do lock antes da conclusão.');
 
       const jobUpdate = await finishClient.query(
         `UPDATE public.tiktok_sync_jobs
@@ -2050,7 +2317,7 @@ router.post('/sync-account', authenticateToken, async (req, res) => {
         RETURNING client_id`,
         [JSON.stringify(terminalPayload), clientId, requesterUid, targetUid, normalizedShopId]
       );
-      if (jobUpdate.rowCount !== 1) throw new Error('O estado terminal do job TikTok Shop não pôde ser persistido.');
+      if (jobUpdate.rowCount !== 1) throw userFacingError('O estado terminal do job TikTok Shop não pôde ser persistido.');
       await finishClient.query('COMMIT');
     } catch (finishError) {
       try { await finishClient.query('ROLLBACK'); } catch { /* já encerrada */ }
@@ -2068,11 +2335,15 @@ router.post('/sync-account', authenticateToken, async (req, res) => {
     );
     finalizeJob(streamKey, terminalPayload);
   } catch (error) {
-    console.error(`[tiktok-sync] ${nickname} falhou após ${Date.now() - startedAt}ms:`, error.message);
-    const userMessage = error instanceof TikTokApiError && error.isInvalidToken
-      ? `[${nickname}] A autorização desta loja no TikTok Shop expirou ou foi revogada. Reconecte a loja em Contas.`
-      : (error.message || 'Erro na sincronização TikTok Shop.');
-    const errorPayload = { message: userMessage, type: 'error' };
+    // O texto cru (inglês) do TikTok fica só no log do servidor. A resposta HTTP, o SSE e
+    // as colunas last_error levam a mensagem PT-BR normalizada por categoria.
+    const failure = normalizeTikTokError(error, { operation: 'sincronizacao' });
+    console.error(
+      `[tiktok-sync] ${nickname} falhou após ${Date.now() - startedAt}ms: ` +
+      describeTikTokError(error, { operation: 'sincronizacao' })
+    );
+    const userMessage = withShopPrefix(nickname, failure.userMessage);
+    const errorPayload = { message: userMessage, type: 'error', code: failure.errorCode, retryable: failure.retryable };
     clearInterval(leaseTimer);
     leaseTimer = null;
     try {
@@ -2082,7 +2353,7 @@ router.post('/sync-account', authenticateToken, async (req, res) => {
               SET status = 'error', last_error = $1, last_result = $2::jsonb,
                   locked_until = NULL, updated_at = NOW()
             WHERE uid = $3 AND shop_id = $4 AND job_id = $5`,
-          [String(error.message || error).slice(0, 2000), JSON.stringify(errorPayload), targetUid, normalizedShopId, clientId]
+          [toLastErrorText(failure), JSON.stringify(errorPayload), targetUid, normalizedShopId, clientId]
         );
       }
       await db.query(
@@ -2090,25 +2361,31 @@ router.post('/sync-account', authenticateToken, async (req, res) => {
             SET status = 'error', result = $1::jsonb, error = $2, updated_at = NOW()
           WHERE client_id = $3 AND requester_uid = $4 AND uid = $5 AND shop_id = $6
             AND status = 'running'`,
-        [JSON.stringify(errorPayload), String(error.message || error).slice(0, 2000),
-          clientId, requesterUid, targetUid, normalizedShopId]
+        [JSON.stringify(errorPayload), userMessage, clientId, requesterUid, targetUid, normalizedShopId]
       );
     } catch (stateError) {
       console.error('[tiktok-sync] falha ao persistir estado do job:', stateError.message);
     }
     finalizeJob(streamKey, errorPayload);
-    if (!res.headersSent) res.status(500).json({ error: userMessage });
+    if (!res.headersSent) {
+      res.status(failure.httpStatus).json({ error: userMessage, code: failure.errorCode, retryable: failure.retryable });
+    }
   }
 });
 
 router.get('/last-sync/:shopId', authenticateToken, async (req, res) => {
   try {
     const { shopId } = req.params;
+    // `?clientUid[x]=1` chega como objeto; só string vale.
+    const clientUid = readText(req.query.clientUid, 255);
+    if (!isValidTikTokId(shopId) || clientUid === null) {
+      return res.status(400).json({ error: 'Informe um shopId e um clientUid válidos.' });
+    }
     let targetUid = req.user.uid;
     // Só o master consulta a loja de outro dono.
     if (req.user.role === 'master') {
-      if (req.query.clientUid) {
-        targetUid = String(req.query.clientUid);
+      if (clientUid) {
+        targetUid = clientUid;
       } else {
         const owner = await db.query('SELECT uid FROM public.tiktok_accounts WHERE shop_id = $1 LIMIT 1', [shopId]);
         if (owner.rowCount > 0) targetUid = owner.rows[0].uid;
@@ -2134,6 +2411,7 @@ router.get('/last-sync/:shopId', authenticateToken, async (req, res) => {
       message: lastSync ? 'Última sincronização encontrada' : 'Nunca sincronizada',
     });
   } catch (error) {
+    console.error(`[tiktok-sync] Erro ao consultar a última sincronização: ${describeTikTokError(error)}`);
     res.status(500).json({ error: 'Erro interno do servidor' });
   }
 });
@@ -2147,11 +2425,17 @@ const SALE_COLUMNS = `order_id, sku, uid, shop_id, account_nickname, sale_date, 
 
 router.get('/all', authenticateToken, requireMaster, async (req, res) => {
   try {
-    const page = Math.max(1, parseInt(req.query.page, 10) || 1);
-    const limit = Math.min(100, Math.max(1, parseInt(req.query.limit, 10) || 50));
+    // Filtros só valem como texto: objeto/array da query faria parseInt/String lançarem.
+    const pageParam = readText(req.query.page, 10);
+    const limitParam = readText(req.query.limit, 10);
+    const search = readText(req.query.search, 200);
+    const account = readText(req.query.account, 200);
+    if ([pageParam, limitParam, search, account].includes(null)) {
+      return res.status(400).json({ error: 'Parâmetros de busca inválidos.' });
+    }
+    const page = Math.max(1, parseInt(pageParam, 10) || 1);
+    const limit = Math.min(100, Math.max(1, parseInt(limitParam, 10) || 50));
     const offset = (page - 1) * limit;
-    const search = String(req.query.search || '').trim();
-    const account = String(req.query.account || '').trim();
 
     const conditions = [];
     const params = [];
@@ -2231,8 +2515,22 @@ router.get('/my-sales', authenticateToken, async (req, res) => {
   }
 });
 
+/** Status em que o pedido já representa mercadoria do vendedor a separar ou
+ * que saiu sem a baixa ter sido registrada. Estado novo/desconhecido não mexe
+ * em estoque automaticamente: primeiro precisa ser classificado. */
+const TIKTOK_PROCESSABLE_ORDER_STATUSES = new Set([
+  'AWAITING_SHIPMENT',
+  'AWAITING_COLLECTION',
+  'PARTIALLY_SHIPPING',
+  'SHIPPED',
+  'IN_TRANSIT',
+  'DELIVERED',
+  'COMPLETED',
+  'NOT_DELIVERED',
+]);
+
 /** Abatimento de estoque para pedidos TikTok — mesmo fluxo seguro da Shopee. */
-router.post('/process', authenticateToken, requireMaster, async (req, res) => {
+router.post('/process', authenticateToken, async (req, res) => {
   const { salesToProcess } = req.body || {};
   const MAX_PROCESS_BATCH = 500;
 
@@ -2244,11 +2542,20 @@ router.post('/process', authenticateToken, requireMaster, async (req, res) => {
   }
 
   // A quantidade enviada pelo navegador é ignorada: vale a linha bloqueada no banco.
-  const sanitized = salesToProcess.map((sale) => ({
-    orderId: String(sale?.orderId || sale?.order_id || sale?.id || '').trim(),
-    sku: String(sale?.sku || '').trim(),
-    uid: String(sale?.uid || '').trim(),
-  }));
+  const sanitized = salesToProcess.map((sale) => {
+    const item = rec(sale);
+    return {
+      orderId: readAliasedText([item.orderId, item.order_id, item.id], 64),
+      sku: readText(item.sku, 255),
+      uid: readText(item.uid, 255),
+    };
+  });
+  if (sanitized.some((sale) => sale.orderId === null || sale.sku === null || sale.uid === null)) {
+    return res.status(400).json({ error: 'Cada venda deve informar orderId, SKU e UID como texto válido.' });
+  }
+  if (req.user.role !== 'master' && sanitized.some((sale) => sale.uid !== req.user.uid)) {
+    return res.status(403).json({ error: 'Você só pode processar vendas da sua própria conta.' });
+  }
 
   const results = { success: [], failed: [] };
 
@@ -2266,7 +2573,7 @@ router.post('/process', authenticateToken, requireMaster, async (req, res) => {
         // O lock da venda vem antes do estoque: requisições concorrentes para o
         // mesmo item ficam serializadas e só uma faz a baixa.
         const saleResult = await client.query(
-          `SELECT order_id, sku, uid, quantity, processed_at
+          `SELECT order_id, sku, uid, quantity, order_status, fulfillment_type, processed_at
              FROM public.tiktok_sales
             WHERE order_id = $1
               AND UPPER(TRIM(sku)) = UPPER(TRIM($2))
@@ -2280,7 +2587,25 @@ router.post('/process', authenticateToken, requireMaster, async (req, res) => {
         const sale = saleResult.rows[0];
         if (sale.processed_at) {
           await client.query('COMMIT');
-          return { orderId: sale.order_id, sku: sale.sku, alreadyProcessed: true };
+          return {
+            orderId: sale.order_id,
+            sku: sale.sku,
+            alreadyProcessed: true,
+            processedAt: sale.processed_at,
+          };
+        }
+
+        const orderStatus = String(sale.order_status || '').toUpperCase();
+        const fulfillmentType = String(sale.fulfillment_type || '').toUpperCase();
+        if (fulfillmentType === 'FULFILLMENT_BY_TIKTOK') {
+          throw new Error(
+            'Pedido FULL do TikTok: a expedição é feita pelo marketplace e não deve baixar este estoque.'
+          );
+        }
+        if (!TIKTOK_PROCESSABLE_ORDER_STATUSES.has(orderStatus)) {
+          throw new Error(
+            `O status '${orderStatus || 'não informado'}' do pedido TikTok não permite baixar estoque.`
+          );
         }
 
         const quantity = Number(sale.quantity);
@@ -2302,6 +2627,13 @@ router.post('/process', authenticateToken, requireMaster, async (req, res) => {
         if (skuResult.rowCount === 0) throw new Error(`SKU ativo '${sale.sku}' não encontrado no armazenamento.`);
         if (skuResult.rowCount > 1) throw new Error(`Há mais de um SKU ativo normalizado como '${sale.sku}'.`);
         const stock = skuResult.rows[0];
+        const movementKey = (movementSkuId) => buildSaleLineKey({
+          marketplace: 'tiktok',
+          uid: sale.uid,
+          orderId: sale.order_id,
+          soldSku: sale.sku,
+          movementSkuId,
+        });
 
         if (stock.is_kit) {
           const componentsResult = await client.query(
@@ -2334,9 +2666,17 @@ router.post('/process', authenticateToken, requireMaster, async (req, res) => {
             );
             await client.query(
               `INSERT INTO public.stock_movements
-                 (sku_id, user_id, movement_type, quantity_change, reason, related_sale_id, external_sale_id)
-               VALUES ($1, $2, 'saida', $3, $4, NULL, $5)`,
-              [component.child_sku_id, sale.uid, required, `Saída por Kit (TikTok Shop) - Pedido ${sale.order_id}`, sale.order_id]
+                 (sku_id, user_id, movement_type, quantity_change, reason, related_sale_id,
+                  external_sale_id, sale_line_key)
+               VALUES ($1, $2, 'saida', $3, $4, NULL, $5, $6)`,
+              [
+                component.child_sku_id,
+                sale.uid,
+                required,
+                `Saída por Kit (TikTok Shop) - Pedido ${sale.order_id}`,
+                sale.order_id,
+                movementKey(component.child_sku_id),
+              ]
             );
           }
 
@@ -2344,9 +2684,17 @@ router.post('/process', authenticateToken, requireMaster, async (req, res) => {
           // sai dos componentes acima.
           await client.query(
             `INSERT INTO public.stock_movements
-               (sku_id, user_id, movement_type, quantity_change, reason, related_sale_id, external_sale_id)
-             VALUES ($1, $2, 'saida', $3, $4, NULL, $5)`,
-            [stock.id, sale.uid, quantity, `Saída por Venda TikTok Shop - Pedido ${sale.order_id}`, sale.order_id]
+               (sku_id, user_id, movement_type, quantity_change, reason, related_sale_id,
+                external_sale_id, sale_line_key)
+             VALUES ($1, $2, 'saida', $3, $4, NULL, $5, $6)`,
+            [
+              stock.id,
+              sale.uid,
+              quantity,
+              `Saída por Venda TikTok Shop - Pedido ${sale.order_id}`,
+              sale.order_id,
+              movementKey(stock.id),
+            ]
           );
         } else {
           if (Number(stock.quantidade) < quantity) {
@@ -2358,9 +2706,17 @@ router.post('/process', authenticateToken, requireMaster, async (req, res) => {
           );
           await client.query(
             `INSERT INTO public.stock_movements
-               (sku_id, user_id, movement_type, quantity_change, reason, related_sale_id, external_sale_id)
-             VALUES ($1, $2, 'saida', $3, $4, NULL, $5)`,
-            [stock.id, sale.uid, quantity, `Saída por Venda TikTok Shop - Pedido ${sale.order_id}`, sale.order_id]
+               (sku_id, user_id, movement_type, quantity_change, reason, related_sale_id,
+                external_sale_id, sale_line_key)
+             VALUES ($1, $2, 'saida', $3, $4, NULL, $5, $6)`,
+            [
+              stock.id,
+              sale.uid,
+              quantity,
+              `Saída por Venda TikTok Shop - Pedido ${sale.order_id}`,
+              sale.order_id,
+              movementKey(stock.id),
+            ]
           );
         }
 
@@ -2377,9 +2733,15 @@ router.post('/process', authenticateToken, requireMaster, async (req, res) => {
         if (updateResult.rowCount !== 1) throw new Error('Venda não pôde ser marcada como processada.');
 
         await client.query('COMMIT');
-        return { orderId: sale.order_id, sku: sale.sku, alreadyProcessed: false };
+        return {
+          orderId: sale.order_id,
+          sku: sale.sku,
+          alreadyProcessed: false,
+          processedAt: updateResult.rows[0].processed_at,
+        };
       } catch (error) {
         try { await client.query('ROLLBACK'); } catch { /* transação já encerrada */ }
+        if (isDuplicateSaleMovement(error)) throw duplicateSaleMovementError();
         throw error;
       }
     } finally {
@@ -2431,16 +2793,41 @@ router.post('/process', authenticateToken, requireMaster, async (req, res) => {
 });
 
 /**
+ * Status de expedição que uma venda pode receber: lista FECHADA.
+ *
+ * Vem de system_settings ('sales_statuses', JSON [{ value, label }] que o master
+ * edita em /settings/statuses e que a tela envia como `status.value`), mais os
+ * dois valores fixos do sistema: 'Pendente' (default da coluna) e 'Despachado'
+ * (a forma que a tela padroniza para o despacho).
+ */
+const TIKTOK_FIXED_SHIPPING_STATUSES = ['Pendente', 'Despachado'];
+
+async function loadAllowedShippingStatuses() {
+  const allowed = new Set(TIKTOK_FIXED_SHIPPING_STATUSES);
+  const { rows } = await db.query("SELECT value FROM public.system_settings WHERE key = 'sales_statuses'");
+  const configured = Array.isArray(rows[0]?.value) ? rows[0].value : [];
+  for (const item of configured) {
+    const value = typeof item === 'string' ? item : item?.value;
+    if (typeof value === 'string' && value.trim()) allowed.add(value.trim());
+  }
+  return allowed;
+}
+
+/**
  * Status de expedição de uma venda TikTok (equivalente a /shopee/status).
  *
  * Usuário comum só altera as próprias vendas; o master altera de qualquer dono.
  */
 router.put('/status', authenticateToken, async (req, res) => {
-  const body = req.body || {};
-  const orderId = String(body.orderId || body.order_id || body.orderSn || '').trim();
-  const sku = String(body.sku || '').trim();
-  const uid = String(body.uid || '').trim();
-  const shippingStatus = String(body.shippingStatus || '').trim();
+  const body = rec(req.body);
+  // Só string vale (objeto no corpo faria String()/trim() lançar fora do try).
+  const orderId = readAliasedText([body.orderId, body.order_id, body.orderSn], 64);
+  const sku = readText(body.sku, 255);
+  const uid = readText(body.uid, 255);
+  const shippingStatus = readText(body.shippingStatus, 100);
+  if ([orderId, sku, uid, shippingStatus].includes(null)) {
+    return res.status(400).json({ error: 'orderId, sku, uid e shippingStatus precisam ser textos válidos.' });
+  }
   if (!orderId || !sku || !uid || !shippingStatus) {
     return res.status(400).json({ error: 'orderId, sku, uid e shippingStatus são obrigatórios.' });
   }
@@ -2448,6 +2835,14 @@ router.put('/status', authenticateToken, async (req, res) => {
     return res.status(403).json({ error: 'Acesso negado. Você só pode alterar as suas próprias vendas.' });
   }
   try {
+    const allowedStatuses = await loadAllowedShippingStatuses();
+    if (!allowedStatuses.has(shippingStatus)) {
+      return res.status(400).json({
+        error: 'Status de expedição desconhecido. Escolha um dos status configurados no sistema.',
+        allowedStatuses: Array.from(allowedStatuses),
+      });
+    }
+
     const { rowCount } = await db.query(
       `UPDATE public.tiktok_sales
           SET shipping_status = $1, updated_at = NOW()
@@ -2457,6 +2852,7 @@ router.put('/status', authenticateToken, async (req, res) => {
     if (rowCount === 0) return res.status(404).json({ error: 'Venda não encontrada.' });
     res.json({ message: 'Status atualizado com sucesso.' });
   } catch (error) {
+    console.error(`[TikTok Status] Erro ao atualizar o status do pedido ${orderId}: ${describeTikTokError(error)}`);
     res.status(500).json({ error: 'Erro interno ao atualizar status.' });
   }
 });
