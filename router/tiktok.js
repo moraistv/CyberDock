@@ -29,7 +29,7 @@ const {
   requireOwnerOrMaster,
   verifyAccessToken,
 } = require('../utils/authMiddleware');
-const { stampLabelLines, buildItemLines } = require('../utils/labelStamp');
+const { stampLabelFooter, buildItemLines } = require('../utils/labelStamp');
 const {
   TikTokApiError,
   TIKTOK_SHIPPING_QUEUE_STATUS,
@@ -1487,6 +1487,11 @@ router.get('/download-label', authenticateToken, async (req, res) => {
 
     /* SKU estampado na etiqueta, como na Shopee e no Mercado Livre.
      *
+     * Aqui a etiqueta é REDUZIDA (cerca de 6% com 1 SKU) e Qtd | SKU vai numa
+     * faixa livre embaixo. A etiqueta do TikTok é toda vetorial: o QR code não
+     * pode ser localizado, e a estampa sobre ela caía no rodapé da página, em
+     * cima do código de barras da NF-e e dos números da chave.
+     *
      * Nada aqui é impeditivo: sem itens gravados, ou se o PDF não puder ser
      * reescrito, a etiqueta original segue do mesmo jeito. */
     const allPdf = documents.every((doc) => looksLikePdf(doc.buffer, doc.contentType));
@@ -1500,7 +1505,7 @@ router.get('/download-label', authenticateToken, async (req, res) => {
             console.warn(`[TikTok Label] Pacote ${doc.packageId} do pedido ${orderId} sem vínculo item→pacote; etiqueta mantida sem estampa CyberDock.`);
           }
           const lines = buildItemLines(packageItems);
-          if (lines.length > 0) buffer = await stampLabelLines(buffer, lines);
+          if (lines.length > 0) buffer = await stampLabelFooter(buffer, lines);
         } catch (stampError) {
           console.error(`[TikTok Label] Falha ao estampar o SKU no pedido ${orderId}:`, stampError.message);
         }

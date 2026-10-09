@@ -8,6 +8,11 @@
  * uma implementação própria que também remove a página de declaração de conteúdo
  * e trata ZPL. Este módulo é a parte genérica, para a Shopee usar sem que eu
  * precise mexer naquele caminho, que está em produção e funciona.
+ *
+ * Há dois jeitos de estampar:
+ *   - stampLabelLines: bloco logo ACIMA do QR code (Shopee). Depende de achar o QR.
+ *   - stampLabelFooter: reduz a etiqueta e escreve numa faixa livre ABAIXO dela
+ *     (TikTok). Não depende de achar nada, então nunca cobre código de barras.
  */
 const zlib = require('zlib');
 const { PDFDocument, rgb, StandardFonts } = require('pdf-lib');
@@ -349,6 +354,143 @@ async function stampLabelLines(pdfBuffer, lines, options = {}) {
 }
 
 /**
+ * Reduz a etiqueta e escreve as linhas numa faixa livre ABAIXO dela.
+ *
+ * Existe por causa da etiqueta do TikTok Shop (iMile, A6). Nela o QR code e os
+ * códigos de barras são traçados como caminhos vetoriais, sem imagem e sem
+ * retângulos: stampLabelLines não acha o QR, cai no plano B e cola a caixa na
+ * borda de baixo da página, em cima do código de barras da NF-e e dos 44
+ * números da chave, que são exatamente o que fica ali.
+ *
+ * Em vez de adivinhar onde há espaço, este jeito CRIA o espaço: a página inteira
+ * é desenhada um pouco menor (mesma escala nos dois eixos, então código de barras
+ * e QR não se deformam), encostada no topo, e a faixa que sobra embaixo recebe a
+ * caixa com Qtd | SKU. Nada é coberto, qualquer que seja o desenho da etiqueta.
+ *
+ * Quanto reduz (página A6, 420 pt de altura): 1 SKU ~6%, 2 SKUs ~10%, 3 SKUs
+ * ~13%. A faixa nunca passa de `maxReserve` da altura; acima disso a letra
+ * diminui, até `minFontSize`.
+ *
+ * Plano B, sempre que não der para reduzir com segurança (página girada, PDF que
+ * o pdf-lib não consegue reembutir, redução absurda): usa stampLabelLines, que
+ * é o comportamento de antes. E se nem isso der, devolve o PDF ORIGINAL: a
+ * etiqueta é o que o cliente precisa imprimir.
+ *
+ * @param {Buffer} pdfBuffer PDF vindo do marketplace.
+ * @param {string[]} lines Linhas a imprimir, da primeira (topo) à última.
+ * @param {{ maxFontSize?: number, minFontSize?: number, maxReserve?: number }} [options]
+ * @returns {Promise<Buffer>}
+ */
+async function stampLabelFooter(pdfBuffer, lines, options = {}) {
+  const texto = (lines || []).map((l) => String(l || '').trim()).filter(Boolean);
+  if (texto.length === 0) return pdfBuffer;
+
+  const maxFontSize = options.maxFontSize || 12;
+  const minFontSize = options.minFontSize || 5.5;
+  const maxReserve = options.maxReserve || 0.14;
+  // Abaixo disso a etiqueta ficaria pequena demais para ler: melhor o plano B.
+  const escalaMinima = 0.7;
+
+  const padding = 4;
+  const margemInferior = 2;
+  const folga = 2;
+
+  try {
+    const origem = await PDFDocument.load(pdfBuffer);
+    const paginas = origem.getPages();
+    if (paginas.length === 0) return pdfBuffer;
+
+    // O reembutir não aplica /Rotate: uma página girada sairia torta.
+    if (paginas.some((p) => p.getRotation().angle % 360 !== 0)) {
+      console.warn('[labelStamp] Página girada; usando a estampa sobre a etiqueta.');
+      return stampLabelLines(pdfBuffer, lines);
+    }
+
+    const saida = await PDFDocument.create();
+    const font = await saida.embedFont(StandardFonts.HelveticaBold);
+
+    for (const pagina of paginas) {
+      // A área visível é a CropBox (ou a MediaBox, na falta dela). Passar a caixa
+      // explicitamente também acerta PDFs cuja origem não é (0, 0).
+      const caixa = pagina.getCropBox();
+      const largura = caixa.width;
+      const altura = caixa.height;
+      if (!(largura > 50 && altura > 50)) throw new Error('página com tamanho inválido');
+
+      const embutida = await saida.embedPage(pagina, {
+        left: caixa.x,
+        bottom: caixa.y,
+        right: caixa.x + caixa.width,
+        top: caixa.y + caixa.height,
+      });
+
+      // Maior corpo em que a linha mais larga cabe E a faixa respeita o teto.
+      let fontSize = maxFontSize;
+      const maiorLinha = () => texto.reduce(
+        (maior, linha) => Math.max(maior, font.widthOfTextAtSize(linha, fontSize)),
+        0
+      );
+      const alturaDoBloco = () => (fontSize + 3) * texto.length + padding * 2;
+      const reservado = () => margemInferior + alturaDoBloco() + folga;
+      const larguraDisponivel = largura - padding * 6;
+      while (
+        fontSize > minFontSize
+        && (maiorLinha() > larguraDisponivel || reservado() > altura * maxReserve)
+      ) {
+        fontSize -= 0.5;
+      }
+      // SKU gigante que não cabe nem no menor corpo: letra miúda, mas dentro da
+      // página. Texto passando da borda seria cortado na impressão.
+      if (maiorLinha() > larguraDisponivel) {
+        fontSize = Math.max(3, (fontSize * larguraDisponivel) / maiorLinha());
+      }
+
+      const escala = (altura - reservado()) / altura;
+      if (!(escala >= escalaMinima)) throw new Error(`redução de ${Math.round((1 - escala) * 100)}% é grande demais`);
+
+      const novaPagina = saida.addPage([largura, altura]);
+      const larguraEtiqueta = largura * escala;
+      const alturaEtiqueta = altura * escala;
+      // Encostada no topo e centrada; a sobra fica toda embaixo.
+      novaPagina.drawPage(embutida, {
+        x: (largura - larguraEtiqueta) / 2,
+        y: altura - alturaEtiqueta,
+        width: larguraEtiqueta,
+        height: alturaEtiqueta,
+      });
+
+      const alturaLinha = fontSize + 3;
+      const alturaBloco = alturaDoBloco();
+      const larguraBloco = Math.min(largura - padding * 2, maiorLinha() + padding * 4);
+      const blocoX = (largura - larguraBloco) / 2;
+
+      novaPagina.drawRectangle({
+        x: blocoX,
+        y: margemInferior,
+        width: larguraBloco,
+        height: alturaBloco,
+        color: rgb(1, 1, 1),
+        borderColor: rgb(0, 0, 0),
+        borderWidth: 0.7,
+      });
+
+      // Primeira linha no topo do bloco, última embaixo.
+      texto.forEach((linha, indice) => {
+        const larguraTexto = font.widthOfTextAtSize(linha, fontSize);
+        const x = blocoX + Math.max(0, (larguraBloco - larguraTexto) / 2);
+        const y = margemInferior + padding + (texto.length - 1 - indice) * alturaLinha + 1;
+        novaPagina.drawText(linha, { x, y, size: fontSize, font, color: rgb(0, 0, 0) });
+      });
+    }
+
+    return Buffer.from(await saida.save());
+  } catch (error) {
+    console.error('[labelStamp] Não foi possível reduzir a etiqueta; usando a estampa sobre ela:', error.message);
+    return stampLabelLines(pdfBuffer, lines);
+  }
+}
+
+/**
  * Linhas de conferência a partir dos itens da venda.
  *
  * Um pedido pode ter vários SKUs no mesmo pacote, então sai uma linha por item.
@@ -371,5 +513,6 @@ module.exports = {
   getVectorQrBox,
   findQrCodeBox,
   stampLabelLines,
+  stampLabelFooter,
   buildItemLines,
 };
