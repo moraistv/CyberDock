@@ -19,7 +19,9 @@ const {
   isValidIsoDate,
   hojeNoBrasil,
   normalizeBillingType,
+  moneyCents,
 } = require('../utils/billingSafety');
+const { montarDescricaoCobranca, formatarReais, LIMITE_DESCRICAO_ASAAS } = require('../utils/billingDescription');
 
 const router = express.Router();
 
@@ -36,6 +38,16 @@ const billingQueryBuilder = new BillingQueryBuilder();
 /* -------------------------------------------------------------------------- */
 
 const PERIODO_VALIDO = /^\d{4}-(0[1-9]|1[0-2])$/;
+
+/* Dia de vencimento das faturas, no mês SEGUINTE à competência. A conta (e o
+ * histórico de quando era dia 5) está comentada em calculateAndSaveInvoice. */
+const DIA_VENCIMENTO = 10;
+
+/** Vencimento padrão da competência em AAAA-MM-DD: "2026-08" -> "2026-09-10". */
+function vencimentoPadraoDaCompetencia(period) {
+  const [year, month] = period.split('-').map(Number);
+  return new Date(Date.UTC(year, month, DIA_VENCIMENTO)).toISOString().slice(0, 10);
+}
 
 /** Erro do provedor traduzido para resposta HTTP, sem vazar detalhe interno. */
 function responderErroAsaas(res, erro, contexto) {
@@ -372,7 +384,6 @@ async function calculateAndSaveInvoice(client, uid, period) {
    * de chegar aqui — e isso é o certo: o valor e o documento dela já foram
    * congelados, possivelmente já comunicados ao cliente.
    */
-  const DIA_VENCIMENTO = 10;
   const dueDate = new Date(Date.UTC(year, month, DIA_VENCIMENTO));
   const upsertRes = await client.query(`
     INSERT INTO public.invoices (uid, period, due_date, total_amount, status)
@@ -490,6 +501,194 @@ router.get('/summary', authenticateToken, requireMaster, async (req, res) => {
   } catch (err) {
     console.error('Erro ao buscar resumo de faturamento:', err);
     res.status(500).json({ error: 'Erro interno ao buscar resumo de faturamento.' });
+  }
+});
+
+/**
+ * ===== Visão geral de uma competência, todos os clientes (master) =====
+ *
+ * Base da tela geral de cobranças: cada cliente com a fatura da competência e o
+ * que falta para cobrá-lo, numa consulta só.
+ *
+ * SOMENTE LEITURA, de propósito. GET /invoices/:uid recalcula a fatura em toda
+ * leitura; repetir isso aqui varreria as vendas de todos os clientes a cada
+ * abertura da tela — e recálculo em paralelo já esgotou o pool (incidente de
+ * 25/08). O total exibido é o último gravado. Quem quer o valor de agora pede
+ * POST /overview/:period/refresh, e o fechamento recalcula uma última vez antes
+ * de congelar.
+ *
+ * Documento e endereço saem como booleanos: a tela precisa saber se dá para
+ * cobrar, não do CPF/CNPJ de todos os clientes.
+ */
+router.get('/overview', authenticateToken, requireMaster, async (req, res) => {
+  const period = String(req.query.period || '');
+  if (!PERIODO_VALIDO.test(period)) {
+    return res.status(400).json({ error: 'Competência inválida. Use o formato AAAA-MM.' });
+  }
+
+  try {
+    const { rows } = await db.query(`
+      SELECT u.uid, u.name, u.email, u.active,
+             u.cpf_cnpj, u.postal_code, u.address_number, u.asaas_customer_id,
+             (SELECT ma.nickname FROM public.ml_accounts ma
+               WHERE ma.uid = u.uid ORDER BY ma.created_at ASC LIMIT 1) AS ml_nickname,
+             i.id AS invoice_id, i.total_amount, i.status,
+             to_char(i.due_date, 'YYYY-MM-DD') AS due_date,
+             to_char(i.payment_date, 'YYYY-MM-DD') AS payment_date,
+             i.closed_at, i.closed_by,
+             i.asaas_payment_id, i.asaas_status, i.asaas_invoice_url,
+             itens.quantidade AS item_count, itens.soma AS items_total
+        FROM public.users u
+        LEFT JOIN public.invoices i ON i.uid = u.uid AND i.period = $1
+        LEFT JOIN LATERAL (
+          SELECT COUNT(*)::int AS quantidade, COALESCE(SUM(it.total_price), 0) AS soma
+            FROM public.invoice_items it
+           WHERE it.invoice_id = i.id
+        ) itens ON TRUE
+       WHERE u.role = 'cliente'
+       ORDER BY u.name NULLS LAST, u.email
+    `, [period]);
+
+    const clients = rows.map((r) => {
+      const hasDocument = Boolean(r.cpf_cnpj && String(r.cpf_cnpj).trim());
+      return {
+        uid: r.uid,
+        name: r.name || null,
+        email: r.email || null,
+        mlNickname: r.ml_nickname || null,
+        active: r.active !== false,
+        hasDocument,
+        // Mesmo critério de GET /users/:uid/billing-info.
+        boletoReady: hasDocument && Boolean(r.postal_code && r.address_number),
+        linked: Boolean(r.asaas_customer_id),
+        invoice: r.invoice_id ? {
+          id: r.invoice_id,
+          total: round(parseFloat(r.total_amount) || 0),
+          itemsTotal: round(parseFloat(r.items_total) || 0),
+          itemCount: r.item_count,
+          // A mesma conferência da emissão, em centavos.
+          itemsMatch: moneyCents(r.items_total) === moneyCents(r.total_amount),
+          status: r.status,
+          dueDate: r.due_date,
+          paymentDate: r.payment_date,
+          closedAt: r.closed_at,
+          closedBy: r.closed_by,
+          asaasPaymentId: r.asaas_payment_id,
+          asaasStatus: r.asaas_status,
+          asaasInvoiceUrl: r.asaas_invoice_url,
+        } : null,
+      };
+    });
+
+    return res.json({
+      period,
+      // "Hoje" de Brasília, o mesmo que a emissão usa para recusar vencimento passado.
+      today: hojeNoBrasil(),
+      standardDueDate: vencimentoPadraoDaCompetencia(period),
+      clients,
+    });
+  } catch (err) {
+    console.error(`Erro ao montar a visão geral de cobranças de ${period}:`, err);
+    return res.status(500).json({ error: 'Erro interno ao carregar as cobranças da competência.' });
+  }
+});
+
+/* Teto de clientes por chamada de recálculo. A tela manda em lotes: cada
+ * recálculo varre as vendas do cliente, e uma requisição longa demais cairia no
+ * timeout do proxy no meio do lote. */
+const LIMITE_RECALCULO_POR_CHAMADA = 25;
+
+/**
+ * ===== Recalcula as faturas ABERTAS de uma competência (master) =====
+ *
+ * O "recalcular" da tela geral. Para cada uid informado, recalcula a
+ * competência como a abertura da fatura faria, com duas diferenças que são o
+ * motivo de esta rota existir em vez de chamar GET /invoices/:uid em laço:
+ *
+ *   - roda sob o mesmo lock da emissão e do fechamento. Sem ele, um recálculo
+ *     que começou com o mês aberto podia terminar depois de um fechamento e
+ *     regravar a fatura já congelada;
+ *   - em série, uma transação por cliente: um que falhe não desfaz os outros.
+ *
+ * Competência fechada e fatura já paga ficam como estão (`skipped`). Cliente
+ * sem fatura na competência ganha uma, que é o que a abertura da tela dele já
+ * faria.
+ */
+router.post('/overview/:period/refresh', authenticateToken, requireMaster, async (req, res) => {
+  const { period } = req.params;
+  if (!PERIODO_VALIDO.test(period)) {
+    return res.status(400).json({ error: 'Competência inválida. Use o formato AAAA-MM.' });
+  }
+
+  const pedidos = Array.isArray(req.body?.uids)
+    ? [...new Set(req.body.uids
+      .filter((uid) => typeof uid === 'string' && uid.trim())
+      .map((uid) => uid.trim()))]
+    : [];
+  if (pedidos.length === 0) {
+    return res.status(400).json({ error: 'Informe em `uids` os clientes a recalcular.' });
+  }
+  if (pedidos.length > LIMITE_RECALCULO_POR_CHAMADA) {
+    return res.status(400).json({
+      error: `Recalcule no máximo ${LIMITE_RECALCULO_POR_CHAMADA} clientes por vez.`,
+      code: 'too_many_clients',
+    });
+  }
+
+  try {
+    const existentes = await db.query(
+      `SELECT uid FROM public.users WHERE uid = ANY($1::text[]) AND role = 'cliente'`,
+      [pedidos]
+    );
+    const clientes = new Set(existentes.rows.map((r) => r.uid));
+
+    const results = [];
+    for (const uid of pedidos) {
+      if (!clientes.has(uid)) {
+        results.push({ uid, ok: false, code: 'not_found', error: 'Cliente não encontrado.' });
+        continue;
+      }
+      try {
+        results.push(await withBillingLock('invoice', `${uid}:${period}`, async (client) => {
+          await client.query('BEGIN');
+          try {
+            const atual = await client.query(
+              'SELECT closed_at, status FROM public.invoices WHERE uid = $1 AND period = $2',
+              [uid, period]
+            );
+            const fatura = atual.rows[0];
+            if (fatura?.closed_at || fatura?.status === 'paid') {
+              await client.query('ROLLBACK');
+              return { uid, ok: true, skipped: fatura.closed_at ? 'closed' : 'paid' };
+            }
+            const calculo = await calculateAndSaveInvoice(client, uid, period);
+            await client.query('COMMIT');
+            return calculo.recalculada === false
+              ? { uid, ok: true, skipped: 'closed' }
+              : { uid, ok: true, total: round(calculo.total) };
+          } catch (erro) {
+            await client.query('ROLLBACK').catch(() => {});
+            throw erro;
+          }
+        }));
+      } catch (erro) {
+        const ocupado = erro?.code === 'billing_busy';
+        if (!ocupado) console.error(`Erro ao recalcular ${uid} ${period}:`, erro?.message || erro);
+        results.push({
+          uid,
+          ok: false,
+          code: ocupado ? 'billing_busy' : null,
+          error: ocupado
+            ? 'Outra operação de cobrança deste cliente está em andamento.'
+            : 'Não foi possível recalcular.',
+        });
+      }
+    }
+
+    return res.json({ ok: true, period, results });
+  } catch (err) {
+    console.error(`Erro ao recalcular a competência ${period}:`, err);
+    return res.status(500).json({ error: 'Erro interno ao recalcular a competência.' });
   }
 });
 
@@ -1355,6 +1554,82 @@ async function carregarFaturaParaCobranca(uid, period, executor = db) {
   return rows[0] || null;
 }
 
+/** Itens da fatura, na ordem em que foram gravados (a montagem reordena por tipo). */
+async function carregarItensDaFatura(invoiceId, executor = db) {
+  const { rows } = await executor.query(`
+    SELECT id, description, quantity, unit, unit_price, total_price, type
+      FROM public.invoice_items
+     WHERE invoice_id = $1
+     ORDER BY id
+  `, [invoiceId]);
+  return rows;
+}
+
+/** Composição da fatura -> descrição da cobrança. Ver utils/billingDescription.js. */
+async function montarComposicaoDaFatura(fatura, executor = db) {
+  return montarDescricaoCobranca({
+    items: await carregarItensDaFatura(fatura.id, executor),
+    total: fatura.total_amount,
+    period: fatura.period,
+  });
+}
+
+/** Resposta 422 para fatura cujos itens não fecham com o total congelado. */
+function responderItensDivergentes(res, composicao) {
+  const soma = composicao.itemsCents === null ? 'um valor inválido' : formatarReais(composicao.itemsCents);
+  const total = composicao.totalCents === null ? 'um valor inválido' : formatarReais(composicao.totalCents);
+  return res.status(422).json({
+    error: `Os itens desta fatura somam ${soma}, mas o total congelado é ${total}. A descrição da `
+      + 'cobrança detalharia um valor diferente do cobrado. Reabra e feche a competência para '
+      + 'recalcular antes de emitir.',
+    code: 'items_total_mismatch',
+    itemsTotal: composicao.itemsTotal,
+    invoiceTotal: composicao.total,
+  });
+}
+
+/**
+ * ===== Prévia da descrição da cobrança (master) =====
+ *
+ * O texto que POST .../charge mandaria ao Asaas, montado pela mesma função e
+ * sem tocar o provedor. Serve para conferir a composição antes de emitir, na
+ * tela do cliente e na tela geral.
+ *
+ * Com a competência aberta a prévia usa os itens gravados agora, que ainda
+ * mudam até o fechamento; `closed` diz em qual dos dois casos se está.
+ */
+router.get('/invoices/:uid/:period/charge-preview', authenticateToken, requireMaster, async (req, res) => {
+  const { uid, period } = req.params;
+  if (!PERIODO_VALIDO.test(period)) {
+    return res.status(400).json({ error: 'Competência inválida. Use o formato AAAA-MM.' });
+  }
+
+  try {
+    const fatura = await carregarFaturaParaCobranca(uid, period);
+    if (!fatura) {
+      return res.status(404).json({ error: 'Não há fatura desta competência para este cliente.' });
+    }
+    const composicao = await montarComposicaoDaFatura(fatura);
+    return res.json({
+      period,
+      closed: Boolean(fatura.closed_at),
+      charged: Boolean(fatura.asaas_payment_id),
+      description: composicao.description,
+      length: composicao.length,
+      limit: LIMITE_DESCRICAO_ASAAS,
+      matches: composicao.matches,
+      total: composicao.total,
+      itemsTotal: composicao.itemsTotal,
+      itemCount: composicao.itemCount,
+      groupedItems: composicao.groupedItems,
+      compacted: composicao.compacted,
+    });
+  } catch (err) {
+    console.error(`Erro ao montar a prévia da cobrança de ${uid} ${period}:`, err);
+    return res.status(500).json({ error: 'Erro interno ao montar a descrição da cobrança.' });
+  }
+});
+
 /**
  * ===== Emite a cobrança da competência (master) =====
  *
@@ -1394,8 +1669,10 @@ router.post('/invoices/:uid/:period/charge', authenticateToken, requireMaster, a
   if (description !== undefined && description !== null && typeof description !== 'string') {
     return res.status(400).json({ error: 'A descrição da cobrança deve ser um texto.' });
   }
-  if (description && description.length > 500) {
-    return res.status(400).json({ error: 'A descrição da cobrança deve ter no máximo 500 caracteres.' });
+  if (description && description.length > LIMITE_DESCRICAO_ASAAS) {
+    return res.status(400).json({
+      error: `A descrição da cobrança deve ter no máximo ${LIMITE_DESCRICAO_ASAAS} caracteres.`,
+    });
   }
 
   try {
@@ -1457,14 +1734,25 @@ router.post('/invoices/:uid/:period/charge', authenticateToken, requireMaster, a
       });
     }
 
-    const descricao = description
-      || `CyberDock - Fatura ${period} - ${fatura.client_name || fatura.client_email}`;
+    /* Descrição: a informada no corpo ou, no caso normal, a composição da
+     * fatura — cada serviço com quantidade e valor, montada aqui para valer
+     * igual na tela do cliente e na tela geral de cobranças. */
+    const composicao = description ? null : await montarComposicaoDaFatura(fatura, lockClient);
+    const descricao = description || composicao.description;
 
     // Consulta antes do dry-run: prova chave/rede e detecta a cobrança criada
     // cujo vínculo local se perdeu. Ela só é adotada se cliente, referência e
     // valor forem exatamente os desta fatura.
     const existente = await asaas.findPaymentByInvoice(uid, period);
     if (existente) assertPaymentMatchesInvoice(existente, fatura);
+
+    /* Para CRIAR, os itens têm de fechar com o total: uma descrição detalhando
+     * um valor numa cobrança de outro é pior do que o texto genérico de antes.
+     * Na adoção nada é enviado, e a cobrança já conferiu com o total acima —
+     * recusar ali deixaria sem vínculo um documento que o cliente já recebeu. */
+    if (!existente && composicao && !composicao.matches) {
+      return responderItensDivergentes(res, composicao);
+    }
 
     if (dryRun) {
       let clienteRemoto;
@@ -1523,9 +1811,23 @@ router.post('/invoices/:uid/:period/charge', authenticateToken, requireMaster, a
       return res.status(502).json({ error: 'O provedor não devolveu o identificador da cobrança.' });
     }
 
+    /* O vencimento que vale é o da cobrança no provedor: o informado agora ou,
+     * na adoção, o da cobrança que já existia. */
+    const vencimentoEmitido = isValidIsoDate(cobranca.dueDate) ? cobranca.dueDate : vencimento;
+
     try {
       await lockClient.query('BEGIN');
       const aplicado = await aplicarCobrancaNaFatura(lockClient, { uid, period, cobranca });
+      /* Mesmo critério de PATCH .../charge: a fatura passa a mostrar o
+       * vencimento do documento que o cliente recebeu. Sem isto, emitir com data
+       * nova (vencimento padrão já passado, ou a data única da emissão em massa)
+       * deixava a tela exibindo o dia 10 enquanto o boleto vencia em outro dia.
+       * A competência está fechada, então o recálculo não desfaz esta data. */
+      await lockClient.query(`
+        UPDATE public.invoices
+           SET due_date = $1::date
+         WHERE uid = $2 AND period = $3 AND due_date IS DISTINCT FROM $1::date
+      `, [vencimentoEmitido, uid, period]);
       await lockClient.query('COMMIT');
 
       console.log(`[Cobrança] ${adotada ? 'Adotada' : 'Emitida'} cobrança ${cobranca.id} para ${uid} ${period} `
@@ -1540,7 +1842,9 @@ router.post('/invoices/:uid/:period/charge', authenticateToken, requireMaster, a
         invoiceUrl: cobranca.invoiceUrl || null,
         bankSlipUrl: cobranca.bankSlipUrl || null,
         value: valor,
-        dueDate: vencimento,
+        dueDate: vencimentoEmitido,
+        // Na adoção a descrição é a da cobrança que já existia no provedor.
+        description: adotada ? (cobranca.description ?? null) : descricao,
       });
     } catch (erro) {
       await lockClient.query('ROLLBACK').catch(() => {});
