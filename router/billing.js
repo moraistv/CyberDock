@@ -530,8 +530,12 @@ router.get('/overview', authenticateToken, requireMaster, async (req, res) => {
     const { rows } = await db.query(`
       SELECT u.uid, u.name, u.email, u.active,
              u.cpf_cnpj, u.postal_code, u.address_number, u.asaas_customer_id,
+             -- ml_accounts não tem created_at: a data da conta é connected_at,
+             -- o mesmo critério do histórico de serviços (router/history.js).
              (SELECT ma.nickname FROM public.ml_accounts ma
-               WHERE ma.uid = u.uid ORDER BY ma.created_at ASC LIMIT 1) AS ml_nickname,
+               WHERE ma.uid = u.uid
+               ORDER BY ma.connected_at ASC NULLS LAST, ma.user_id ASC
+               LIMIT 1) AS ml_nickname,
              i.id AS invoice_id, i.total_amount, i.status,
              to_char(i.due_date, 'YYYY-MM-DD') AS due_date,
              to_char(i.payment_date, 'YYYY-MM-DD') AS payment_date,
