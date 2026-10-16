@@ -424,7 +424,131 @@ const schema = {
          WHERE processed_at IS NULL;
         CREATE INDEX idx_asaas_webhook_payment
             ON public.asaas_webhook_events (payment_id)
-         WHERE payment_id IS NOT NULL;`
+         WHERE payment_id IS NOT NULL;`,
+    /* Devoluções do Mercado Livre (tela /admin/devolucoes).
+     *
+     * Uma linha por devolução do ML (`ml_return_id` é o id da devolução, não o
+     * da reclamação). Os dados vêm da API do ML; o que é do CD fica nas colunas
+     * de chegada, análise e decisão, e o ML nunca as sobrescreve.
+     *
+     * `stage` é a situação no CyberDock: aguardando_envio, em_transito, no_cd,
+     * analisado, cancelada, no_ml (vai para o depósito do ML) e sem_devolucao
+     * (reembolso sem pedir o produto). `result` só existe depois da análise:
+     * apto, nao_apto ou parcial. */
+    ml_returns: `
+        CREATE TABLE public.ml_returns (
+            id BIGSERIAL PRIMARY KEY,
+            ml_return_id BIGINT NOT NULL UNIQUE,
+            claim_id BIGINT,
+            seller_id BIGINT NOT NULL,
+            uid VARCHAR(255) REFERENCES public.users(uid) ON DELETE SET NULL,
+            account_nickname VARCHAR(255),
+            order_id BIGINT,
+            pack_id BIGINT,
+            buyer_name VARCHAR(255),
+            ml_status VARCHAR(40),
+            ml_subtype VARCHAR(40),
+            ml_status_money VARCHAR(40),
+            refund_at VARCHAR(30),
+            destination VARCHAR(30),
+            shipment_id BIGINT,
+            shipment_status VARCHAR(40),
+            tracking_number VARCHAR(80),
+            claim_status VARCHAR(40),
+            claim_stage VARCHAR(40),
+            claim_reason_id VARCHAR(40),
+            claim_reason_text TEXT,
+            review_due_at TIMESTAMP WITH TIME ZONE,
+            stage VARCHAR(30) NOT NULL DEFAULT 'aguardando_envio',
+            result VARCHAR(20),
+            status_changed_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            received_at TIMESTAMP WITH TIME ZONE,
+            received_by VARCHAR(255),
+            decided_at TIMESTAMP WITH TIME ZONE,
+            decided_by VARCHAR(255),
+            checklist JSONB NOT NULL DEFAULT '{}'::jsonb,
+            notes TEXT,
+            not_apt_reason VARCHAR(40),
+            not_apt_destination VARCHAR(40),
+            ml_created_at TIMESTAMP WITH TIME ZONE,
+            ml_closed_at TIMESTAMP WITH TIME ZONE,
+            ml_last_updated TIMESTAMP WITH TIME ZONE,
+            raw_return JSONB,
+            raw_claim JSONB,
+            created_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            updated_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT CURRENT_TIMESTAMP
+        );
+        CREATE INDEX idx_ml_returns_stage ON public.ml_returns (stage, status_changed_at DESC);
+        CREATE INDEX idx_ml_returns_opened ON public.ml_returns ((COALESCE(ml_created_at, created_at)) DESC);
+        CREATE INDEX idx_ml_returns_uid ON public.ml_returns (uid);
+        CREATE INDEX idx_ml_returns_seller ON public.ml_returns (seller_id, stage);
+        CREATE INDEX idx_ml_returns_order ON public.ml_returns (order_id);
+        CREATE INDEX idx_ml_returns_claim ON public.ml_returns (claim_id);`,
+    /* Itens de cada devolução: pedido, anúncio e variação do ML, o SKU da venda
+     * e quantas unidades voltaram. `qty_apt`/`qty_not_apt` são da análise do CD;
+     * `restocked_at` marca a entrada no estoque e impede somar duas vezes. */
+    ml_return_items: `
+        CREATE TABLE public.ml_return_items (
+            id BIGSERIAL PRIMARY KEY,
+            return_id BIGINT NOT NULL REFERENCES public.ml_returns(id) ON DELETE CASCADE,
+            order_id BIGINT NOT NULL,
+            item_id VARCHAR(40) NOT NULL DEFAULT '',
+            variation_id VARCHAR(40) NOT NULL DEFAULT '',
+            sku VARCHAR(255),
+            title TEXT,
+            thumbnail TEXT,
+            permalink TEXT,
+            quantity INTEGER NOT NULL DEFAULT 1,
+            sold_quantity INTEGER,
+            context_type VARCHAR(20),
+            qty_apt INTEGER,
+            qty_not_apt INTEGER,
+            restocked_at TIMESTAMP WITH TIME ZONE,
+            created_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            updated_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            UNIQUE (return_id, order_id, item_id, variation_id)
+        );
+        CREATE INDEX idx_ml_return_items_sku ON public.ml_return_items (UPPER(TRIM(sku)));`,
+    /* Histórico de cada devolução: mudanças vindas do ML e tudo que o CD fez
+     * (chegada, análise, decisão, entrada no estoque, fotos), com quem e quando.
+     * `stock_movements` não guarda o operador, por isso ele fica aqui. */
+    ml_return_events: `
+        CREATE TABLE public.ml_return_events (
+            id BIGSERIAL PRIMARY KEY,
+            return_id BIGINT NOT NULL REFERENCES public.ml_returns(id) ON DELETE CASCADE,
+            kind VARCHAR(40) NOT NULL,
+            source VARCHAR(20) NOT NULL,
+            from_value VARCHAR(60),
+            to_value VARCHAR(60),
+            actor VARCHAR(255),
+            note TEXT,
+            payload JSONB,
+            created_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT CURRENT_TIMESTAMP
+        );
+        CREATE INDEX idx_ml_return_events_return ON public.ml_return_events (return_id, created_at DESC);`,
+    /* Fotos da inspeção. Ficam no próprio banco, em tabela separada (não pesam
+     * nas consultas de venda) e já reduzidas no navegador antes do envio. */
+    ml_return_photos: `
+        CREATE TABLE public.ml_return_photos (
+            id BIGSERIAL PRIMARY KEY,
+            return_id BIGINT NOT NULL REFERENCES public.ml_returns(id) ON DELETE CASCADE,
+            content_type VARCHAR(40) NOT NULL,
+            size_bytes INTEGER NOT NULL,
+            data BYTEA NOT NULL,
+            uploaded_by VARCHAR(255),
+            created_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT CURRENT_TIMESTAMP
+        );
+        CREATE INDEX idx_ml_return_photos_return ON public.ml_return_photos (return_id, id);`,
+    /* Ponto onde parou a leitura de reclamações de cada conta do ML. */
+    ml_return_sync: `
+        CREATE TABLE public.ml_return_sync (
+            seller_id BIGINT PRIMARY KEY,
+            cursor_at TIMESTAMP WITH TIME ZONE,
+            last_run_at TIMESTAMP WITH TIME ZONE,
+            last_ok_at TIMESTAMP WITH TIME ZONE,
+            last_error TEXT,
+            updated_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT CURRENT_TIMESTAMP
+        );`
 };
 
 /* ---------------------------------------------------------------------------
@@ -900,7 +1024,8 @@ async function syncDatabaseSchema() {
             'invoices', 'invoice_items', 'asaas_webhook_events', 'shopee_oauth_attempts', 'shopee_accounts',
             'shopee_sync_cursors', 'shopee_sync_jobs', 'shopee_sales',
             'tiktok_oauth_attempts', 'tiktok_accounts', 'tiktok_sync_cursors',
-            'tiktok_sync_jobs', 'tiktok_sales'
+            'tiktok_sync_jobs', 'tiktok_sales',
+            'ml_returns', 'ml_return_items', 'ml_return_events', 'ml_return_photos', 'ml_return_sync'
         ];
 
         await client.query('BEGIN');
