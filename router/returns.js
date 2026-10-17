@@ -49,9 +49,12 @@ async function comCliente(fn) {
 /* Token do ML                                                                */
 /* ------------------------------------------------------------------------- */
 
+/* Falha de acesso da conta: a tela pede para reconectar. */
+const acessoRecusado = (mensagem) => Object.assign(new Error(mensagem), { tipoDaFalha: 'acesso' });
+
 /** Mesma renovação do webhook de vendas, com a mesma trava contra gravar token vazio. */
 async function renovarToken({ db: banco, sellerId, uid, refreshToken }) {
-  if (!refreshToken) throw new Error('Conta do Mercado Livre sem renovação de acesso. Reconecte a conta.');
+  if (!refreshToken) throw acessoRecusado('Conta do Mercado Livre sem renovação de acesso. Reconecte a conta.');
   const resposta = await fetch('https://api.mercadolibre.com/oauth/token', {
     method: 'POST',
     headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
@@ -62,10 +65,14 @@ async function renovarToken({ db: banco, sellerId, uid, refreshToken }) {
       refresh_token: refreshToken,
     }),
   });
-  if (!resposta.ok) throw new Error(`Mercado Livre recusou a renovação do token (HTTP ${resposta.status}).`);
+  if (!resposta.ok) {
+    const erro = new Error(`Mercado Livre recusou a renovação do token (HTTP ${resposta.status}).`);
+    erro.tipoDaFalha = resposta.status >= 500 ? 'instavel' : 'acesso';
+    throw erro;
+  }
   const token = await resposta.json();
   if (!token || !token.access_token || !token.refresh_token) {
-    throw new Error('Renovação de token do ML devolveu resposta sem token.');
+    throw acessoRecusado('Renovação de token do ML devolveu resposta sem token.');
   }
   await banco.query(
     `UPDATE public.ml_accounts
@@ -85,6 +92,9 @@ const abrirSessao = (sellerId) => devolucoes.abrirSessaoMl(db, sellerId, { mlFet
 /* Trava do PostgreSQL: com mais de uma instância do backend, só uma sincroniza. */
 const CHAVE_DA_TRAVA = 727410;
 
+/* Contas lidas ao mesmo tempo. O limite de chamadas ao ML é o do mlClient, comum a tudo. */
+const CONTAS_EM_PARALELO = Math.min(8, Math.max(1, parseInt(process.env.ML_RETURNS_SYNC_CONCURRENCY || '4', 10) || 4));
+
 const estado = {
   rodando: false,
   gatilho: null,
@@ -96,6 +106,13 @@ const estado = {
   erro: null,
 };
 
+/*
+ * `falha` é o motivo que mais apareceu entre as contas que não foram lidas:
+ *  - acesso: token recusado ou conta sem renovação (reconectar a conta);
+ *  - consulta: o ML recusou a busca (ajuste no sistema, não na conta);
+ *  - instavel: o ML não respondeu ou limitou as chamadas (tenta de novo sozinho);
+ *  - outro: erro do próprio sistema (detalhe só no log do servidor).
+ */
 const estadoPublico = () => ({
   rodando: estado.rodando,
   gatilho: estado.gatilho,
@@ -106,8 +123,43 @@ const estadoPublico = () => ({
   devolucoes: estado.resultado?.devolucoes ?? null,
   novas: estado.resultado?.novas ?? null,
   contasComFalha: estado.resultado?.falhas?.length ?? 0,
+  falha: estado.resultado?.falhaPrincipal ?? null,
+  reclamacoesComFalha: estado.resultado?.reclamacoesComFalha ?? 0,
   erro: estado.erro,
 });
+
+/** Que tipo de falha derrubou a conta, para a tela dizer o que fazer. */
+function tipoDaFalha(erro) {
+  if (erro?.tipoDaFalha) return erro.tipoDaFalha;
+  const status = Number(erro?.status);
+  if (erro?.code === 'conta_nao_encontrada' || status === 401 || status === 403) return 'acesso';
+  if (status === 408 || status === 429 || status >= 500) return 'instavel';
+  if (status >= 400) return 'consulta';
+  if (erro?.name === 'FetchError' || erro?.name === 'AbortError') return 'instavel';
+  return 'outro';
+}
+
+/**
+ * Agrupa as contas que falharam pelo mesmo motivo: uma linha no log por
+ * motivo (e não uma por conta) e o motivo principal para a tela.
+ */
+function agruparFalhas(falhas) {
+  const grupos = new Map();
+  for (const falha of falhas) {
+    const texto = falha.erro.replace(/\d{5,}/g, '#');
+    const chave = `${falha.tipo}|${texto}`;
+    if (!grupos.has(chave)) grupos.set(chave, { tipo: falha.tipo, detalhe: falha.detalhe, erro: falha.erro, contas: [] });
+    grupos.get(chave).contas.push(falha.sellerId);
+  }
+  const ordenados = [...grupos.values()].sort((a, b) => b.contas.length - a.contas.length);
+  for (const g of ordenados) {
+    const n = g.contas.length;
+    const lista = `${g.contas.slice(0, 10).join(', ')}${n > 10 ? `, mais ${n - 10}` : ''}`;
+    console.warn(`[DEVOLUCOES] ${n} ${n === 1 ? 'conta não sincronizada' : 'contas não sincronizadas'} (${g.tipo}): ${g.erro} Contas: ${lista}.`);
+  }
+  const principal = ordenados[0];
+  return principal ? { tipo: principal.tipo, detalhe: principal.detalhe || null, contas: principal.contas.length } : null;
+}
 
 async function executarSincronizacao(gatilho) {
   if (estado.rodando) return false;
@@ -131,22 +183,49 @@ async function executarSincronizacao(gatilho) {
           WHERE status = 'active' AND access_token IS NOT NULL`
       )).rows;
       estado.contas = contas.length;
-      const resumo = { devolucoes: 0, novas: 0, falhas: [] };
-      for (const { seller_id: sellerId } of contas) {
-        try {
-          const ml = await abrirSessao(sellerId);
-          const r = await devolucoes.sincronizarConta({ db, ml, sellerId });
-          resumo.devolucoes += r.devolucoes;
-          resumo.novas += r.novas;
-        } catch (erro) {
-          resumo.falhas.push({ sellerId, erro: String(erro?.message || erro) });
-          console.warn(`[DEVOLUCOES] conta ${sellerId} não sincronizada: ${erro?.message || erro}`);
-        } finally {
-          estado.feitas += 1;
+      const resumo = {
+        devolucoes: 0, novas: 0, falhas: [], falhaPrincipal: null,
+        reclamacoesComFalha: 0, falhaDeReclamacao: null, buscas: {},
+      };
+      let proxima = 0;
+      const trabalhar = async () => {
+        while (proxima < contas.length) {
+          const { seller_id: sellerId } = contas[proxima];
+          proxima += 1;
+          try {
+            const ml = await abrirSessao(sellerId);
+            const r = await devolucoes.sincronizarConta({ db, ml, sellerId });
+            resumo.devolucoes += r.devolucoes;
+            resumo.novas += r.novas;
+            if (r.busca) resumo.buscas[r.busca] = (resumo.buscas[r.busca] || 0) + 1;
+            if (r.reclamacoesComFalha) {
+              resumo.reclamacoesComFalha += r.reclamacoesComFalha;
+              if (!resumo.falhaDeReclamacao) resumo.falhaDeReclamacao = { sellerId, ...r.falhaDeReclamacao };
+            }
+          } catch (erro) {
+            const tipo = tipoDaFalha(erro);
+            resumo.falhas.push({
+              sellerId,
+              tipo,
+              detalhe: tipo === 'consulta' ? erro?.detalheMl || null : null,
+              erro: String(erro?.message || erro),
+            });
+          } finally {
+            estado.feitas += 1;
+          }
         }
+      };
+      await Promise.all(Array.from({ length: Math.min(CONTAS_EM_PARALELO, contas.length) }, () => trabalhar()));
+
+      resumo.falhaPrincipal = agruparFalhas(resumo.falhas);
+      if (resumo.reclamacoesComFalha) {
+        const exemplo = resumo.falhaDeReclamacao;
+        console.warn(`[DEVOLUCOES] ${resumo.reclamacoesComFalha} reclamação(ões) não lida(s); serão tentadas de novo. Exemplo (conta ${exemplo.sellerId}): ${exemplo.mensagem}`);
       }
       estado.resultado = resumo;
-      console.log(`[DEVOLUCOES] sincronização (${gatilho}): ${contas.length} contas, ${resumo.devolucoes} devoluções, ${resumo.novas} novas, ${resumo.falhas.length} falhas`);
+      const buscas = Object.entries(resumo.buscas).map(([nome, n]) => `${nome}=${n}`).join(', ');
+      const qtd = (n, um, varios) => `${n} ${n === 1 ? um : varios}`;
+      console.log(`[DEVOLUCOES] sincronização (${gatilho}): ${qtd(contas.length, 'conta', 'contas')}, ${qtd(resumo.devolucoes, 'devolução', 'devoluções')}, ${qtd(resumo.novas, 'nova', 'novas')}, ${qtd(resumo.falhas.length, 'conta com falha', 'contas com falha')}${buscas ? `, formato da busca: ${buscas}` : ''}`);
     } finally {
       await trava.query('SELECT pg_advisory_unlock($1)', [CHAVE_DA_TRAVA]).catch(() => {});
     }
@@ -337,3 +416,4 @@ module.exports = router;
 module.exports.interceptarAvisoDoMl = interceptarAvisoDoMl;
 module.exports.ehAvisoDeDevolucao = ehAvisoDeDevolucao;
 module.exports.executarSincronizacao = executarSincronizacao;
+module.exports.tipoDaFalha = tipoDaFalha;

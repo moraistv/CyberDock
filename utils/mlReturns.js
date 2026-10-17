@@ -1238,9 +1238,21 @@ async function processarReclamacao({ db, ml, sellerId, claimId, claim = null }) 
   if (!reclamacao || !Array.isArray(reclamacao.players)) {
     reclamacao = await ml.get(`/post-purchase/v1/claims/${id}`, { aceita404: true });
   }
-  if (relacionaDevolucao(reclamacao) === false) return { ignorada: true };
+  const relacionada = relacionaDevolucao(reclamacao);
+  if (relacionada === false) return { ignorada: true };
 
-  const resposta = await ml.get(`/post-purchase/v2/claims/${id}/returns`, { aceita404: true });
+  let resposta;
+  try {
+    resposta = await ml.get(`/post-purchase/v2/claims/${id}/returns`, { aceita404: true });
+  } catch (erro) {
+    // A busca não traz a lista de entidades da reclamação. Sem ela, recusa do
+    // ML ao pedir a devolução quer dizer que esta reclamação não tem devolução.
+    const status = Number(erro?.status);
+    if (relacionada === null && status >= 400 && status < 500 && ![401, 408, 429].includes(status)) {
+      return { ignorada: true };
+    }
+    throw erro;
+  }
   const devolucoes = (Array.isArray(resposta) ? resposta : [resposta]).filter((d) => d && idTexto(d.id));
   if (!devolucoes.length) return { ignorada: true };
 
@@ -1258,30 +1270,206 @@ async function processarReclamacao({ db, ml, sellerId, claimId, claim = null }) 
   return { ignorada: false, resultados };
 }
 
-/** "2026-03-19T12:31:54.000+00:00": o formato que a busca de reclamações aceita. */
-const dataParaBusca = (data) => data.toISOString().replace('Z', '+00:00');
+/* ------------------------------------------------------------------------- */
+/* Busca de reclamações no ML                                                 */
+/* ------------------------------------------------------------------------- */
 
+const DIA_MS = 24 * 60 * 60 * 1000;
 const JANELA_INICIAL_DIAS = 60;
 const SOBREPOSICAO_MS = 10 * 60 * 1000;
+/* O fim do período vai um pouco à frente: relógio do ML adiantado não esconde a última reclamação. */
+const FOLGA_DO_RELOGIO_MS = 10 * 60 * 1000;
 const POR_PAGINA = 50;
+/* Regra do ML: offset + limit sempre abaixo de 10000. */
+const LIMITE_DE_POSICAO = 10000;
+/* Formato recusado volta a ser tentado depois deste tempo (o ML pode passar a aceitar). */
+const REAVALIAR_FORMATO_MS = 6 * 60 * 60 * 1000;
+/* Reclamação que falha por instabilidade segura o cursor por no máximo estas leituras. */
+const MAX_FALHAS_TRANSITORIAS = 3;
+const LIMITE_DA_MEMORIA = 50000;
+
+/**
+ * Formatos da busca, do mais preciso ao mais simples, todos da documentação do
+ * ML ("Gerenciar reclamações"). Em produção o ML respondeu 400 em todas as
+ * contas ao formato antigo (período só com início, data em "+00:00" e
+ * ordenação). Agora, se um formato for recusado, a leitura segue com o
+ * próximo e o sistema lembra qual funcionou.
+ *  - atualizadas: reclamações alteradas desde a última leitura (o normal);
+ *  - criadas: reclamações abertas nos últimos 60 dias. Mudança em reclamação
+ *    mais antiga chega pelo aviso do ML e pela releitura das devoluções a caminho;
+ *  - abertas: só as reclamações em aberto, sem período (o exemplo mínimo da doc).
+ */
+const FORMATOS_DA_BUSCA = Object.freeze([
+  Object.freeze({ nome: 'atualizadas', campo: 'last_updated' }),
+  Object.freeze({ nome: 'criadas', campo: 'date_created' }),
+  Object.freeze({ nome: 'abertas', status: 'opened' }),
+]);
+
+/* Estado do processo: formato em uso e o que já foi lido (evita reler o que não mudou). */
+const estadoDaBusca = { indice: 0, desde: 0, ativo: null, recusados: new Set() };
+const versoesLidas = new Map();
+const falhasSeguidas = new Map();
+
+/** Volta ao estado inicial (testes e diagnóstico). */
+function reiniciarEstadoDaBusca() {
+  estadoDaBusca.indice = 0;
+  estadoDaBusca.desde = 0;
+  estadoDaBusca.ativo = null;
+  estadoDaBusca.recusados.clear();
+  versoesLidas.clear();
+  falhasSeguidas.clear();
+}
+
+function lembrarVersao(chave, versao) {
+  if (!versao) return;
+  if (versoesLidas.size >= LIMITE_DA_MEMORIA) versoesLidas.clear();
+  versoesLidas.set(chave, versao);
+}
+
+/**
+ * Data no horário de Brasília, com milissegundos: "2026-03-19T09:31:54.000-03:00".
+ * Brasília não tem horário de verão desde 2019, então o fuso é fixo. Sem "+"
+ * na data: numa URL ele pode virar espaço e o ML recusar a data.
+ */
+function dataParaBusca(data) {
+  return `${new Date(data.getTime() - 3 * 60 * 60 * 1000).toISOString().slice(0, 23)}-03:00`;
+}
+
+/**
+ * Parâmetros da busca. Montados à mão: `range` usa ":" e "," como separadores
+ * e vai sem codificação (são caracteres válidos na URL), para o ML ler igual
+ * decodificando ou não.
+ */
+function consultaDaBusca(formato, { seller, desde, ate, offset }) {
+  const partes = [`players.user_id=${seller}`, 'players.role=respondent'];
+  if (formato.campo) partes.push(`range=${formato.campo}:after:${dataParaBusca(desde)},before:${dataParaBusca(ate)}`);
+  if (formato.status) partes.push(`status=${formato.status}`);
+  partes.push(`limit=${POR_PAGINA}`, `offset=${offset}`);
+  return partes.join('&');
+}
+
+function inicioDoFormato(formato, janela) {
+  if (formato.campo === 'last_updated') return janela.desdeAtualizacao;
+  if (formato.campo === 'date_created') return janela.inicio;
+  return null;
+}
+
+const caminhoDaBusca = (formato, janela, offset) => `/post-purchase/v1/claims/search?${consultaDaBusca(formato, {
+  seller: janela.seller, desde: inicioDoFormato(formato, janela), ate: janela.ate, offset,
+})}`;
+
+/**
+ * Primeira página da busca, no formato que o ML aceitar. Recusa (400) passa
+ * para o formato seguinte; qualquer outro erro (token, instabilidade) sobe
+ * como está, porque trocar de formato não resolveria.
+ */
+async function primeiraPagina(ml, janela) {
+  if (estadoDaBusca.indice > 0 && Date.now() - estadoDaBusca.desde > REAVALIAR_FORMATO_MS) {
+    estadoDaBusca.indice = 0;
+    estadoDaBusca.desde = Date.now();
+    estadoDaBusca.recusados.clear();
+  }
+  let recusa = null;
+  for (let i = estadoDaBusca.indice; i < FORMATOS_DA_BUSCA.length; i += 1) {
+    const formato = FORMATOS_DA_BUSCA[i];
+    try {
+      const pagina = await ml.get(caminhoDaBusca(formato, janela, 0));
+      if (i < estadoDaBusca.indice) estadoDaBusca.indice = i;
+      if (estadoDaBusca.ativo !== formato.nome) {
+        estadoDaBusca.ativo = formato.nome;
+        console.log(`[DEVOLUCOES] busca de reclamações no formato "${formato.nome}".`);
+      }
+      return { formato, pagina };
+    } catch (erro) {
+      if (Number(erro?.status) !== 400) throw erro;
+      recusa = erro;
+      if (!estadoDaBusca.recusados.has(formato.nome)) {
+        estadoDaBusca.recusados.add(formato.nome);
+        console.warn(`[DEVOLUCOES] o Mercado Livre recusou a busca no formato "${formato.nome}": ${erro.detalheMl || 'sem motivo na resposta'}.`);
+      }
+      // As próximas contas já começam pelo formato seguinte. Se nenhum for
+      // aceito, fica no último até a próxima reavaliação: uma recusa por conta.
+      if (i >= estadoDaBusca.indice) {
+        estadoDaBusca.indice = Math.min(i + 1, FORMATOS_DA_BUSCA.length - 1);
+        estadoDaBusca.desde = Date.now();
+      }
+    }
+  }
+  throw recusa;
+}
+
+/** Instabilidade (rede, limite de chamadas, erro do ML): vale tentar de novo. */
+function ehTransitoria(erro) {
+  const status = Number(erro?.status);
+  return !status || status === 408 || status === 429 || status >= 500;
+}
+
+/**
+ * Versão (last_updated) da reclamação já gravada nas devoluções, para não
+ * reler o que não mudou. Reclamação com versões diferentes entre as próprias
+ * devoluções é relida.
+ */
+async function versoesGravadas(db, seller, ids) {
+  const mapa = new Map();
+  if (!ids.length) return mapa;
+  const r = await db.query(
+    `SELECT claim_id::text AS claim_id, raw_claim->>'last_updated' AS versao
+       FROM public.ml_returns
+      WHERE seller_id = $1 AND claim_id = ANY($2::bigint[])`,
+    [seller, ids]
+  );
+  const divergentes = new Set();
+  for (const { claim_id: claimId, versao } of r.rows) {
+    if (divergentes.has(claimId)) continue;
+    if (!versao || (mapa.has(claimId) && mapa.get(claimId) !== versao)) {
+      mapa.delete(claimId);
+      divergentes.add(claimId);
+    } else {
+      mapa.set(claimId, versao);
+    }
+  }
+  return mapa;
+}
 
 /**
  * Sincroniza UMA conta: reclamações alteradas desde a última leitura e, além
  * delas, as devoluções ainda a caminho (o envio pode mudar sem a reclamação
- * mudar).
+ * mudar). Uma reclamação que falha não derruba a conta: fica contada no
+ * resumo e é tentada de novo na próxima leitura.
  */
 async function sincronizarConta({ db, ml, sellerId, agora = new Date() }) {
   const seller = idTexto(sellerId);
+  if (!seller) throw new Error('Conta do Mercado Livre sem identificador.');
   const estado = await db.query('SELECT cursor_at FROM public.ml_return_sync WHERE seller_id = $1', [seller]);
   const cursor = estado.rows[0]?.cursor_at ? new Date(estado.rows[0].cursor_at) : null;
-  const desde = cursor
-    ? new Date(cursor.getTime() - SOBREPOSICAO_MS)
-    : new Date(agora.getTime() - JANELA_INICIAL_DIAS * 24 * 60 * 60 * 1000);
+  const inicio = new Date(agora.getTime() - JANELA_INICIAL_DIAS * DIA_MS);
+  const janela = {
+    seller,
+    inicio,
+    desdeAtualizacao: cursor ? new Date(cursor.getTime() - SOBREPOSICAO_MS) : inicio,
+    ate: new Date(agora.getTime() + FOLGA_DO_RELOGIO_MS),
+  };
 
-  const resumo = { reclamacoes: 0, devolucoes: 0, novas: 0 };
+  const resumo = {
+    busca: null, reclamacoes: 0, semMudanca: 0, devolucoes: 0, novas: 0,
+    reclamacoesComFalha: 0, falhaDeReclamacao: null,
+  };
   const vistas = new Set();
+  /* Lidas de verdade nesta passada; as puladas (sem mudança) ainda passam pela releitura das que estão a caminho. */
+  const processadas = new Set();
   let maisRecente = cursor;
-  let offset = 0;
+  let menorFalha = null;
+
+  const anotarFalha = (erro) => {
+    resumo.reclamacoesComFalha += 1;
+    if (!resumo.falhaDeReclamacao) {
+      resumo.falhaDeReclamacao = {
+        status: Number(erro?.status) || null,
+        detalhe: erro?.detalheMl || null,
+        mensagem: String(erro?.message || erro).slice(0, 300),
+      };
+    }
+  };
 
   await db.query(
     `INSERT INTO public.ml_return_sync (seller_id, last_run_at, updated_at) VALUES ($1, NOW(), NOW())
@@ -1290,33 +1478,51 @@ async function sincronizarConta({ db, ml, sellerId, agora = new Date() }) {
   );
 
   try {
+    const { formato, pagina: primeira } = await primeiraPagina(ml, janela);
+    resumo.busca = formato.nome;
+    let pagina = primeira;
+    let offset = 0;
     for (;;) {
-      const qs = new URLSearchParams({
-        'players.user_id': seller,
-        'players.role': 'respondent',
-        range: `last_updated:after:${dataParaBusca(desde)}`,
-        sort: 'last_updated:asc',
-        limit: String(POR_PAGINA),
-        offset: String(offset),
-      });
-      const pagina = await ml.get(`/post-purchase/v1/claims/search?${qs.toString()}`);
       const lista = Array.isArray(pagina?.data) ? pagina.data : [];
+      const conhecidas = await versoesGravadas(db, seller, lista.map((c) => idTexto(c?.id)).filter(Boolean));
       for (const claim of lista) {
         const claimId = idTexto(claim?.id);
         if (!claimId || vistas.has(claimId)) continue;
         vistas.add(claimId);
         resumo.reclamacoes += 1;
-        const atualizada = dataOuNull(claim?.last_updated);
+        const versao = claim?.last_updated ? String(claim.last_updated) : null;
+        const atualizada = dataOuNull(versao);
         if (atualizada && (!maisRecente || atualizada > maisRecente)) maisRecente = atualizada;
-        const r = await processarReclamacao({ db, ml, sellerId: seller, claimId, claim });
-        if (!r.ignorada) {
-          resumo.devolucoes += r.resultados.length;
-          resumo.novas += r.resultados.filter((x) => x.criada).length;
+
+        const chave = `${seller}:${claimId}`;
+        if (versao && (versoesLidas.get(chave) === versao || conhecidas.get(claimId) === versao)) {
+          resumo.semMudanca += 1;
+          lembrarVersao(chave, versao);
+          continue;
+        }
+        processadas.add(claimId);
+        try {
+          const r = await processarReclamacao({ db, ml, sellerId: seller, claimId, claim });
+          lembrarVersao(chave, versao);
+          falhasSeguidas.delete(chave);
+          if (!r.ignorada) {
+            resumo.devolucoes += r.resultados.length;
+            resumo.novas += r.resultados.filter((x) => x.criada).length;
+          }
+        } catch (erro) {
+          if (Number(erro?.status) === 401) throw erro; // token recusado mesmo depois de renovar: a conta toda falha
+          anotarFalha(erro);
+          const seguidas = (falhasSeguidas.get(chave) || 0) + 1;
+          falhasSeguidas.set(chave, seguidas);
+          if (ehTransitoria(erro) && seguidas <= MAX_FALHAS_TRANSITORIAS && atualizada && (!menorFalha || atualizada < menorFalha)) {
+            menorFalha = atualizada;
+          }
         }
       }
       offset += lista.length;
       const total = Number(pagina?.paging?.total);
-      if (lista.length < POR_PAGINA || (Number.isFinite(total) && offset >= total) || offset + POR_PAGINA >= 10000) break;
+      if (lista.length < POR_PAGINA || (Number.isFinite(total) && offset >= total) || offset + POR_PAGINA >= LIMITE_DE_POSICAO) break;
+      pagina = await ml.get(caminhoDaBusca(formato, janela, offset));
     }
 
     const abertas = await db.query(
@@ -1327,17 +1533,30 @@ async function sincronizarConta({ db, ml, sellerId, agora = new Date() }) {
       [seller]
     );
     for (const { claim_id: claimId } of abertas.rows) {
-      if (vistas.has(claimId)) continue;
-      vistas.add(claimId);
-      const r = await processarReclamacao({ db, ml, sellerId: seller, claimId });
-      if (!r.ignorada) resumo.devolucoes += r.resultados.length;
+      if (processadas.has(claimId)) continue;
+      processadas.add(claimId);
+      try {
+        const r = await processarReclamacao({ db, ml, sellerId: seller, claimId });
+        if (!r.ignorada) resumo.devolucoes += r.resultados.length;
+      } catch (erro) {
+        if (Number(erro?.status) === 401) throw erro;
+        anotarFalha(erro);
+      }
     }
 
+    // Só o formato por data de atualização anda o cursor. Reclamação que
+    // falhou por instabilidade segura o cursor para ser lida de novo.
+    let novoCursor = maisRecente;
+    if (menorFalha && (!novoCursor || novoCursor >= menorFalha)) novoCursor = new Date(menorFalha.getTime() - 1);
+    const falhasDaLeitura = resumo.reclamacoesComFalha
+      ? `${resumo.reclamacoesComFalha} reclamação(ões) não lida(s). ${resumo.falhaDeReclamacao.mensagem}`.slice(0, 500)
+      : null;
     await db.query(
       `UPDATE public.ml_return_sync
-          SET cursor_at = COALESCE($2, cursor_at, $3), last_ok_at = NOW(), last_error = NULL, updated_at = NOW()
+          SET cursor_at = CASE WHEN $4::boolean THEN COALESCE($2, cursor_at, $3) ELSE cursor_at END,
+              last_ok_at = NOW(), last_error = $5, updated_at = NOW()
         WHERE seller_id = $1`,
-      [seller, maisRecente, desde]
+      [seller, novoCursor, janela.desdeAtualizacao, formato.campo === 'last_updated', falhasDaLeitura]
     );
     return resumo;
   } catch (erro) {
@@ -1352,6 +1571,41 @@ async function sincronizarConta({ db, ml, sellerId, agora = new Date() }) {
 /* ------------------------------------------------------------------------- */
 /* Acesso ao ML com o token da conta                                          */
 /* ------------------------------------------------------------------------- */
+
+/**
+ * Motivo que o ML deu no corpo da resposta de erro, curto e numa linha só
+ * (ex.: "invalid_query: at least any of these filters ..."). Sem ele, um 400
+ * não diz qual parâmetro foi recusado.
+ */
+async function motivoDoMl(res) {
+  let texto = '';
+  try {
+    texto = typeof res?.text === 'function' ? String(await res.text()) : '';
+  } catch {
+    return null;
+  }
+  if (!texto.trim()) return null;
+  let corpo = null;
+  try {
+    corpo = JSON.parse(texto);
+  } catch {
+    corpo = null;
+  }
+  let motivo = texto.replace(/<[^>]*>/g, ' ');
+  if (corpo && typeof corpo === 'object') {
+    const partes = [];
+    const codigo = corpo.error || corpo.code;
+    if (codigo) partes.push(String(codigo));
+    if (corpo.message && String(corpo.message) !== String(codigo)) partes.push(String(corpo.message));
+    const causas = (Array.isArray(corpo.cause) ? corpo.cause : [])
+      .map((c) => (c && typeof c === 'object' ? c.message || c.code : c))
+      .filter(Boolean);
+    if (causas.length) partes.push(causas.join('; '));
+    if (partes.length) motivo = partes.join(': ');
+  }
+  motivo = motivo.replace(/\s+/g, ' ').trim();
+  return motivo ? motivo.slice(0, 300) : null;
+}
 
 /**
  * Sessão de leitura no ML para uma conta. Renova o token uma vez quando ele
@@ -1392,8 +1646,10 @@ async function abrirSessaoMl(db, sellerId, { mlFetch, fetchToken }) {
     }
     if (res.status === 404 && aceita404) return null;
     if (!res.ok) {
-      const erro = new Error(`Mercado Livre respondeu ${res.status} em ${caminho.split('?')[0]}.`);
+      const motivo = await motivoDoMl(res);
+      const erro = new Error(`Mercado Livre respondeu ${res.status} em ${caminho.split('?')[0]}${motivo ? `: ${motivo}` : '.'}`);
       erro.status = res.status;
+      erro.detalheMl = motivo;
       throw erro;
     }
     try {
@@ -1434,4 +1690,8 @@ module.exports = {
   processarReclamacao,
   sincronizarConta,
   abrirSessaoMl,
+  FORMATOS_DA_BUSCA,
+  dataParaBusca,
+  consultaDaBusca,
+  reiniciarEstadoDaBusca,
 };
