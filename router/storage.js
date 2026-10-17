@@ -9,6 +9,8 @@ const {
   daysInMonth: realDaysInMonth,
 } = require('../utils/billingRules');
 
+const { requireMasterWithMessage } = require('../utils/authMiddleware');
+
 const router = express.Router();
 const JWT_SECRET = process.env.JWT_SECRET || 'seu-segredo-super-secreto-para-jwt';
 
@@ -67,6 +69,15 @@ const requireOwnerOrMaster = (req, res, next) => {
   }
   next();
 };
+
+/* Cadastrar e alterar o armazenamento (SKUs, kits, ligação com kits, estoque e
+ * histórico) é só do master: o cliente consulta e não altera. As rotas de
+ * leitura continuam abertas ao próprio cliente. A baixa de estoque por venda
+ * processada e a entrada por devolução não passam por estas rotas (gravam
+ * direto em router/sales.js, shopee.js, tiktok.js e utils/mlReturns.js). */
+const somenteMasterAltera = requireMasterWithMessage(
+  'Somente o administrador pode cadastrar ou alterar produtos e estoque. Você pode consultar normalmente.'
+);
 
 // --- ROTAS PARA TIPOS DE PACOTE (PACKAGE TYPES) ---
 
@@ -548,7 +559,7 @@ router.get('/user/:userId/skus', authenticateToken, async (req, res) => {
 });
 
 // --- ROTA DE CRIAÇÃO DE SKU/KIT (CORRIGIDA) ---
-router.post('/user/:userId/skus', authenticateToken, async (req, res) => {
+router.post('/user/:userId/skus', authenticateToken, somenteMasterAltera, async (req, res) => {
   const { userId } = req.params;
   const {
     sku,
@@ -695,7 +706,7 @@ router.post('/user/:userId/skus', authenticateToken, async (req, res) => {
   }
 });
 
-router.put('/skus/:skuId', authenticateToken, async (req, res) => {
+router.put('/skus/:skuId', authenticateToken, somenteMasterAltera, async (req, res) => {
   const { skuId } = req.params;
   const { descricao, dimensoes, package_type_id, kit_parent_id, ativo, kit_components } = req.body;
 
@@ -803,7 +814,7 @@ router.put('/skus/:skuId', authenticateToken, async (req, res) => {
   }
 });
 
-router.delete('/skus/:skuId', authenticateToken, requireMaster, async (req, res) => {
+router.delete('/skus/:skuId', authenticateToken, somenteMasterAltera, async (req, res) => {
   const { skuId } = req.params;
   const client = await db.pool.connect();
 
@@ -935,7 +946,7 @@ router.get('/sku/:skuCode/movements', authenticateToken, requireMaster, async (r
 });
 
 // Endpoint específico para ajuste de estoque de componentes
-router.post('/component/:skuCode/movements', authenticateToken, async (req, res) => {
+router.post('/component/:skuCode/movements', authenticateToken, somenteMasterAltera, async (req, res) => {
   const { skuCode } = req.params;
   const { userId, reason, forceComponent } = req.body;
   const movementType = normalizeMovementType(req.body.movementType);
@@ -1065,7 +1076,7 @@ router.post('/component/:skuCode/movements', authenticateToken, async (req, res)
   }
 });
 
-router.post('/sku/:skuCode/movements', authenticateToken, requireMaster, async (req, res) => {
+router.post('/sku/:skuCode/movements', authenticateToken, somenteMasterAltera, async (req, res) => {
   const { skuCode } = req.params;
   const { userId, reason, relatedSaleId } = req.body;
   const movementType = normalizeMovementType(req.body.movementType);
@@ -1213,7 +1224,7 @@ router.post('/sku/:skuCode/movements', authenticateToken, requireMaster, async (
 });
 
 // DELETE /api/storage/movements/:movementId - removendo uma movimentação (reverte estoque quando aplicável)
-router.delete('/movements/:movementId', authenticateToken, async (req, res) => {
+router.delete('/movements/:movementId', authenticateToken, somenteMasterAltera, async (req, res) => {
   const { movementId } = req.params;
   const client = await db.pool.connect();
 
@@ -1276,7 +1287,7 @@ router.delete('/movements/:movementId', authenticateToken, async (req, res) => {
 });
 
 // --- ROTA PARA CONECTAR SKU A KITS EXISTENTES ---
-router.post('/user/:userId/connect-sku-to-kits', authenticateToken, async (req, res) => {
+router.post('/user/:userId/connect-sku-to-kits', authenticateToken, somenteMasterAltera, async (req, res) => {
   const { userId } = req.params;
   const { sku_id, connections } = req.body;
 
@@ -1386,7 +1397,7 @@ router.post('/user/:userId/connect-sku-to-kits', authenticateToken, async (req, 
 });
 
 // --- ROTA PARA DESCONECTAR SKU DE KIT ---
-router.delete('/user/:userId/disconnect-sku-from-kit', authenticateToken, async (req, res) => {
+router.delete('/user/:userId/disconnect-sku-from-kit', authenticateToken, somenteMasterAltera, async (req, res) => {
   const { userId } = req.params;
   const { sku_id, kit_id } = req.body;
 

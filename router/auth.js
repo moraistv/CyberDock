@@ -5,6 +5,7 @@ const bcrypt = require('bcryptjs');
 const jwt = require('jsonwebtoken');
 const db = require('../utils/postgres');
 const { v4: uuidv4 } = require('uuid');
+const { authenticateToken, requireMasterWithMessage } = require('../utils/authMiddleware');
 const router = express.Router();
 
 const JWT_SECRET = process.env.JWT_SECRET || 'seu-segredo-super-secreto-para-jwt';
@@ -159,8 +160,14 @@ router.put('/user/role', async (req, res) => {
     }
 });
 
+/* As duas rotas abaixo baixam estoque sem registrar movimentação e estavam
+ * abertas, sem login. O cliente não altera o armazenamento: agora exigem
+ * master. (Elas filtram por skus.uid, coluna que não existe; a tabela usa
+ * user_id. Nenhuma tela chama estas rotas.) */
+const somenteMasterAlteraEstoque = requireMasterWithMessage('Somente o administrador pode alterar o estoque.');
+
 // --- Rota para registrar consumo de armazenamento ---
-router.post('/storage/consume', async (req, res) => {
+router.post('/storage/consume', authenticateToken, somenteMasterAlteraEstoque, async (req, res) => {
     const { uid, sku, quantity } = req.body;
 
     if (!uid || !sku || !quantity) {
@@ -192,7 +199,7 @@ router.post('/storage/consume', async (req, res) => {
 });
 
 // --- Rota para retirada manual de SKUs ---
-router.post('/storage/withdraw', async (req, res) => {
+router.post('/storage/withdraw', authenticateToken, somenteMasterAlteraEstoque, async (req, res) => {
     const { uid, sku, quantity } = req.body;
 
     if (!uid || !sku || !quantity) {

@@ -1,6 +1,12 @@
 const express = require('express');
 const router = express.Router();
-const { authenticateToken, requireMaster } = require('../utils/authMiddleware');
+const { authenticateToken, requireMaster, requireMasterWithMessage } = require('../utils/authMiddleware');
+
+/* Kit pai é cadastro de produto: só o master cria, altera e exclui. O cliente
+ * continua vendo os dele (rotas GET). */
+const somenteMasterAltera = requireMasterWithMessage(
+    'Somente o administrador pode cadastrar ou alterar kits pai. Você pode consultar normalmente.'
+);
 const db = require('../utils/postgres');
 
 // Criar tabela kit_parents se não existir
@@ -95,7 +101,7 @@ router.get('/user/:userId/active', authenticateToken, async (req, res) => {
 });
 
 // POST - Criar novo kit pai
-router.post('/user/:userId', authenticateToken, async (req, res) => {
+router.post('/user/:userId', authenticateToken, somenteMasterAltera, async (req, res) => {
     const { userId } = req.params;
     const { nome, descricao, ativo = true } = req.body;
     
@@ -151,7 +157,7 @@ router.post('/user/:userId', authenticateToken, async (req, res) => {
 });
 
 // PUT - Atualizar kit pai
-router.put('/user/:userId/:kitId', authenticateToken, async (req, res) => {
+router.put('/user/:userId/:kitId', authenticateToken, somenteMasterAltera, async (req, res) => {
     const { userId, kitId } = req.params;
     const { nome, descricao, ativo } = req.body;
     
@@ -207,7 +213,7 @@ router.put('/user/:userId/:kitId', authenticateToken, async (req, res) => {
 });
 
 // PATCH - Alternar status ativo/inativo
-router.patch('/user/:userId/:kitId/toggle-status', authenticateToken, async (req, res) => {
+router.patch('/user/:userId/:kitId/toggle-status', authenticateToken, somenteMasterAltera, async (req, res) => {
     const { userId, kitId } = req.params;
     
     // Allow masters and the user themselves to manage their own data
@@ -250,7 +256,7 @@ router.patch('/user/:userId/:kitId/toggle-status', authenticateToken, async (req
 });
 
 // DELETE - Excluir kit pai
-router.delete('/user/:userId/:kitId', authenticateToken, async (req, res) => {
+router.delete('/user/:userId/:kitId', authenticateToken, somenteMasterAltera, async (req, res) => {
     const { userId, kitId } = req.params;
     
     // Allow masters and the user themselves to manage their own data

@@ -48,6 +48,19 @@ const requireMaster = (req, res, next) => {
 };
 
 /**
+ * Como `requireMaster`, mas com a mensagem que a pessoa vai ler na tela e um
+ * código fixo para o frontend. Usado no cadastro de produtos do armazenamento,
+ * que é só do master: o cliente consulta, não altera.
+ * Deve ser usado *após* o middleware authenticateToken.
+ */
+const requireMasterWithMessage = (message) => (req, res, next) => {
+    if (req.user?.role !== 'master') {
+        return res.status(403).json({ error: message, code: 'master_only' });
+    }
+    next();
+};
+
+/**
  * Middleware para rotas de autoatendimento: o próprio usuário pode acessar
  * seus dados (uid da rota == uid do token) OU um master pode acessar
  * qualquer usuário. Usado em recursos como status de venda e contratos, que
@@ -66,6 +79,7 @@ module.exports = {
     authenticateToken,
     getBearerToken,
     requireMaster,
+    requireMasterWithMessage,
     requireOwnerOrMaster,
     verifyAccessToken,
 };
