@@ -42,6 +42,51 @@ const normalizeQuantityChange = (value) => {
   return numero;
 };
 
+/* --- Peso por unidade do SKU (kg) ---
+ *
+ * Opcional: vazio ou null é "sem peso" (os SKUs antigos ficam assim). Aceita
+ * número ou texto com vírgula ("0,350") e grava com até 3 casas decimais.
+ * Zero, negativo, texto ou acima do limite são recusados: melhor sem peso do
+ * que um peso que ninguém digitou. Kit não grava peso próprio; a listagem
+ * mostra a soma do peso das peças (pesoDoKitPelasPecas). */
+const PESO_MAXIMO_KG = 99999.999;
+const PESO_INVALIDO = Symbol('peso_invalido');
+const MENSAGEM_PESO_INVALIDO = 'Peso inválido. Informe o peso em kg, maior que zero e com até 3 casas decimais (ex.: 0,350), ou deixe em branco.';
+
+function normalizarPesoKg(valor) {
+  if (valor === null || valor === undefined) return null;
+  const texto = String(valor).trim();
+  if (texto === '') return null;
+  // Com vírgula, ela é a casa decimal e o ponto é milhar ("1.250,5"); sem vírgula, o ponto é decimal ("0.35").
+  const normalizado = texto.includes(',') ? texto.replace(/\./g, '').replace(',', '.') : texto;
+  if (!/^\d+(\.\d+)?$/.test(normalizado)) return PESO_INVALIDO;
+  const numero = Math.round(Number(normalizado) * 1000) / 1000;
+  if (!Number.isFinite(numero) || numero <= 0 || numero > PESO_MAXIMO_KG) return PESO_INVALIDO;
+  return numero;
+}
+
+/* O pg devolve NUMERIC como texto ("0.350"); a tela recebe número. */
+const pesoComoNumero = (valor) => (valor === null || valor === undefined ? null : Number(valor));
+
+/** Kit não tem peso próprio: é a soma do peso das peças (peso × quantidade no kit).
+ *  Peça sem peso deixa o total desconhecido (null) e entra em `pecas_sem_peso`. */
+function pesoDoKitPelasPecas(componentes = []) {
+  if (!componentes.length) return { peso_kg: null, pecas_sem_peso: [] };
+  let total = 0;
+  const pecasSemPeso = [];
+  for (const componente of componentes) {
+    if (componente.child_peso_kg === null || componente.child_peso_kg === undefined) {
+      pecasSemPeso.push(componente.child_sku_code);
+      continue;
+    }
+    total += Number(componente.child_peso_kg) * (Number(componente.quantity_per_kit) || 1);
+  }
+  return {
+    peso_kg: pecasSemPeso.length ? null : Math.round(total * 1000) / 1000,
+    pecas_sem_peso: pecasSemPeso,
+  };
+}
+
 // --- Middlewares ---
 const authenticateToken = (req, res, next) => {
   const authHeader = req.headers['authorization'];
@@ -458,7 +503,7 @@ router.get('/user/:userId/skus', authenticateToken, async (req, res) => {
   try {
     const query = `
       SELECT 
-        s.id, s.user_id, s.sku, s.descricao, s.dimensoes, s.quantidade, s.package_type_id, s.kit_parent_id, s.is_kit, s.ativo,
+        s.id, s.user_id, s.sku, s.descricao, s.dimensoes, s.peso_kg, s.quantidade, s.package_type_id, s.kit_parent_id, s.is_kit, s.ativo,
         pt.name as package_type_name, pt.price as package_type_price,
         kp.nome as kit_parent_name
       FROM public.skus s
@@ -478,7 +523,8 @@ router.get('/user/:userId/skus', authenticateToken, async (req, res) => {
         cs.sku as child_sku_code,
         cs.descricao as child_descricao,
         cs.quantidade as child_stock,
-        cs.dimensoes as child_dimensoes
+        cs.dimensoes as child_dimensoes,
+        cs.peso_kg as child_peso_kg
       FROM public.sku_kit_components kc
       JOIN public.skus cs ON kc.child_sku_id = cs.id
       WHERE kc.kit_sku_id IN (SELECT id FROM public.skus WHERE user_id = $1 AND is_kit = true)
@@ -498,6 +544,7 @@ router.get('/user/:userId/skus', authenticateToken, async (req, res) => {
         child_descricao: row.child_descricao,
         child_stock: row.child_stock,
         child_dimensoes: typeof row.child_dimensoes === 'string' ? JSON.parse(row.child_dimensoes) : row.child_dimensoes,
+        child_peso_kg: pesoComoNumero(row.child_peso_kg),
         quantity_per_kit: row.quantity_per_kit
       };
       kitComponentsMap[row.kit_sku_id].push(component);
@@ -531,6 +578,7 @@ router.get('/user/:userId/skus', authenticateToken, async (req, res) => {
       const result = {
         ...sku,
         dimensoes: typeof sku.dimensoes === 'string' ? JSON.parse(sku.dimensoes) : sku.dimensoes,
+        peso_kg: pesoComoNumero(sku.peso_kg),
         package_type_price: sku.package_type_price ? parseFloat(sku.package_type_price) : null
       };
 
@@ -541,6 +589,11 @@ router.get('/user/:userId/skus', authenticateToken, async (req, res) => {
           return Math.min(min, availableFromChild);
         }, Infinity);
         if (result.available_kit_quantity === Infinity) result.available_kit_quantity = 0;
+      }
+
+      // Peso do kit = soma do peso das peças (o kit não guarda peso próprio).
+      if (sku.is_kit) {
+        Object.assign(result, pesoDoKitPelasPecas(result.kit_components || []));
       }
 
       // Para SKUs normais, informa em quais kits ele está sendo usado
@@ -574,6 +627,12 @@ router.post('/user/:userId/skus', authenticateToken, somenteMasterAltera, async 
     monthly_price,
     monthly_start_date
   } = req.body;
+
+  // Kit não guarda peso próprio (é a soma das peças); para SKU o peso é opcional.
+  const pesoKg = is_kit ? null : normalizarPesoKg(req.body.peso_kg);
+  if (pesoKg === PESO_INVALIDO) {
+    return res.status(400).json({ error: MENSAGEM_PESO_INVALIDO, code: 'peso_invalido' });
+  }
 
   console.log('🚀 [BACKEND] Criando SKU/Kit para usuário:', userId);
   console.log('📦 [BACKEND] Dados recebidos:', { sku, descricao, is_kit, userId });
@@ -619,9 +678,9 @@ router.post('/user/:userId/skus', authenticateToken, somenteMasterAltera, async 
 
     const skuInsertQuery = `
       INSERT INTO public.skus
-      (user_id, sku, descricao, dimensoes, quantidade, package_type_id, is_kit, ativo, is_monthly, monthly_price, monthly_start_date)
-      VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
-      RETURNING id, sku, descricao, is_kit, ativo, is_monthly, monthly_price, monthly_start_date;
+      (user_id, sku, descricao, dimensoes, quantidade, package_type_id, is_kit, ativo, is_monthly, monthly_price, monthly_start_date, peso_kg)
+      VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
+      RETURNING id, sku, descricao, is_kit, ativo, is_monthly, monthly_price, monthly_start_date, peso_kg;
     `;
     
     const skuResult = await client.query(skuInsertQuery, [
@@ -635,9 +694,10 @@ router.post('/user/:userId/skus', authenticateToken, somenteMasterAltera, async 
       ativo === undefined ? true : ativo,
       is_monthly || false,
       is_monthly ? parseFloat(monthly_price) : null,
-      is_monthly ? monthly_start_date : null
+      is_monthly ? monthly_start_date : null,
+      pesoKg
     ]);
-    const newSku = skuResult.rows[0];
+    const newSku = { ...skuResult.rows[0], peso_kg: pesoComoNumero(skuResult.rows[0].peso_kg) };
 
     console.log('✅ [BACKEND] SKU/Kit criado com sucesso:', newSku);
 
@@ -710,7 +770,7 @@ router.put('/skus/:skuId', authenticateToken, somenteMasterAltera, async (req, r
   const { skuId } = req.params;
   const { descricao, dimensoes, package_type_id, kit_parent_id, ativo, kit_components } = req.body;
 
-  const skuOwnerCheck = await db.query('SELECT user_id FROM public.skus WHERE id = $1', [skuId]);
+  const skuOwnerCheck = await db.query('SELECT user_id, is_kit FROM public.skus WHERE id = $1', [skuId]);
   if (skuOwnerCheck.rows.length === 0) {
     return res.status(404).json({ error: 'SKU não encontrado.' });
   }
@@ -718,6 +778,14 @@ router.put('/skus/:skuId', authenticateToken, somenteMasterAltera, async (req, r
   const skuOwnerId = skuOwnerCheck.rows[0].user_id;
   if (req.user.role !== 'master' && req.user.uid !== skuOwnerId) {
     return res.status(403).json({ error: 'Acesso negado.' });
+  }
+
+  /* Peso: só muda quando vem no corpo (null ou vazio limpa). Kit não guarda
+   * peso próprio, então o campo é ignorado nele. */
+  const pesoVeio = req.body.peso_kg !== undefined && !skuOwnerCheck.rows[0].is_kit;
+  const pesoKg = pesoVeio ? normalizarPesoKg(req.body.peso_kg) : null;
+  if (pesoKg === PESO_INVALIDO) {
+    return res.status(400).json({ error: MENSAGEM_PESO_INVALIDO, code: 'peso_invalido' });
   }
 
   try {
@@ -774,6 +842,11 @@ router.put('/skus/:skuId', authenticateToken, somenteMasterAltera, async (req, r
         updateValues.push(ativo);
         paramCounter++;
       }
+      if (pesoVeio) {
+        updateFields.push(`peso_kg = $${paramCounter}`);
+        updateValues.push(pesoKg);
+        paramCounter++;
+      }
 
       updateFields.push('updated_at = NOW()');
 
@@ -783,7 +856,7 @@ router.put('/skus/:skuId', authenticateToken, somenteMasterAltera, async (req, r
         if (kit_components !== undefined) {
           await client.query('COMMIT');
         }
-        return res.json(rows[0]);
+        return res.json(rows[0] ? { ...rows[0], peso_kg: pesoComoNumero(rows[0].peso_kg) } : rows[0]);
       }
 
       updateValues.push(skuId);
@@ -801,7 +874,7 @@ router.put('/skus/:skuId', authenticateToken, somenteMasterAltera, async (req, r
 
       if (kit_components !== undefined) await client.query('COMMIT');
 
-      res.json(rows[0]);
+      res.json({ ...rows[0], peso_kg: pesoComoNumero(rows[0].peso_kg) });
     } catch (error) {
       if (kit_components !== undefined) await client.query('ROLLBACK');
       throw error;

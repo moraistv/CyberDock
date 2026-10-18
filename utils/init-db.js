@@ -293,6 +293,7 @@ const schema = {
             sku VARCHAR(255) NOT NULL,
             descricao TEXT,
             dimensoes JSONB,
+            peso_kg NUMERIC(10,3),
             quantidade INTEGER DEFAULT 0,
             package_type_id INTEGER REFERENCES public.package_types(id) ON DELETE SET NULL,
             kit_parent_id INTEGER,
@@ -1309,6 +1310,10 @@ async function syncDatabaseSchema() {
                         console.log(`   -> Adicionando coluna 'ativo' à tabela: public.skus`);
                         await client.query('ALTER TABLE public.skus ADD COLUMN ativo BOOLEAN DEFAULT TRUE;');
                     }
+                    /* Peso por unidade, em kg com até 3 casas (ex.: 0,350). Opcional:
+                     * os SKUs que já existem ficam sem peso. Kit não grava peso: a
+                     * tela mostra a soma do peso das peças (router/storage.js). */
+                    await client.query('ALTER TABLE public.skus ADD COLUMN IF NOT EXISTS peso_kg NUMERIC(10,3);');
                 }
                 if (tableName === 'sku_kit_components') {
                     const updatedAtColRes = await client.query(`SELECT 1 FROM information_schema.columns WHERE table_schema = 'public' AND table_name = 'sku_kit_components' AND column_name = 'updated_at'`);
