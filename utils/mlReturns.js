@@ -13,7 +13,9 @@
 //  - só unidades aptas voltam ao estoque, sempre para o SKU do cliente dono da
 //    venda, e só se a venda tirou estoque no CyberDock;
 //  - kit não tem estoque próprio: a entrada vai para os componentes;
-//  - a entrada é idempotente (restocked_at + chave única no movimento).
+//  - a entrada é idempotente (restocked_at + chave única no movimento);
+//  - o cliente só vê as devoluções dele (uid), sem nomes da equipe e sem a
+//    observação interna da análise (`devolucaoParaCliente`).
 
 const { buildSaleLineKey, isDuplicateSaleMovement } = require('./saleProcessing');
 
@@ -530,28 +532,65 @@ async function travarDevolucao(client, id) {
 
 const SITUACOES_QUE_PODEM_CHEGAR = new Set([STAGES.AGUARDANDO_ENVIO, STAGES.EM_TRANSITO, STAGES.CANCELADA]);
 
-/** O pacote chegou e o ML ainda não atualizou: o CD registra a chegada. */
-async function registrarChegada(client, id, autor) {
+/**
+ * A CyberDock confirma que o pacote está no CD. É o sinal que o cliente vê na
+ * tela dele ("Recebida pela CyberDock") e o filtro "Recebimento" das telas.
+ *  - Ainda a caminho no ML (ou cancelada, e chegou mesmo assim): passa para
+ *    "No CD" e registra a chegada agora, como o antigo "Registrar chegada".
+ *  - Já "No CD" porque o ML avisou a entrega: só confirma. `received_at` e
+ *    `received_by` ficam como estão (a hora da chegada é a do ML).
+ * A análise (salvar ou concluir) também confirma, se ninguém confirmou antes.
+ */
+async function confirmarRecebimento(client, id, autor) {
   await client.query('BEGIN');
   try {
     const dev = await travarDevolucao(client, id);
-    if (!SITUACOES_QUE_PODEM_CHEGAR.has(dev.stage)) {
-      throw erroHttp(409, 'situacao_invalida', dev.stage === STAGES.NO_CD || dev.stage === STAGES.ANALISADO
-        ? 'A chegada desta devolução já está registrada.'
-        : 'Esta devolução não vem para o CD.');
+    if (STAGES_FORA_DO_CD.includes(dev.stage)) {
+      throw erroHttp(409, 'situacao_invalida', 'Esta devolução não vem para a CyberDock.');
     }
-    await client.query(
-      `UPDATE public.ml_returns
-          SET stage = 'no_cd', received_at = NOW(), received_by = $2, status_changed_at = NOW(), updated_at = NOW()
-        WHERE id = $1`,
-      [id, autor]
-    );
-    await registrarEvento(client, id, { kind: 'chegada', source: 'cd', from: dev.stage, to: STAGES.NO_CD, actor: autor, note: 'Chegada registrada no CD.' });
+    if (dev.receipt_confirmed_at) {
+      throw erroHttp(409, 'ja_confirmado', 'O recebimento desta devolução já foi confirmado.');
+    }
+    const chegouAgora = SITUACOES_QUE_PODEM_CHEGAR.has(dev.stage);
+    if (chegouAgora) {
+      await client.query(
+        `UPDATE public.ml_returns
+            SET stage = 'no_cd', received_at = NOW(), received_by = $2, status_changed_at = NOW(),
+                receipt_confirmed_at = NOW(), receipt_confirmed_by = $2, updated_at = NOW()
+          WHERE id = $1`,
+        [id, autor]
+      );
+    } else {
+      await client.query(
+        `UPDATE public.ml_returns
+            SET receipt_confirmed_at = NOW(), receipt_confirmed_by = $2,
+                received_at = COALESCE(received_at, NOW()), updated_at = NOW()
+          WHERE id = $1`,
+        [id, autor]
+      );
+    }
+    await registrarEvento(client, id, {
+      kind: 'recebimento', source: 'cd', actor: autor,
+      from: chegouAgora ? dev.stage : null, to: chegouAgora ? STAGES.NO_CD : null,
+      note: 'Recebimento confirmado pela CyberDock.',
+    });
     await client.query('COMMIT');
+    return { chegouAgora };
   } catch (erro) {
     await client.query('ROLLBACK').catch(() => {});
     throw erro;
   }
+}
+
+/** Nome antigo (POST /:id/chegada). Confirmar o recebimento já registra a chegada. */
+const registrarChegada = confirmarRecebimento;
+
+/* Quem analisa está com o pacote na mão: salvar ou concluir a análise confirma
+ * o recebimento que ainda não foi confirmado (o UPDATE da análise grava as
+ * colunas; aqui fica o histórico). */
+async function registrarRecebimentoNaAnalise(client, dev, autor) {
+  if (dev.receipt_confirmed_at) return;
+  await registrarEvento(client, dev.id, { kind: 'recebimento', source: 'cd', actor: autor, note: 'Recebimento confirmado na análise.' });
 }
 
 function normalizarChecklist(entrada) {
@@ -582,12 +621,18 @@ async function salvarAnalise(client, id, { checklist, notes }, autor) {
     if (dev.stage !== STAGES.NO_CD) {
       throw erroHttp(409, 'situacao_invalida', dev.stage === STAGES.ANALISADO
         ? 'Esta devolução já foi analisada.'
-        : 'Registre a chegada no CD antes de analisar.');
+        : 'Confirme o recebimento no CD antes de analisar.');
     }
     await client.query(
-      'UPDATE public.ml_returns SET checklist = $2, notes = $3, updated_at = NOW() WHERE id = $1',
-      [id, JSON.stringify(lista), observacao]
+      `UPDATE public.ml_returns
+          SET checklist = $2, notes = $3,
+              receipt_confirmed_by = CASE WHEN receipt_confirmed_at IS NULL THEN $4 ELSE receipt_confirmed_by END,
+              receipt_confirmed_at = COALESCE(receipt_confirmed_at, NOW()),
+              updated_at = NOW()
+        WHERE id = $1`,
+      [id, JSON.stringify(lista), observacao, autor]
     );
+    await registrarRecebimentoNaAnalise(client, dev, autor);
     await registrarEvento(client, id, { kind: 'analise_salva', source: 'cd', actor: autor, note: 'Análise salva sem decisão.' });
     await client.query('COMMIT');
   } catch (erro) {
@@ -760,7 +805,7 @@ async function concluirAnalise(client, id, { itens, motivo, destino, checklist, 
       throw erroHttp(409, 'ja_analisada', 'Esta devolução já foi analisada. A decisão não foi alterada.');
     }
     if (dev.stage !== STAGES.NO_CD) {
-      throw erroHttp(409, 'situacao_invalida', 'Registre a chegada no CD antes de concluir a análise.');
+      throw erroHttp(409, 'situacao_invalida', 'Confirme o recebimento no CD antes de concluir a análise.');
     }
 
     const itensDaDevolucao = (await client.query(
@@ -819,11 +864,14 @@ async function concluirAnalise(client, id, { itens, motivo, destino, checklist, 
           stage = 'analisado', result = $2, decided_at = NOW(), decided_by = $3,
           checklist = $4, notes = $5,
           not_apt_reason = $6, not_apt_destination = $7,
+          receipt_confirmed_by = CASE WHEN receipt_confirmed_at IS NULL THEN $3 ELSE receipt_confirmed_by END,
+          receipt_confirmed_at = COALESCE(receipt_confirmed_at, NOW()),
           status_changed_at = NOW(), updated_at = NOW()
         WHERE id = $1`,
       [id, resultado, autor, JSON.stringify(lista), observacao,
         totalNaoAptas > 0 ? motivo : null, totalNaoAptas > 0 ? destino : null]
     );
+    await registrarRecebimentoNaAnalise(client, dev, autor);
 
     const partes = [];
     if (totalAptas > 0) partes.push(`${totalAptas} ${totalAptas === 1 ? 'unidade apta' : 'unidades aptas'}`);
@@ -987,7 +1035,48 @@ function filtrosDaLista(filtros, params) {
       where.push(`r.result = $${params.length}`);
     }
   }
+  /* Recebimento confirmado pela CyberDock. "Aguardando" é o que ainda vem (ou
+   * já chegou pelo ML) sem confirmação: cancelada fica de fora, senão ficaria
+   * aguardando para sempre. */
+  if (filtros.recebimento === 'confirmado') {
+    where.push('r.receipt_confirmed_at IS NOT NULL');
+  } else if (filtros.recebimento === 'aguardando') {
+    where.push(`r.receipt_confirmed_at IS NULL AND r.stage IN ('aguardando_envio', 'em_transito', 'no_cd')`);
+  }
   return where;
+}
+
+/* ---------------- Visão do cliente ---------------- */
+
+/* O cliente vê a própria devolução sem saber quem da equipe fez cada passo
+ * (vira "CyberDock"), sem a observação interna da análise e sem os passos de
+ * trabalho do CD (análise salva, foto incluída ou removida). */
+const PELA_CYBERDOCK = 'CyberDock';
+const EVENTOS_DO_CLIENTE = new Set(['aberta', 'situacao', 'status_ml', 'chegada', 'recebimento', 'analise_concluida', 'estoque']);
+const quemDaCyberDock = (valor) => (valor ? PELA_CYBERDOCK : null);
+
+function devolucaoParaCliente(dev) {
+  const copia = { ...dev };
+  delete copia.notes;
+  delete copia.client_name;
+  delete copia.client_email;
+  copia.received_by = quemDaCyberDock(dev.received_by);
+  copia.decided_by = quemDaCyberDock(dev.decided_by);
+  copia.receipt_confirmed_by = quemDaCyberDock(dev.receipt_confirmed_by);
+  return copia;
+}
+
+const eventoParaCliente = (evento) => ({ ...evento, actor: quemDaCyberDock(evento.actor) });
+
+/**
+ * uid da visão do cliente, ou null na visão do master. Pedir a visão do
+ * cliente sem uid é erro: cair na visão do master mostraria tudo de todos.
+ */
+function clienteDaVisao(opcoes = {}) {
+  if (!Object.prototype.hasOwnProperty.call(opcoes, 'cliente')) return null;
+  const uid = opcoes.cliente === null || opcoes.cliente === undefined ? '' : String(opcoes.cliente).trim();
+  if (!uid) throw erroHttp(401, 'sem_usuario', 'Sessão sem usuário identificado. Entre de novo.');
+  return uid;
 }
 
 const SELECT_DA_LISTA = `
@@ -995,6 +1084,7 @@ const SELECT_DA_LISTA = `
          r.uid, r.account_nickname, r.order_id::text AS order_id, r.pack_id::text AS pack_id, r.buyer_name,
          r.ml_status, r.destination, r.tracking_number, r.claim_reason_text, r.review_due_at,
          r.stage, r.result, r.status_changed_at, r.received_at, r.received_by, r.decided_at, r.decided_by,
+         r.receipt_confirmed_at, r.receipt_confirmed_by,
          r.not_apt_reason, r.not_apt_destination, r.notes, r.ml_created_at, r.created_at,
          u.name AS client_name, u.email AS client_email,
          COALESCE((SELECT json_agg(json_build_object(
@@ -1006,7 +1096,14 @@ const SELECT_DA_LISTA = `
     FROM public.ml_returns r
     LEFT JOIN public.users u ON u.uid = r.uid`;
 
-async function listarDevolucoes(db, filtros = {}) {
+/**
+ * Lista, números do período e facetas. Com `cliente` (uid), tudo fica preso às
+ * devoluções desse cliente: o filtro de cliente da query é ignorado, as
+ * facetas só trazem as contas dele e as linhas saem sem dados da equipe.
+ */
+async function listarDevolucoes(db, filtrosPedidos = {}, opcoes = {}) {
+  const cliente = clienteDaVisao(opcoes);
+  const filtros = cliente ? { ...filtrosPedidos, uid: cliente } : filtrosPedidos;
   const todas = Boolean(filtros.todas);
   const limite = todas ? 5000 : Math.min(100, Math.max(1, parseInt(filtros.limit, 10) || 25));
   const pagina = todas ? 1 : Math.max(1, parseInt(filtros.page, 10) || 1);
@@ -1035,6 +1132,8 @@ async function listarDevolucoes(db, filtros = {}) {
         COUNT(*) FILTER (WHERE r.stage = 'analisado' AND r.result = 'nao_apto')::int    AS nao_aptos,
         COUNT(*) FILTER (WHERE r.stage = 'cancelada')::int                              AS canceladas,
         COUNT(*) FILTER (WHERE r.stage = 'no_ml')::int                                  AS no_ml,
+        COUNT(*) FILTER (WHERE r.receipt_confirmed_at IS NOT NULL)::int                 AS recebidas,
+        COUNT(*) FILTER (WHERE r.stage = 'no_cd' AND r.receipt_confirmed_at IS NULL)::int AS a_confirmar,
         AVG(EXTRACT(EPOCH FROM (r.decided_at - r.received_at)))
           FILTER (WHERE r.decided_at IS NOT NULL AND r.received_at IS NOT NULL)         AS segundos_analise,
         COALESCE(SUM(q.aptas) FILTER (WHERE r.stage = 'analisado'), 0)::int             AS unidades_aptas,
@@ -1066,22 +1165,31 @@ async function listarDevolucoes(db, filtros = {}) {
     );
   }
 
-  const facetasQ = db.query(
-    `SELECT 'cliente' AS tipo, r.uid AS valor, COALESCE(NULLIF(TRIM(u.name), ''), u.email, r.uid) AS rotulo
-       FROM public.ml_returns r JOIN public.users u ON u.uid = r.uid
-      GROUP BY r.uid, u.name, u.email
-     UNION ALL
-     SELECT 'conta', r.seller_id::text, COALESCE(MAX(r.account_nickname), r.seller_id::text)
-       FROM public.ml_returns r
-      GROUP BY r.seller_id
-     ORDER BY 1, 3`
-  );
+  const facetasQ = cliente
+    ? db.query(
+      `SELECT 'conta' AS tipo, r.seller_id::text AS valor, COALESCE(MAX(r.account_nickname), r.seller_id::text) AS rotulo
+         FROM public.ml_returns r
+        WHERE r.uid = $1
+        GROUP BY r.seller_id
+        ORDER BY 3`,
+      [String(cliente)]
+    )
+    : db.query(
+      `SELECT 'cliente' AS tipo, r.uid AS valor, COALESCE(NULLIF(TRIM(u.name), ''), u.email, r.uid) AS rotulo
+         FROM public.ml_returns r JOIN public.users u ON u.uid = r.uid
+        GROUP BY r.uid, u.name, u.email
+       UNION ALL
+       SELECT 'conta', r.seller_id::text, COALESCE(MAX(r.account_nickname), r.seller_id::text)
+         FROM public.ml_returns r
+        GROUP BY r.seller_id
+       ORDER BY 1, 3`
+    );
 
   const [totalR, dadosR, kpiR, anteriorR, facetasR] = await Promise.all([totalQ, dadosQ, kpiQ, anteriorQ, facetasQ]);
   const total = totalR.rows[0]?.total || 0;
   const k = kpiR.rows[0] || {};
   return {
-    data: dadosR.rows,
+    data: cliente ? dadosR.rows.map(devolucaoParaCliente) : dadosR.rows,
     total,
     page: pagina,
     limit: limite,
@@ -1094,6 +1202,8 @@ async function listarDevolucoes(db, filtros = {}) {
       naoAptos: k.nao_aptos || 0,
       canceladas: k.canceladas || 0,
       noMl: k.no_ml || 0,
+      recebidas: k.recebidas || 0,
+      aConfirmar: k.a_confirmar || 0,
       unidadesAptas: k.unidades_aptas || 0,
       unidadesNaoAptas: k.unidades_nao_aptas || 0,
       horasMediasDeAnalise: k.segundos_analise === null || k.segundos_analise === undefined
@@ -1137,7 +1247,15 @@ async function estoqueDoItem(db, uid, item) {
   return { ...base, componentes: lista };
 }
 
-async function detalharDevolucao(db, id) {
+/**
+ * Devolução com itens, histórico e fotos. Com `cliente` (uid), só abre se for
+ * desse cliente (senão 404, como se não existisse) e sai na visão dele: sem
+ * a conferência de estoque, sem nomes da equipe e sem passos internos.
+ */
+async function detalharDevolucao(db, id, opcoes = {}) {
+  const cliente = clienteDaVisao(opcoes);
+  const params = [id];
+  if (cliente) params.push(cliente);
   const r = await db.query(
     `SELECT r.id, r.ml_return_id::text AS ml_return_id, r.claim_id::text AS claim_id, r.seller_id::text AS seller_id,
             r.uid, r.account_nickname, r.order_id::text AS order_id, r.pack_id::text AS pack_id, r.buyer_name,
@@ -1145,12 +1263,13 @@ async function detalharDevolucao(db, id) {
             r.shipment_id::text AS shipment_id, r.shipment_status, r.tracking_number,
             r.claim_status, r.claim_stage, r.claim_reason_id, r.claim_reason_text, r.review_due_at,
             r.stage, r.result, r.status_changed_at, r.received_at, r.received_by, r.decided_at, r.decided_by,
+            r.receipt_confirmed_at, r.receipt_confirmed_by,
             r.checklist, r.notes, r.not_apt_reason, r.not_apt_destination,
             r.ml_created_at, r.ml_closed_at, r.ml_last_updated, r.created_at, r.updated_at,
             u.name AS client_name, u.email AS client_email
        FROM public.ml_returns r LEFT JOIN public.users u ON u.uid = r.uid
-      WHERE r.id = $1`,
-    [id]
+      WHERE r.id = $1${cliente ? ' AND r.uid = $2' : ''}`,
+    params
   );
   if (!r.rowCount) throw erroHttp(404, 'nao_encontrada', 'Devolução não encontrada.');
   const dev = r.rows[0];
@@ -1161,9 +1280,11 @@ async function detalharDevolucao(db, id) {
        FROM public.ml_return_items WHERE return_id = $1 ORDER BY id`,
     [id]
   )).rows;
-  for (const item of itens) {
-    item.estoque = await estoqueDoItem(db, dev.uid, item);
-    item.vendaBaixouEstoque = dev.uid && item.sku ? await vendaBaixouEstoque(db, dev.uid, item.order_id, item.sku) : false;
+  if (!cliente) {
+    for (const item of itens) {
+      item.estoque = await estoqueDoItem(db, dev.uid, item);
+      item.vendaBaixouEstoque = dev.uid && item.sku ? await vendaBaixouEstoque(db, dev.uid, item.order_id, item.sku) : false;
+    }
   }
 
   const [eventos, fotos] = await Promise.all([
@@ -1179,6 +1300,14 @@ async function detalharDevolucao(db, id) {
     ),
   ]);
 
+  if (cliente) {
+    return {
+      ...devolucaoParaCliente(dev),
+      items: itens,
+      events: eventos.rows.filter((evento) => EVENTOS_DO_CLIENTE.has(evento.kind)).map(eventoParaCliente),
+      photos: fotos.rows.map((foto) => ({ ...foto, uploaded_by: null })),
+    };
+  }
   return { ...dev, items: itens, events: eventos.rows, photos: fotos.rows };
 }
 
@@ -1680,6 +1809,7 @@ module.exports = {
   vendaDoItem,
   tipoDaImagem,
   gravarDevolucaoDoMl,
+  confirmarRecebimento,
   registrarChegada,
   salvarAnalise,
   concluirAnalise,
@@ -1687,6 +1817,7 @@ module.exports = {
   removerFoto,
   listarDevolucoes,
   detalharDevolucao,
+  devolucaoParaCliente,
   processarReclamacao,
   sincronizarConta,
   abrirSessaoMl,

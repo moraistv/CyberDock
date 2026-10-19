@@ -1,12 +1,20 @@
 // router/returns.js
 //
-// Devoluções do Mercado Livre — tela /admin/devolucoes (só master).
+// Devoluções do Mercado Livre — tela /admin/devolucoes (master) e /devolucoes
+// (cliente, só leitura).
 //
+// Cliente (qualquer usuário logado; sempre e só as devoluções do próprio uid):
+//   GET    /api/returns/minhas                        fila, números e contas do cliente
+//   GET    /api/returns/minhas/:id                    detalhe na visão do cliente
+//   GET    /api/returns/minhas/:id/fotos/:fotoId      imagem
+//
+// Master:
 //   GET    /api/returns                       fila com filtros, números do período e facetas
 //   GET    /api/returns/sync                  andamento da sincronização com o ML
 //   POST   /api/returns/sync                  busca agora as devoluções no ML (roda em segundo plano)
 //   GET    /api/returns/:id                   detalhe (itens, estoque, fotos e histórico)
-//   POST   /api/returns/:id/chegada           registra que o pacote chegou ao CD
+//   POST   /api/returns/:id/confirmar-recebimento   a CyberDock confirma que o pacote está no CD
+//   POST   /api/returns/:id/chegada           nome antigo do confirmar-recebimento
 //   PUT    /api/returns/:id/analise           salva checklist e observação sem decidir
 //   POST   /api/returns/:id/decisao           conclui a análise (apto / não apto) e soma ao estoque
 //   POST   /api/returns/:id/fotos             adiciona foto (base64, já reduzida no navegador)
@@ -297,28 +305,99 @@ function interceptarAvisoDoMl(req, res, next) {
 }
 
 /* ------------------------------------------------------------------------- */
-/* Rotas da tela                                                              */
+/* Consulta da lista                                                          */
+/* ------------------------------------------------------------------------- */
+
+const PERIODOS = new Set(['7d', '30d', '90d', 'all']);
+
+/** Filtros da lista a partir da query. O filtro de cliente só vale para o master. */
+function filtrosDaQuery(q = {}, { aceitaCliente }) {
+  return {
+    periodo: PERIODOS.has(q.periodo) ? q.periodo : '30d',
+    situacao: q.situacao,
+    resultado: q.resultado,
+    recebimento: q.recebimento,
+    uid: aceitaCliente ? q.cliente || null : null,
+    seller: q.conta || null,
+    busca: q.busca,
+    page: q.page,
+    limit: q.limit,
+    todas: q.todas === '1',
+  };
+}
+
+/** Envia a imagem guardada. Sempre Buffer: com outro tipo o Express responderia JSON. */
+function enviarFoto(res, linha) {
+  if (!linha) return res.status(404).json({ error: 'Foto não encontrada.', code: 'foto_nao_encontrada' });
+  res.set('Content-Type', linha.content_type);
+  res.set('Cache-Control', 'private, max-age=86400');
+  res.set('X-Content-Type-Options', 'nosniff');
+  return res.send(Buffer.isBuffer(linha.data) ? linha.data : Buffer.from(linha.data));
+}
+
+/* ------------------------------------------------------------------------- */
+/* Tela do cliente: só leitura, só as devoluções do próprio uid              */
+/* ------------------------------------------------------------------------- */
+
+/* Declaradas ANTES do `router.use(requireMaster)` abaixo. O dono vem sempre do
+ * token, nunca da query: devolução sem cliente identificado (uid nulo) não
+ * aparece para ninguém além do master. */
+const uidDoToken = (req) => String(req.user?.uid || '').trim();
+
+router.get('/minhas', authenticateToken, async (req, res) => {
+  try {
+    const uid = uidDoToken(req);
+    const [dados, ultima] = await Promise.all([
+      devolucoes.listarDevolucoes(db, filtrosDaQuery(req.query, { aceitaCliente: false }), { cliente: uid }),
+      // Última leitura com sucesso das contas do ML do próprio cliente.
+      db.query(
+        `SELECT MAX(s.last_ok_at) AS ultima
+           FROM public.ml_return_sync s
+          WHERE s.seller_id IN (SELECT a.user_id FROM public.ml_accounts a WHERE a.uid = $1)`,
+        [uid]
+      ),
+    ]);
+    res.json({ ...dados, ultimaSincronizacao: ultima.rows[0]?.ultima || null });
+  } catch (erro) {
+    responderErro(res, erro, 'Não foi possível carregar as devoluções.');
+  }
+});
+
+router.get('/minhas/:id(\\d+)', authenticateToken, async (req, res) => {
+  try {
+    res.json(await devolucoes.detalharDevolucao(db, req.params.id, { cliente: uidDoToken(req) }));
+  } catch (erro) {
+    responderErro(res, erro, 'Não foi possível abrir a devolução.');
+  }
+});
+
+router.get('/minhas/:id(\\d+)/fotos/:fotoId(\\d+)', authenticateToken, async (req, res) => {
+  try {
+    const uid = uidDoToken(req);
+    if (!uid) return res.status(401).json({ error: 'Sessão sem usuário identificado. Entre de novo.', code: 'sem_usuario' });
+    const r = await db.query(
+      `SELECT p.content_type, p.data
+         FROM public.ml_return_photos p
+         JOIN public.ml_returns r ON r.id = p.return_id
+        WHERE p.id = $1 AND p.return_id = $2 AND r.uid = $3`,
+      [req.params.fotoId, req.params.id, uid]
+    );
+    return enviarFoto(res, r.rows[0]);
+  } catch (erro) {
+    return responderErro(res, erro, 'Não foi possível abrir a foto.');
+  }
+});
+
+/* ------------------------------------------------------------------------- */
+/* Tela do master                                                             */
 /* ------------------------------------------------------------------------- */
 
 router.use(authenticateToken, requireMaster);
 
-const PERIODOS = new Set(['7d', '30d', '90d', 'all']);
-
 router.get('/', async (req, res) => {
   try {
-    const q = req.query || {};
     const [dados, ultima] = await Promise.all([
-      devolucoes.listarDevolucoes(db, {
-        periodo: PERIODOS.has(q.periodo) ? q.periodo : '30d',
-        situacao: q.situacao,
-        resultado: q.resultado,
-        uid: q.cliente || null,
-        seller: q.conta || null,
-        busca: q.busca,
-        page: q.page,
-        limit: q.limit,
-        todas: q.todas === '1',
-      }),
+      devolucoes.listarDevolucoes(db, filtrosDaQuery(req.query, { aceitaCliente: true })),
       db.query('SELECT MAX(last_ok_at) AS ultima FROM public.ml_return_sync'),
     ]);
     res.json({ ...dados, ultimaSincronizacao: ultima.rows[0]?.ultima || null, sync: estadoPublico() });
@@ -344,14 +423,19 @@ router.get('/:id(\\d+)', async (req, res) => {
   }
 });
 
-router.post('/:id(\\d+)/chegada', async (req, res) => {
+/* Confirmar o recebimento também registra a chegada quando o ML ainda não
+ * atualizou; /chegada continua respondendo para quem ainda usa o nome antigo. */
+async function confirmarRecebimento(req, res) {
   try {
-    await comCliente((client) => devolucoes.registrarChegada(client, req.params.id, autorDe(req)));
+    await comCliente((client) => devolucoes.confirmarRecebimento(client, req.params.id, autorDe(req)));
     res.json(await devolucoes.detalharDevolucao(db, req.params.id));
   } catch (erro) {
-    responderErro(res, erro, 'Não foi possível registrar a chegada.');
+    responderErro(res, erro, 'Não foi possível confirmar o recebimento.');
   }
-});
+}
+
+router.post('/:id(\\d+)/confirmar-recebimento', confirmarRecebimento);
+router.post('/:id(\\d+)/chegada', confirmarRecebimento);
 
 router.put('/:id(\\d+)/analise', async (req, res) => {
   try {
@@ -391,13 +475,7 @@ router.get('/:id(\\d+)/fotos/:fotoId(\\d+)', async (req, res) => {
       'SELECT content_type, data FROM public.ml_return_photos WHERE id = $1 AND return_id = $2',
       [req.params.fotoId, req.params.id]
     );
-    if (!r.rowCount) return res.status(404).json({ error: 'Foto não encontrada.', code: 'foto_nao_encontrada' });
-    const { content_type: tipo, data } = r.rows[0];
-    res.set('Content-Type', tipo);
-    res.set('Cache-Control', 'private, max-age=86400');
-    res.set('X-Content-Type-Options', 'nosniff');
-    // Sempre Buffer: com outro tipo binário o Express responderia JSON no lugar da imagem.
-    return res.send(Buffer.isBuffer(data) ? data : Buffer.from(data));
+    return enviarFoto(res, r.rows[0]);
   } catch (erro) {
     return responderErro(res, erro, 'Não foi possível abrir a foto.');
   }

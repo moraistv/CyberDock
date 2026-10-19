@@ -435,7 +435,11 @@ const schema = {
      * `stage` é a situação no CyberDock: aguardando_envio, em_transito, no_cd,
      * analisado, cancelada, no_ml (vai para o depósito do ML) e sem_devolucao
      * (reembolso sem pedir o produto). `result` só existe depois da análise:
-     * apto, nao_apto ou parcial. */
+     * apto, nao_apto ou parcial.
+     *
+     * `receipt_confirmed_*`: a CyberDock confirmou que o pacote está no CD (o
+     * que o cliente vê como "Recebida pela CyberDock"). A entrega informada
+     * pelo ML preenche `received_at`, mas não confirma o recebimento. */
     ml_returns: `
         CREATE TABLE public.ml_returns (
             id BIGSERIAL PRIMARY KEY,
@@ -465,6 +469,8 @@ const schema = {
             status_changed_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT CURRENT_TIMESTAMP,
             received_at TIMESTAMP WITH TIME ZONE,
             received_by VARCHAR(255),
+            receipt_confirmed_at TIMESTAMP WITH TIME ZONE,
+            receipt_confirmed_by VARCHAR(255),
             decided_at TIMESTAMP WITH TIME ZONE,
             decided_by VARCHAR(255),
             checklist JSONB NOT NULL DEFAULT '{}'::jsonb,
@@ -1384,6 +1390,28 @@ async function syncDatabaseSchema() {
                     if (saleLineKeyColRes.rowCount === 0) {
                         console.log(`   -> Adicionando coluna 'sale_line_key' à tabela: public.stock_movements`);
                         await client.query('ALTER TABLE public.stock_movements ADD COLUMN sale_line_key TEXT;');
+                    }
+                }
+                if (tableName === 'ml_returns') {
+                    /* Recebimento confirmado pela CyberDock (ver o CREATE TABLE).
+                     * O preenchimento roda UMA vez, junto com a criação da
+                     * coluna, e nunca mais no boot: o que o CD já tinha
+                     * registrado (chegada pelo botão ou análise concluída) já
+                     * foi recebido pela equipe. A entrega só informada pelo ML
+                     * continua esperando a confirmação. Uma linha por devolução,
+                     * tabela pequena. */
+                    const recebimentoColRes = await client.query(`SELECT 1 FROM information_schema.columns WHERE table_schema = 'public' AND table_name = 'ml_returns' AND column_name = 'receipt_confirmed_at'`);
+                    if (recebimentoColRes.rowCount === 0) {
+                        console.log(`   -> Adicionando colunas de recebimento confirmado à tabela: public.ml_returns`);
+                        await client.query('ALTER TABLE public.ml_returns ADD COLUMN receipt_confirmed_at TIMESTAMP WITH TIME ZONE;');
+                        await client.query('ALTER TABLE public.ml_returns ADD COLUMN IF NOT EXISTS receipt_confirmed_by VARCHAR(255);');
+                        await client.query(`
+                            UPDATE public.ml_returns
+                               SET receipt_confirmed_at = COALESCE(received_at, decided_at),
+                                   receipt_confirmed_by = COALESCE(received_by, decided_by)
+                             WHERE receipt_confirmed_at IS NULL
+                               AND (received_by IS NOT NULL OR stage = 'analisado')
+                        `);
                     }
                 }
             }
