@@ -317,6 +317,8 @@ function filtrosDaQuery(q = {}, { aceitaCliente }) {
     situacao: q.situacao,
     resultado: q.resultado,
     recebimento: q.recebimento,
+    // Modalidade de envio da venda: full, sem_full, flex, coleta... (utils/mlReturns.js, FILTROS_DE_ENVIO).
+    envio: typeof q.envio === 'string' ? q.envio : '',
     uid: aceitaCliente ? q.cliente || null : null,
     seller: q.conta || null,
     busca: q.busca,

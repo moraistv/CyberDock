@@ -975,7 +975,61 @@ const PERIODOS = { '7d': 7, '30d': 30, '90d': 90 };
 /* `aptos` = apto ou parcial (alguma unidade voltou ao estoque), o mesmo que o número do topo conta. */
 const FILTROS_DE_RESULTADO = new Set(['pendente', 'apto', 'nao_apto', 'parcial', 'aptos']);
 
-/** Filtros comuns (período, cliente, conta, busca) em SQL parametrizado. */
+/**
+ * Modalidade de envio da VENDA que gerou a devolução (não do pacote que
+ * volta): 'FULL', 'FLEX', 'Coleta', 'Agência', 'Correios', 'Envio Padrão',
+ * 'Outros' ou NULL quando a venda não está em public.sales.
+ *
+ * Mesma regra das telas de venda (router/sales.js, U_SHIPPING_MODE e
+ * U_NOT_FULL), para as duas telas nunca discordarem: vale o shipping_mode que
+ * o sync gravou; sem ele, o logistic_type do ML; e é FULL sempre que um dos
+ * dois disser FULL. O logistic_type vem da coluna derivada quando ela já foi
+ * preenchida (derived_fields_at), sem ler o JSON da venda.
+ *
+ * Lida na hora, e não guardada na devolução: a venda pode chegar depois da
+ * devolução, ou ter a modalidade corrigida depois (rota fix-shipping-modes).
+ * É uma busca pelo índice (id, sku, uid) de sales, uma por devolução.
+ */
+const MODALIDADE_DA_VENDA = `(
+    SELECT m.modalidade
+      FROM public.sales s
+     CROSS JOIN LATERAL (
+       SELECT LOWER(COALESCE(CASE WHEN s.derived_fields_at IS NOT NULL THEN s.logistic_type
+                                  ELSE s.raw_api_data->'shipping'->>'logistic_type' END, '')) AS logistica
+     ) t
+     CROSS JOIN LATERAL (
+       SELECT CASE
+                WHEN UPPER(COALESCE(s.shipping_mode, '')) = 'FULL' OR t.logistica = 'fulfillment' THEN 'FULL'
+                ELSE COALESCE(NULLIF(s.shipping_mode, ''), CASE t.logistica
+                       WHEN 'self_service'  THEN 'FLEX'
+                       WHEN 'cross_docking' THEN 'Coleta'
+                       WHEN 'drop_off'      THEN 'Agência'
+                       WHEN 'xd_drop_off'   THEN 'Agência'
+                     END)
+              END AS modalidade
+     ) m
+     WHERE s.id = r.order_id AND s.seller_id = r.seller_id
+     ORDER BY m.modalidade = 'FULL' DESC NULLS LAST, m.modalidade IS NULL, s.updated_at DESC NULLS LAST
+     LIMIT 1
+  )`;
+
+/* Filtro "Mod. envio". As opções se completam: Full + todas as outras +
+ * não identificada somam o total. `sem_full` é tudo que não é Full, inclusive
+ * a venda sem modalidade identificada. */
+const MODALIDADES_CONHECIDAS = ['FULL', 'FLEX', 'Coleta', 'Agência', 'Correios', 'Envio Padrão'];
+const FILTROS_DE_ENVIO = Object.freeze({
+  full: `${MODALIDADE_DA_VENDA} = 'FULL'`,
+  sem_full: `${MODALIDADE_DA_VENDA} IS DISTINCT FROM 'FULL'`,
+  flex: `${MODALIDADE_DA_VENDA} = 'FLEX'`,
+  coleta: `${MODALIDADE_DA_VENDA} = 'Coleta'`,
+  agencia: `${MODALIDADE_DA_VENDA} = 'Agência'`,
+  correios: `${MODALIDADE_DA_VENDA} = 'Correios'`,
+  padrao: `${MODALIDADE_DA_VENDA} = 'Envio Padrão'`,
+  outras: `${MODALIDADE_DA_VENDA} NOT IN (${MODALIDADES_CONHECIDAS.map((m) => `'${m}'`).join(', ')})`,
+  nao_identificada: `${MODALIDADE_DA_VENDA} IS NULL`,
+});
+
+/** Filtros comuns (período, cliente, conta, mod. envio, busca) em SQL parametrizado. */
 function filtrosBase(filtros, params) {
   const where = [];
   const dias = PERIODOS[filtros.periodo];
@@ -991,6 +1045,10 @@ function filtrosBase(filtros, params) {
   if (seller) {
     params.push(seller);
     where.push(`r.seller_id = $${params.length}`);
+  }
+  // Valor fora da lista é ignorado (como os outros filtros), nunca vai para o SQL.
+  if (Object.prototype.hasOwnProperty.call(FILTROS_DE_ENVIO, filtros.envio)) {
+    where.push(FILTROS_DE_ENVIO[filtros.envio]);
   }
   const busca = String(filtros.busca || '').trim().slice(0, 120);
   if (busca) {
@@ -1086,6 +1144,7 @@ const SELECT_DA_LISTA = `
          r.stage, r.result, r.status_changed_at, r.received_at, r.received_by, r.decided_at, r.decided_by,
          r.receipt_confirmed_at, r.receipt_confirmed_by,
          r.not_apt_reason, r.not_apt_destination, r.notes, r.ml_created_at, r.created_at,
+         ${MODALIDADE_DA_VENDA} AS sale_shipping_mode,
          u.name AS client_name, u.email AS client_email,
          COALESCE((SELECT json_agg(json_build_object(
                     'id', i.id, 'sku', i.sku, 'title', i.title, 'thumbnail', i.thumbnail, 'permalink', i.permalink,
@@ -1266,6 +1325,7 @@ async function detalharDevolucao(db, id, opcoes = {}) {
             r.receipt_confirmed_at, r.receipt_confirmed_by,
             r.checklist, r.notes, r.not_apt_reason, r.not_apt_destination,
             r.ml_created_at, r.ml_closed_at, r.ml_last_updated, r.created_at, r.updated_at,
+            ${MODALIDADE_DA_VENDA} AS sale_shipping_mode,
             u.name AS client_name, u.email AS client_email
        FROM public.ml_returns r LEFT JOIN public.users u ON u.uid = r.uid
       WHERE r.id = $1${cliente ? ' AND r.uid = $2' : ''}`,
