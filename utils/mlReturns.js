@@ -1013,6 +1013,29 @@ const MODALIDADE_DA_VENDA = `(
      LIMIT 1
   )`;
 
+/**
+ * Nome e apelido do COMPRADOR, lidos na venda (public.sales) pelo mesmo motivo
+ * da modalidade: a venda pode chegar depois da devolução. O ML não manda o
+ * comprador na devolução nem na reclamação; ele só existe no pedido.
+ *
+ * O nome gravado na devolução (`buyer_name`, tirado da venda na leitura do ML)
+ * fica de reserva para quando a venda não está no CyberDock. Ele pode ser o
+ * próprio apelido: com o pedido sem nome, a gravação usa o apelido no lugar
+ * (`nomeDoComprador`), e a tela não repete os dois.
+ */
+const DADO_DO_COMPRADOR = (expressao) => `(
+    SELECT NULLIF(TRIM(${expressao}), '')
+      FROM public.sales s
+     WHERE s.id = r.order_id AND s.seller_id = r.seller_id
+       AND NULLIF(TRIM(${expressao}), '') IS NOT NULL
+     ORDER BY s.updated_at DESC NULLS LAST
+     LIMIT 1
+  )`;
+const NOME_NA_VENDA = `CONCAT_WS(' ', s.raw_api_data->'buyer'->>'first_name', s.raw_api_data->'buyer'->>'last_name')`;
+const APELIDO_NA_VENDA = `s.raw_api_data->'buyer'->>'nickname'`;
+const COMPRADOR_DA_DEVOLUCAO = `COALESCE(${DADO_DO_COMPRADOR(NOME_NA_VENDA)}, r.buyer_name) AS buyer_name,
+         ${DADO_DO_COMPRADOR(APELIDO_NA_VENDA)} AS buyer_nickname`;
+
 /* Filtro "Mod. envio". As opções se completam: Full + todas as outras +
  * não identificada somam o total. `sem_full` é tudo que não é Full, inclusive
  * a venda sem modalidade identificada. */
@@ -1062,11 +1085,15 @@ function filtrosBase(filtros, params) {
       porNumero = ` OR r.order_id = ${n}::bigint OR r.ml_return_id = ${n}::bigint OR r.claim_id = ${n}::bigint
                     OR r.pack_id = ${n}::bigint OR r.shipment_id = ${n}::bigint`;
     }
+    // O comprador também é buscado na venda (nome e apelido), como a tela mostra.
     where.push(`(
         r.tracking_number ILIKE ${p} OR r.buyer_name ILIKE ${p} OR r.account_nickname ILIKE ${p}
         OR u.name ILIKE ${p} OR u.email ILIKE ${p}
         OR EXISTS (SELECT 1 FROM public.ml_return_items i
                     WHERE i.return_id = r.id AND (i.sku ILIKE ${p} OR i.title ILIKE ${p}))
+        OR EXISTS (SELECT 1 FROM public.sales s
+                    WHERE s.id = r.order_id AND s.seller_id = r.seller_id
+                      AND (${APELIDO_NA_VENDA} ILIKE ${p} OR ${NOME_NA_VENDA} ILIKE ${p}))
         ${porNumero}
       )`);
   }
@@ -1139,7 +1166,8 @@ function clienteDaVisao(opcoes = {}) {
 
 const SELECT_DA_LISTA = `
   SELECT r.id, r.ml_return_id::text AS ml_return_id, r.claim_id::text AS claim_id, r.seller_id::text AS seller_id,
-         r.uid, r.account_nickname, r.order_id::text AS order_id, r.pack_id::text AS pack_id, r.buyer_name,
+         r.uid, r.account_nickname, r.order_id::text AS order_id, r.pack_id::text AS pack_id,
+         ${COMPRADOR_DA_DEVOLUCAO},
          r.ml_status, r.destination, r.tracking_number, r.claim_reason_text, r.review_due_at,
          r.stage, r.result, r.status_changed_at, r.received_at, r.received_by, r.decided_at, r.decided_by,
          r.receipt_confirmed_at, r.receipt_confirmed_by,
@@ -1317,7 +1345,8 @@ async function detalharDevolucao(db, id, opcoes = {}) {
   if (cliente) params.push(cliente);
   const r = await db.query(
     `SELECT r.id, r.ml_return_id::text AS ml_return_id, r.claim_id::text AS claim_id, r.seller_id::text AS seller_id,
-            r.uid, r.account_nickname, r.order_id::text AS order_id, r.pack_id::text AS pack_id, r.buyer_name,
+            r.uid, r.account_nickname, r.order_id::text AS order_id, r.pack_id::text AS pack_id,
+            ${COMPRADOR_DA_DEVOLUCAO},
             r.ml_status, r.ml_subtype, r.ml_status_money, r.refund_at, r.destination,
             r.shipment_id::text AS shipment_id, r.shipment_status, r.tracking_number,
             r.claim_status, r.claim_stage, r.claim_reason_id, r.claim_reason_text, r.review_due_at,
