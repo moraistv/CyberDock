@@ -947,6 +947,38 @@ router.delete('/skus/:skuId', authenticateToken, somenteMasterAltera, async (req
 
 // --- ROTAS DE MOVIMENTAÇÃO DE ESTOQUE ---
 
+/* De qual kit veio a baixa.
+ *
+ * Quando um kit é vendido, o estoque é debitado nos SKUs filhos, e o movimento
+ * do filho guarda o motivo "Saída por Kit..." — sem dizer QUAL kit. A venda
+ * gera, na mesma transação, um movimento do próprio kit. É esse irmão de venda
+ * que responde a pergunta.
+ *
+ * A correlação precisa cobrir os dois jeitos de gravar a venda:
+ *   - Mercado Livre: `related_sale_id`;
+ *   - Shopee e TikTok: `related_sale_id` NULL, venda em `external_sale_id`.
+ * Correlacionar só pelo primeiro deixaria a coluna vazia nos outros dois canais.
+ *
+ * O CASE evita rodar a subconsulta nas linhas que não vieram de kit (entrada,
+ * ajuste, venda direta), que são a maioria do histórico.
+ */
+const KIT_PAI_SQL = `
+  CASE WHEN sm.reason LIKE 'Saída por Kit%' THEN (
+    SELECT ks.sku
+      FROM public.stock_movements km
+      JOIN public.skus ks ON ks.id = km.sku_id
+     WHERE km.user_id = sm.user_id
+       AND km.sku_id <> sm.sku_id
+       AND km.movement_type = 'saida'
+       AND ks.is_kit = true
+       AND (
+         (sm.related_sale_id IS NOT NULL AND km.related_sale_id = sm.related_sale_id)
+         OR (sm.external_sale_id IS NOT NULL AND km.external_sale_id = sm.external_sale_id)
+       )
+     ORDER BY km.created_at DESC
+     LIMIT 1
+  ) END AS kit_parent_sku`;
+
 router.get('/user/:userId/movements', authenticateToken, async (req, res) => {
   const { userId } = req.params;
   if (req.user.role !== 'master' && req.user.uid !== userId) {
@@ -965,7 +997,7 @@ router.get('/user/:userId/movements', authenticateToken, async (req, res) => {
     if (!wantsPagination) {
       const { rows } = await db.query(`
         SELECT sm.id, s.sku, sm.movement_type, sm.quantity_change, sm.reason,
-               sm.related_sale_id, sm.created_at
+               sm.related_sale_id, sm.created_at, ${KIT_PAI_SQL}
         ${baseFrom}
         ORDER BY sm.created_at DESC
       `, [userId]);
@@ -976,7 +1008,7 @@ router.get('/user/:userId/movements', authenticateToken, async (req, res) => {
       db.query(`SELECT COUNT(*)::int AS total ${baseFrom}`, [userId]),
       db.query(`
         SELECT sm.id, s.sku, sm.movement_type, sm.quantity_change, sm.reason,
-               sm.related_sale_id, sm.created_at
+               sm.related_sale_id, sm.created_at, ${KIT_PAI_SQL}
         ${baseFrom}
         ORDER BY sm.created_at DESC
         LIMIT $2 OFFSET $3
@@ -1004,7 +1036,8 @@ router.get('/sku/:skuCode/movements', authenticateToken, requireMaster, async (r
 
   try {
     const query = `
-      SELECT sm.id, sm.movement_type, sm.quantity_change, sm.reason, sm.related_sale_id, sm.created_at
+      SELECT sm.id, sm.movement_type, sm.quantity_change, sm.reason,
+             sm.related_sale_id, sm.created_at, ${KIT_PAI_SQL}
       FROM public.stock_movements sm
       JOIN public.skus s ON sm.sku_id = s.id
       WHERE s.sku = $1 AND sm.user_id = $2
