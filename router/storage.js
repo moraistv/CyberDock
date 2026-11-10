@@ -1028,11 +1028,22 @@ router.get('/user/:userId/movements', authenticateToken, async (req, res) => {
   }
 });
 
-router.get('/sku/:skuCode/movements', authenticateToken, requireMaster, async (req, res) => {
+/* Histórico de um SKU.
+ *
+ * Era `requireMaster`, o que impedia o próprio cliente de abrir o histórico do
+ * seu SKU. Agora que ele usa a mesma tela do master, o clique na quantidade
+ * precisa responder — e a regra é a mesma das outras leituras: o dono vê o
+ * dele, o master vê o de todos.
+ */
+router.get('/sku/:skuCode/movements', authenticateToken, async (req, res) => {
   const { skuCode } = req.params;
   const { uid } = req.query;
 
   if (!uid) return res.status(400).json({ error: 'UID do usuário é obrigatório.' });
+
+  if (req.user.role !== 'master' && req.user.uid !== uid) {
+    return res.status(403).json({ error: 'Acesso negado.' });
+  }
 
   try {
     const query = `
