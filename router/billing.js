@@ -720,7 +720,7 @@ router.get('/manual-services', authenticateToken, requireMaster, async (req, res
 
 /** ===== NOVO: adiciona item manual na fatura (master) ===== */
 router.post('/add-manual-item', authenticateToken, requireMaster, async (req, res) => {
-  const { uid, period, serviceId, quantity, serviceDate } = req.body || {};
+  const { uid, period, serviceId, quantity, serviceDate, unitPrice: requestedUnitPrice } = req.body || {};
 
   if (!uid || !period || !serviceId) {
     return res.status(400).json({ error: 'uid, period e serviceId são obrigatórios.' });
@@ -735,28 +735,46 @@ router.post('/add-manual-item', authenticateToken, requireMaster, async (req, re
     if (serviceRes.rowCount === 0) throw new Error('Serviço não encontrado.');
     const service = serviceRes.rows[0];
 
+    const editavel = service.type === 'avulso_quantidade' && service.config?.allow_unit_price_override === true;
+    const precoInformado = requestedUnitPrice !== undefined;
+    if (precoInformado && (!editavel ||
+      (typeof requestedUnitPrice !== 'number' && typeof requestedUnitPrice !== 'string') ||
+      !/^\d+(?:\.\d{1,2})?$/.test(String(requestedUnitPrice)))) {
+      await client.query('ROLLBACK');
+      return res.status(400).json({
+        error: editavel ? 'Informe um valor unitário válido, com até duas casas decimais.' : 'Este serviço tem preço definido pelo catálogo.',
+      });
+    }
+
     // 2) Define quantidade e preço unitário
     let qty = 1;
     let unitPrice = null;
 
     if (service.type === 'avulso_quantidade') {
-      const q = parseInt(quantity, 10);
-      if (!q || q < 1) {
+      const q = editavel ? Number(quantity) : parseInt(quantity, 10);
+      if (!q || q < 1 || (editavel && !Number.isSafeInteger(q))) {
+        await client.query('ROLLBACK');
         return res.status(400).json({ error: 'Quantidade inválida para serviço por quantidade.' });
       }
       qty = q;
-      unitPrice = getTierUnitPrice(service.config, qty);
+      unitPrice = precoInformado ? Number(requestedUnitPrice) : getTierUnitPrice(service.config, qty);
       if (unitPrice === null) {
+        await client.query('ROLLBACK');
         return res.status(400).json({ error: 'Configuração de tiers inválida para este serviço.' });
       }
     } else if (service.type === 'avulso_simples') {
       unitPrice = parseFloat(service.price);
       qty = 1;
     } else {
+      await client.query('ROLLBACK');
       return res.status(400).json({ error: 'Tipo de serviço não permitido para lançamento manual.' });
     }
 
-    const totalPrice = unitPrice * qty;
+    const totalPrice = editavel ? Math.round(unitPrice * 100) * qty / 100 : unitPrice * qty;
+    if (editavel && !(totalPrice <= 99999999.99)) {
+      await client.query('ROLLBACK');
+      return res.status(400).json({ error: 'O valor total do lançamento excede o limite permitido.' });
+    }
 
     /* Competência fechada não recebe lançamento.
      *

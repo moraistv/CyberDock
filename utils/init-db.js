@@ -1631,6 +1631,20 @@ async function seedInitialData() {
             await client.query(`INSERT INTO public.services (name, price, description, type, unit) VALUES ('Coleta CyberSegura', 197.00, 'Coleta até 1m³ e 40km da sede da CyberDock.', 'avulso_simples', 'viagem'), ('Transbordo Full CyberSeguro', 297.00, 'Envios ao Full - C.D do ML - cidade de São Paulo.', 'avulso_simples', 'viagem') ON CONFLICT (name) DO NOTHING;`);
         }
 
+        // O catálogo guarda o preço sugerido. A edição no lançamento fica só na fatura.
+        await client.query(
+            `INSERT INTO public.services (name, price, description, type, config, unit)
+             VALUES
+                ('Montagem de KIT', 0.40, 'Montagem avulsa por kit.', 'avulso_quantidade', $1, 'kit'),
+                ('Montagem de Produto', 0.40, 'Montagem avulsa por produto.', 'avulso_quantidade', $2, 'unidade')
+             ON CONFLICT (name) DO NOTHING;`,
+            ['Quantidade de kits', 'Quantidade de produtos'].map(quantity_label => JSON.stringify({
+                tiers: [{ from: 1, to: null, price: 0.40 }],
+                quantity_label,
+                allow_unit_price_override: true,
+            }))
+        );
+
         // === Montagem de Full: faixas conforme a tabela oficial ===
         // 01 a 100 = 1,49 | 101 a 300 = 1,35 | acima de 301 = 1,19.
         // Rodava com 1,29 e 1,19 nas duas últimas faixas, cobrando menos.
